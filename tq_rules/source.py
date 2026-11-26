@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -29,10 +30,33 @@ class Test:
         return self.start <= comment.line <= self.end and comment.column >= self.column
 
 
+class CollectionControls:
+    """Resolve exact copies of a detector among files in the same lint scan."""
+
+    def __init__(self):
+        self.witnesses = defaultdict(set)
+        self.pending = []
+
+    def record(self, path, scan_root, fingerprint, test=None, line=None):
+        markers = ({"Cargo.toml", ".git"} if path.suffix == ".rs"
+                   else {"pyproject.toml", "setup.py", "setup.cfg", ".git"})
+        path = path.resolve()
+        key = project_root(path, scan_root, markers), path.suffix, fingerprint
+        if test is None:
+            self.witnesses[key].add(path)
+        else:
+            self.pending.append((key, path, test, line))
+
+    def finish(self):
+        for key, path, test, line in self.pending:
+            if not self.witnesses.get(key, set()) - {path}:
+                test.issues.append((line, "absence-no-control"))
+
+
 IGNORED = {".git", "__pycache__", ".venv", "node_modules", "target"}
 
 
-def scan_paths(inputs, errors, *, refine_guards=False):
+def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None):
     """Yield parsed files; append a parse-error finding to `errors` for each unreadable one."""
     from . import python, rust
 
@@ -58,9 +82,11 @@ def scan_paths(inputs, errors, *, refine_guards=False):
         try:
             if path.suffix == ".py":
                 with tokenize.open(path) as stream:
-                    parsed = python.parse(stream.read(), path, scan_root=paths[path])
+                    parsed = python.parse(stream.read(), path, scan_root=paths[path],
+                                          collection_controls=collection_controls)
             else:
-                parsed = rust.parse(path.read_text(encoding="utf-8"), path, scan_root=paths[path])
+                parsed = rust.parse(path.read_text(encoding="utf-8"), path, scan_root=paths[path],
+                                    collection_controls=collection_controls)
         except (SyntaxError, ValueError, UnicodeDecodeError) as error:
             errors.append(finding(path, getattr(error, "lineno", None) or 1, "parse-error",
                                   f"Cannot parse: {error}"))

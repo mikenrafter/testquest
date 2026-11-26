@@ -5,7 +5,7 @@ import re
 from string import Formatter
 
 from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, argument_claims, fixed_boundary, helper, loose_bounds,
-                   named_arguments, prefix_satisfies, DISTINCT_INPUTS, OUTCOME_CLAIM, REPEATABILITY,
+                   named_arguments, prefix_satisfies, DISTINCT_INPUTS, claims_effect, OUTCOME_CLAIM, REPEATABILITY,
                    symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN, inverse_codecs, path_directories, pins_path)
 from .source import Comment, Test
 
@@ -695,7 +695,19 @@ class CheckEvidence:
         module = self.module_scope(scope)
         return self.file_iterables.resolve(module, name) or absolute_path(module, name)
 
-    def checks(self, tokens, scope, *, in_helper=False):
+    def checks(self, tokens, scope, *, in_helper=False, ignore_status=False, visited=frozenset()):
+        def known_check(macro, path):
+            if (macro, path) not in self.known:
+                return False
+            if not ignore_status:
+                return True
+            if (macro, path) in visited:
+                return False
+            seen = visited | {(macro, path)}
+            bodies = self.macros[path] if macro else (self.functions[path],)
+            return any(self.checks(body, path[:-1] if macro else path, in_helper=not macro,
+                                   ignore_status=True, visited=seen) for body in bodies)
+
         declarations = dict(function_items(tokens))
         index = 0
         while index < len(tokens):
@@ -712,7 +724,11 @@ class CheckEvidence:
                 continue
             invocation = invocation_at(tokens, index, generic=True)
             if invocation:
-                _, macro = invocation
+                arguments, macro = invocation
+                if (ignore_status and macro and token.text in ASSERTIONS
+                        and success_check(token.text, list(split(arguments.children)))):
+                    index += 3
+                    continue
                 start = callee_start(tokens, index)
                 if start is not None and tokens[start].text == "::":
                     start += 1
@@ -725,16 +741,21 @@ class CheckEvidence:
                     if receiver.kind == "word" and (index < 3 or tokens[index - 3].text != "."):
                         owner = self.receiver_type(receiver.text, scope, (token.line, token.column))
                         path = (*owner, token.text) if owner else ()
+                if (ignore_status and method and token.text == "expect"
+                        and scope and scope[-1].endswith("_request_format")
+                        and integer_literal(arguments.children) is not None):
+                    index += 2
+                    continue
                 if method and path in self.methods:
-                    if (False, path) in self.known:
+                    if known_check(False, path):
                         return True
                 elif path in definitions:
                     if macro:
-                        if (True, path) in self.known:
+                        if known_check(True, path):
                             return True
                         index += 3
                         continue
-                    if path in self.trait_checks or ((False, path) in self.known and (
+                    if path in self.trait_checks or (known_check(False, path) and (
                             self.module_scope(path) == self.module_scope(scope) or helper(path[-1]))):
                         return True
                 elif (starts_check(tokens, index, macro, (), in_helper=in_helper)
@@ -747,9 +768,10 @@ class CheckEvidence:
                         and index >= 3 and tokens[index - 2].text == "("
                         and tokens[index - 3].text in {"recv_timeout", "wait_timeout", "timeout"}):
                     return True
-                if validates_before_extraction(tokens, index):
+                if not ignore_status and validates_before_extraction(tokens, index):
                     return True
-            if token.kind == "group" and self.checks(token.children, scope, in_helper=in_helper):
+            if token.kind == "group" and self.checks(token.children, scope, in_helper=in_helper,
+                                                     ignore_status=ignore_status, visited=visited):
                 return True
             index += 1
         return False
@@ -861,6 +883,7 @@ class FileIterables:
         self.macro_sources = {}
         self.method_sources = {}
         self.collection_sources = set()
+        self.type_names = set()
         self.path = path
         self.aliases = {}
         self.globs = defaultdict(list)
@@ -891,6 +914,9 @@ class FileIterables:
                         self.globs[scope].append(absolute_path(scope, name))
                         if name[0] in {"crate", "self", "super"}:
                             self.relative_globs[scope].append(name)
+            elif token.text in {"struct", "enum", "union", "type", "trait"}:
+                if index + 1 < len(tokens) and tokens[index + 1].kind == "word":
+                    self.type_names.add((*scope, tokens[index + 1].text))
             elif token.text == "impl":
                 head = tokens[index + 1:index + 3]
                 if len(head) == 2 and head[0].kind == "word" and head[1].text == "{":
@@ -2402,7 +2428,7 @@ class Inspect:
                     source[0].text == parameters.get(0)):
                 yield from self.collection_origins(args[0], line, True)
 
-    def collection_checks(self):
+    def collection_observations(self):
         for line, name, args, guarded in self.checks:
             if not args or guarded:
                 continue
@@ -2428,9 +2454,62 @@ class Inspect:
                     continue
                 if ordered == "==" or ordered in {"!=", ">"} and size == 0 or ordered == ">=" and size > 0:
                     candidates.append((receiver if method == "len" else operand, ordered != "==" or size > 0))
-            for operand, present in candidates:
-                for path in self.collection_origins(operand, line, present):
-                    yield path, present, line
+            yield from ((operand, present, line) for operand, present in candidates)
+
+    def collection_checks(self, observations=None):
+        if observations is None:
+            observations = self.collection_observations()
+        for operand, present, line in observations:
+            for path in self.collection_origins(operand, line, present):
+                yield path, present, line
+
+    def sweep_input(self, operand, line):
+        value = self.resolve(unborrow(operand), line)
+        receiver, method, _ = method_call(value)
+        if not method and shape(value[-2:]) == (">", "("):
+            for index in range(len(value) - 2, 0, -1):
+                if (shape(value[index - 1:index + 1]) == (".", "collect")
+                        and invocation_at(value, index, generic=True) == (value[-1], False)):
+                    receiver, method = value[:index - 1], "collect"
+                    break
+        if method != "collect":
+            return ()
+        filtered = False
+        while receiver:
+            value = receiver
+            receiver, method, _ = method_call(value)
+            filtered |= method in {"filter", "filter_map"}
+            if method not in {"iter", "into_iter", "filter", "filter_map", "map", "flatten",
+                              "copied", "cloned", "enumerate", "unwrap", "expect"}:
+                break
+        if not filtered:
+            return ()
+        if (source := binding_path(value)) and source[0] in self.mutated:
+            return ()
+        return self.resolve(unborrow(value), line)
+
+    def runtime_inventory(self, tokens):
+        while tokens:
+            receiver, method, _ = method_call(tokens)
+            if method in {"read_dir", "glob", "glob_with"}:
+                return True
+            if method in {"unwrap", "expect", "unwrap_or_default", "flatten", "map", "filter",
+                          "filter_map", "collect", "into_iter"}:
+                tokens = receiver
+                continue
+            if tokens[-1].text == "(":
+                name = qualified_name(tokens[:-1])
+                return bool(name and (name[-1] in {"read_dir", "glob", "glob_with"}
+                                      or name[-2:] == ("WalkDir", "new")))
+            break
+        return False
+
+    def runtime_sweep_checks(self, observations):
+        witnessed = {self.resolve(unborrow(operand), line) for operand, present, line in observations if present}
+        for operand, present, line in observations:
+            if not present and (source := self.sweep_input(operand, line)) and source not in witnessed:
+                if self.runtime_inventory(source):
+                    yield line
 
     def checked_iteration_sources(self):
         for line, name, args, guarded in self.checks:
@@ -2451,7 +2530,39 @@ class Inspect:
                     break
                 value = base
 
-    def issues(self, test_name, pins, strings, line_comments):
+    def recorder_origin(self, name, line, evidence, scope):
+        if name in self.writes or len(self.bindings[name]) != 1:
+            return ()
+        inputs = self.recorder_inputs[name]
+        if not inputs or not any(call_line <= line for _, call_line in inputs):
+            return ()
+        keys = {key for key, _ in inputs}
+        if len(keys) != 1:
+            return ()
+        (callee, slot), = keys
+        if len(callee) == 3 and callee[1] == ".":
+            receiver, _, method = callee
+            owners = {evidence.receiver_type(receiver, scope, loc) for loc, _, _ in self.calls[callee]}
+            if len(owners) != 1 or not (owner := owners.pop()):
+                return ()
+            path = (*owner, method)
+            if path not in evidence.methods and owner not in self.file_iterables.type_names:
+                imported = [(*module, owner[-1], method)
+                            for module in self.file_iterables.globs.get(owner[:-1], ())
+                            if (*module, owner[-1], method) in evidence.methods]
+                if len(imported) == 1:
+                    path, = imported
+            if path not in evidence.methods:
+                return ()
+        elif "." not in callee and callee[0] not in self.oracle_locals:
+            path = evidence.resolve(scope, tuple(part for part in callee if part != "::"), False)
+        else:
+            return ()
+        return (path, slot) if path in self.file_iterables.function_sources else ()
+
+    def issues(self, test, pins, strings, line_comments, evidence, recorder_witnesses, recorder_absences):
+        test_name = test.name
+        scope = tuple(test.identifier.split("::"))
         findings = [(line, "nondistinguishing-literal") for line in self.argument_calls(test_name)]
         result_pins = set(self.result_pins())
         initializers = {name: recorder_initializer(bindings[0][1]) for name, bindings in self.bindings.items()}
@@ -2516,6 +2627,11 @@ class Inspect:
                       if name not in self.writes
                       and all(key == producer for key, _ in self.recorder_inputs[name])
                       and any(call_line <= line for line in lines)}
+        unguarded = {line for line, _, _, guarded in self.checks if not guarded}
+        for name, lines in positive.items():
+            for line in lines:
+                if line in unguarded and (origin := self.recorder_origin(name, line, evidence, scope)):
+                    recorder_witnesses.add(origin)
         checked_sources = set(self.checked_iteration_sources())
         for name in recorders - positive.keys():
             if name in negative:
@@ -2523,9 +2639,15 @@ class Inspect:
                 failure_collector = sites and not self.recorder_inputs[name] and all(
                     mismatch and checked_sources.issuperset(path) for path, mismatch in sites)
                 if not failure_collector:
-                    findings.extend((line, "absence-no-control") for line in negative[name]
-                                    if not any(key in controlled and call_line <= line
-                                               for key, call_line in self.recorder_inputs[name]))
+                    for line in negative[name]:
+                        if any(key in controlled and call_line <= line
+                               for key, call_line in self.recorder_inputs[name]):
+                            continue
+                        origin = self.recorder_origin(name, line, evidence, scope)
+                        if origin:
+                            recorder_absences.append((test, line, origin))
+                        else:
+                            findings.append((line, "absence-no-control"))
             elif name in self.writes and name not in self.reads:
                 findings.append((self.writes[name], "absence-no-control"))
         for name, (line, kind) in self.callback_writes.items():
@@ -2577,6 +2699,25 @@ def setup_only(tokens, evidence, scope, assertion_count):
     return unchecked and direct_assertions == assertion_count
 
 
+def success_check(name, args):
+    if not args:
+        return False
+    operator, left, right = assertion_comparison(name, args)
+    if not operator and name in {"assert", "debug_assert", "prop_assert"}:
+        _, method, parameters = method_call(args[0])
+        return (method in {"is_ok", "success"} and not parameters
+                and args[0][0].text != "!" and not any(token.text in {"&&", "||"} for token in args[0]))
+    if operator != "==":
+        return False
+    for status, expected in ((left, right), (right, left)):
+        _, method, parameters = method_call(status)
+        if method == "code" and not parameters:
+            if (len(expected) == 2 and shape(expected[:1]) == ("Some",)
+                    and expected[1].text == "(" and integer_literal(expected[1].children) == 0):
+                return True
+    return False
+
+
 def has_outcome_evidence(test, inspector, body, evidence):
     scope = tuple(test.identifier.split("::"))
     tokens = body.children
@@ -2585,8 +2726,11 @@ def has_outcome_evidence(test, inspector, body, evidence):
     assertions = [(name, args) for _, name, args, _ in inspector.checks if name in ASSERTIONS]
     if (OUTCOME_CLAIM.search(test.name) and assertions
             and all(name in {"assert", "debug_assert", "prop_assert"} and args
-                    and method_call(args[0])[1] == "is_ok" for name, args in assertions)
+                    and method_call(args[0])[1] == "is_ok" and success_check(name, args)
+                    for name, args in assertions)
             and all(name in ASSERTIONS or name == "expect" for _, name, _, _ in inspector.checks)):
+        return False
+    if claims_effect(test.name) and not evidence.checks(tokens, scope, ignore_status=True):
         return False
     return not setup_only(tokens, evidence, scope, len(assertions))
 
@@ -2619,7 +2763,7 @@ def witnessed_by_helpers(inspected, evidence, file_iterables, parameters, missin
             yield from (producer for producer, present, _ in helper.collection_checks() if present)
 
 
-def parse(source, path, *, scan_root=None):
+def parse(source, path, *, scan_root=None, collection_controls=None):
     tokens, comments = tokenize(source)
     line_comments = {comment.line: comment.text for comment in comments}
     tests = []
@@ -2653,22 +2797,39 @@ def parse(source, path, *, scan_root=None):
         inspector.visit(body.children)
         inspected.append((test, inspector, panic, ignored, body))
     pins = {pin for _, inspector, _, _, _ in inspected for pin in inspector.literal_pins()}
-    collections = [list(inspector.collection_checks()) if not ignored else []
-                   for _, inspector, _, ignored, _ in inspected]
+    observations = [list(inspector.collection_observations()) if not ignored else []
+                    for _, inspector, _, ignored, _ in inspected]
+    collections = [list(inspector.collection_checks(checks))
+                   for (_, inspector, _, _, _), checks in zip(inspected, observations)]
     witnessed = {path for checks in collections for path, present, _ in checks if present}
     missing = {path[-1] for checks in collections for path, present, _ in checks
                if not present and path not in witnessed}
     if missing:
         witnessed.update(witnessed_by_helpers(inspected, evidence, file_iterables, parameters, missing))
-    for (test, inspector, panic, ignored, body), collection_checks in zip(inspected, collections):
+    fingerprints = {}
+    if collection_controls is not None:
+        for producer in witnessed | {producer for checks in collections for producer, _, _ in checks}:
+            fingerprints[producer] = producer[-1], shape(file_iterables.function_sources[producer])
+        for producer in witnessed:
+            collection_controls.record(path, scan_root, fingerprints[producer])
+    recorder_witnesses = set()
+    recorder_absences = []
+    for (test, inspector, panic, ignored, body), collection_checks, checks in zip(inspected, collections, observations):
         strings = {value for token in walk_tokens(body.children)
                    if token.kind in {"quoted", "raw"} and isinstance(value := literal((token,)), str)}
-        test.issues, test.measured = inspector.issues(test.name, pins, strings, line_comments)
+        test.issues, test.measured = inspector.issues(
+            test, pins, strings, line_comments, evidence,
+            set() if ignored else recorder_witnesses, recorder_absences,
+        )
         reported = set()
         for producer, present, line in collection_checks:
             if not present and producer not in witnessed and producer not in reported:
-                test.issues.append((line, "absence-no-control"))
+                if collection_controls is None:
+                    test.issues.append((line, "absence-no-control"))
+                else:
+                    collection_controls.record(path, scan_root, fingerprints[producer], test, line)
                 reported.add(producer)
+        test.issues.extend((line, "absence-no-control") for line in inspector.runtime_sweep_checks(checks))
         if not (panic or ignored or id(body) in macro_tests or has_outcome_evidence(test, inspector, body, evidence)):
             test.issues.append((test.line, "no-assert"))
         ignored_tool = (scan_root is not None and ignored
@@ -2690,4 +2851,7 @@ def parse(source, path, *, scan_root=None):
             test.guarded = all(guarded for _, _, _, guarded in guard_inspector.checks)
         test.conditional = inspector.assumes
         tests.append(test)
+    for test, line, origin in recorder_absences:
+        if origin not in recorder_witnesses:
+            test.issues.append((line, "absence-no-control"))
     return tests, comments

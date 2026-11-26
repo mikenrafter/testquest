@@ -1,5 +1,6 @@
 import ast
 import builtins
+from bisect import bisect_left
 from collections import ChainMap, Counter, defaultdict
 import io
 from pathlib import Path
@@ -7,7 +8,7 @@ import sys
 import tokenize
 
 from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, argument_claims, helper, loose_bounds, named_arguments,
-                   prefix_satisfies, DISTINCT_INPUTS, OUTCOME_CLAIM, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
+                   prefix_satisfies, DISTINCT_INPUTS, claims_effect, OUTCOME_CLAIM, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
                    inverse_codecs, path_directories, pins_path)
 from .source import Comment, Test, project_root
 
@@ -891,7 +892,7 @@ class Inspect(ast.NodeVisitor):
                     return False
         return True
 
-    def collection_checks(self, producers):
+    def collection_observations(self):
         for line, predicate, guards in self.checks:
             if guards or predicate is None:
                 continue
@@ -914,14 +915,32 @@ class Inspect(ast.NodeVisitor):
                 if ordered is ast.Eq or ordered in {ast.NotEq, ast.Gt, ast.GtE} and (
                         size == 0 and ordered is not ast.GtE or size > 0 and ordered is ast.GtE):
                     candidates.append((operand, ordered is not ast.Eq or size > 0))
+
             for operand, present in candidates:
                 if isinstance(operand, ast.Name) and operand.id in self.writes:
                     continue
-                value = self.resolve(operand, line)
-                if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
-                    name = value.func.id
-                    if name in producers and name not in self.iterables.changed:
-                        yield name, present, line
+                yield self.resolve(operand, line), present, line
+
+    def collection_checks(self, producers, observations):
+        for value, present, line in observations:
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+                name = value.func.id
+                if name in producers and name not in self.iterables.changed:
+                    yield name, present, line
+
+    def runtime_sweep_checks(self, observations):
+        witnessed = {value for value, present, _ in observations if present}
+        for value, present, line in observations:
+            if present:
+                continue
+            value = materialized_iterator(value)
+            if not isinstance(value, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                continue
+            for iterator in value.generators:
+                source = self.resolve(iterator.iter, iterator.iter.lineno)
+                if source not in witnessed and runtime_inventory(source):
+                    yield line
+                    break
 
     def unchecked_mocks(self):
         uses = defaultdict(list)
@@ -1688,6 +1707,47 @@ def collection_producers(definitions):
             yield name
 
 
+def materialized_iterator(node):
+    while (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+           and node.func.id in {"list", "tuple", "set", "sorted"}
+           and len(node.args) == 1 and not node.keywords):
+        node = node.args[0]
+    return node
+
+
+def runtime_inventory(node):
+    node = materialized_iterator(node)
+    if not isinstance(node, ast.Call):
+        return False
+    return (name_of(node.func) in {"listdir", "scandir", "os.listdir", "os.scandir", "glob", "iglob"}
+            or isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"glob", "rglob", "iglob", "iterdir"})
+
+
+def success_check(node):
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"is_ok", "success"} and not node.args and not node.keywords):
+        return True
+    op, left, right = comparison(node)
+    return op is ast.Eq and any(
+        isinstance(status, ast.Attribute) and status.attr in {"returncode", "exit_code"}
+        and type(literal(expected)) is int and literal(expected) == 0
+        for status, expected in ((left, right), (right, left)))
+
+
+def status_only(evidence):
+    for part in evidence:
+        if isinstance(part, ast.Assert) and success_check(part.test):
+            continue
+        if isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute):
+            if part.func.attr == "check_returncode" and not part.args and not part.keywords:
+                continue
+            if success_check(predicate(part, part.func.attr)):
+                continue
+        return False
+    return True
+
+
 def setup_only(node):
     checked = set()
     unchecked = False
@@ -1728,6 +1788,8 @@ def has_outcome_evidence(node, scope, checks_call):
                 or isinstance(part, ast.Call) and checks_call(scope, name_of(part.func))]
     if not evidence:
         return False
+    if claims_effect(node.name) and status_only(evidence):
+        return False
     if any(not isinstance(part, ast.Assert) for part in evidence):
         return True
     if OUTCOME_CLAIM.search(node.name) and all(
@@ -1738,11 +1800,24 @@ def has_outcome_evidence(node, scope, checks_call):
     return not setup_only(node)
 
 
-def parse(source, path, *, scan_root=None):
+def body_fingerprint(node, tokens, lines):
+    first, last = node.body[0], node.body[-1]
+    first_column = len(lines[first.lineno - 1].encode()[:first.col_offset].decode())
+    last_column = len(lines[last.end_lineno - 1].encode()[:last.end_col_offset].decode())
+    start = bisect_left(tokens, (first.lineno, first_column), key=lambda token: token.start)
+    end = bisect_left(tokens, (last.end_lineno, last_column), key=lambda token: token.start)
+    return node.name, tuple(
+        (token.type, "" if token.type in {tokenize.INDENT, tokenize.DEDENT, tokenize.NEWLINE} else token.string)
+        for token in tokens[start:end] if token.type not in {tokenize.COMMENT, tokenize.NL}
+    )
+
+
+def parse(source, path, *, scan_root=None, collection_controls=None):
     tree = ast.parse(source, filename=str(path))
+    tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
     comments = [
         Comment(start[0], start[1], text[1:].strip(), not raw[:start[1]].strip())
-        for kind, text, start, _, raw in tokenize.generate_tokens(io.StringIO(source).readline)
+        for kind, text, start, _, raw in tokens
         if kind == tokenize.COMMENT
     ]
     line_comments = {comment.line: comment.text for comment in comments}
@@ -1804,15 +1879,30 @@ def parse(source, path, *, scan_root=None):
         tests.append(test)
     pins = {pin for _, inspector, _ in inspected for pin in inspector.literal_pins()}
     producers = set(collection_producers(definitions))
-    collections = [list(inspector.collection_checks(producers)) for _, inspector, _ in inspected]
+    observations = [list(inspector.collection_observations()) for _, inspector, _ in inspected]
+    collections = [list(inspector.collection_checks(producers, checks))
+                   for (_, inspector, _), checks in zip(inspected, observations)]
     witnessed = {name for checks in collections for name, present, _ in checks if present}
-    for (test, inspector, node), collection_checks in zip(inspected, collections):
+    fingerprints = {}
+    if collection_controls is not None:
+        lines = source.splitlines()
+        for name in {name for checks in collections for name, _, _ in checks}:
+            fingerprints[name] = body_fingerprint(definitions[(), name], tokens, lines)
+        for name in witnessed:
+            collection_controls.record(path, scan_root, fingerprints[name])
+    for (test, inspector, node), collection_checks, checks in zip(inspected, collections, observations):
         strings = {part.value for part in body_nodes(node.body)
                    if isinstance(part, ast.Constant) and isinstance(part.value, str)}
         test.issues = inspector.issues(test.name, pins, strings, line_comments)
         scope = (*inspector.owner, node.name)
-        test.issues.extend((line, "absence-no-control") for name, present, line in collection_checks
-                           if not present and name not in witnessed)
+        for name, present, line in collection_checks:
+            if present or name in witnessed:
+                continue
+            if collection_controls is None:
+                test.issues.append((line, "absence-no-control"))
+            else:
+                collection_controls.record(path, scan_root, fingerprints[name], test, line)
+        test.issues.extend((line, "absence-no-control") for line in inspector.runtime_sweep_checks(checks))
         test.issues.extend((line, "absence-no-control") for line in inspector.unchecked_mocks())
         if not has_outcome_evidence(node, scope, checks_call):
             test.issues.append((test.line, "no-assert"))

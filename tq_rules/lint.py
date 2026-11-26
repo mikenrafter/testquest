@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import re
 
-from .source import finding, scan_paths
+from .source import CollectionControls, finding, scan_paths
 
 
 RULES = {
@@ -23,7 +23,7 @@ RULES = {
     ),
     "absence-no-control": (
         "No check shows that the recorder or detector can report a result.",
-        "An independent observation in the same test establishes that the recorder can fire.",
+        "An independent observation establishes that the recorder can fire.",
     ),
     "self-derived-expected": (
         "The expected value reuses production code from the module under test.",
@@ -45,7 +45,17 @@ DISTINCT_INPUTS = re.compile(
 OUTCOME_CLAIM = re.compile(
     r"(?:^|_)(?:returns_none|rejects|fails_when|errors_on|is_empty|truncat(?:es|ed)_before"
     r"|prints?_\w+?_to_(?:stderr|stdout))(?:_|$)")
+EFFECT_CLAIM = re.compile(
+    r"(?:^|_)(?:(?:prints|writes|sends|truncates|rejects|retries|records|emits|logs|deletes|creates)(?:_|$)"
+    r"|(?:idempotent|request_format)$)"
+)
+EFFECT_CONTEXT = re.compile(r"_(?:after|before|when|while|without)_")
 UNKNOWN = object()
+
+
+def claims_effect(name):
+    claim = EFFECT_CONTEXT.split(name, maxsplit=1)[0]
+    return bool(EFFECT_CLAIM.search(claim))
 
 
 @dataclass(frozen=True)
@@ -246,7 +256,10 @@ def helper(name):
 
 def find(paths):
     rows = []
-    for path, tests, comments in scan_paths(paths, rows, refine_guards=True):
+    controls = CollectionControls()
+    files = list(scan_paths(paths, rows, refine_guards=True, collection_controls=controls))
+    controls.finish()
+    for path, tests, comments in files:
         allows = {}
         for comment in comments:
             match = re.fullmatch(r"tq:\s*allow\s+([\w-]+)(?:\s+(.*))?", comment.text)
