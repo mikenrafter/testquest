@@ -1,9 +1,10 @@
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 import re
 
-from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, fixed_boundary, helper, loose_bounds,
-                   named_arguments, symmetric_input, unvaried_arguments)
+from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, argument_claims, fixed_boundary, helper, loose_bounds,
+                   named_arguments, prefix_satisfies, symmetric_input, unvaried_arguments)
 from .source import Comment, Test
 
 
@@ -578,6 +579,7 @@ def test_module(name):
 class FileIterables:
     def __init__(self, tokens, path, parameters):
         self.definitions = {}
+        self.path = path
         self.aliases = {}
         self.globs = defaultdict(list)
         self.test_items = set()
@@ -650,6 +652,23 @@ class FileIterables:
                    and (scope + name[1:] if name[0] == "Self" else self.resolve(scope, name)) == expected
                    for name in constant_references(body))
 
+    def function(self, path, *, external=False):
+        kind, body = self.definitions.get(path, ("", ()))
+        if kind == "helper" or not external or not path:
+            return body
+        for root in self.path.parents:
+            if (root / "lib.rs").is_file() or (root / "main.rs").is_file():
+                module = root.joinpath(*path[:-1])
+                if path[:-1]:
+                    candidates = (module.with_suffix(".rs"), module / "mod.rs")
+                else:
+                    candidates = (root / "lib.rs", root / "main.rs")
+                files = [candidate for candidate in candidates if candidate.is_file()]
+                if len(files) == 1:
+                    return module_functions(files[0]).get(path[-1], ())
+                break
+        return ()
+
     def lookup(self, scope, name, kind):
         if not name:
             return None
@@ -661,6 +680,113 @@ class FileIterables:
             return literal_size(expression, lambda count: known_integer(
                 count, lambda tokens, kind: self.lookup(path[:-1], qualified_name(tokens), kind)))
         return None
+
+
+@lru_cache(maxsize=64)
+def module_functions(path):
+    try:
+        tokens, _ = tokenize(path.read_text(encoding="utf-8"))
+        return {name: return_expression(body) for name, body in function_bodies(group(tokens))}
+    except (OSError, ValueError):
+        return {}
+
+
+def literal_returns(tokens):
+    tail_start = max((index + 1 for index, token in enumerate(tokens)
+                      if token.text in {";", "{"}), default=0)
+    value = number_value(tokens[tail_start:])
+    if value is not None:
+        yield value
+    yield from explicit_literal_returns(tokens)
+    tail = tuple(split(tokens, ";"))[-1] if tokens and tokens[-1].text == "{" else ()
+    if tail and tail[0].text == "if":
+        for index, token in enumerate(tail):
+            if token.text == "{" and (index == len(tail) - 1 or tail[index + 1].text == "else"):
+                yield from literal_returns(token.children)
+
+
+def explicit_literal_returns(tokens):
+    nested_functions = {id(body) for _, body in function_bodies(tokens)}
+    in_closure = False
+    for index, token in enumerate(tokens):
+        if token.text == ";":
+            in_closure = False
+        elif token.text == "|":
+            in_closure = True
+        elif token.text == "return" and not in_closure:
+            value = number_value(next(iter(split(tokens[index + 1:], ";")), ()))
+            if value is not None:
+                yield value
+        elif (token.text == "{" and not in_closure and id(token) not in nested_functions
+              and (not index or tokens[index - 1].text != "!")):
+            yield from explicit_literal_returns(token.children)
+
+
+def number_value(tokens):
+    value = literal(tokens, signed_and_float=True)
+    if isinstance(value, SuffixedNumber):
+        return value.value
+    return value if type(value) in {int, float} else None
+
+
+def output_fragments(tokens):
+    tokens = unborrow(tokens)
+    if len(tokens) == 1:
+        value = literal(tokens)
+        if isinstance(value, str):
+            return [value]
+        if tokens[0].kind == "quoted" and tokens[0].text.startswith('"'):
+            content = tokens[0].text[1:-1]
+            escapes = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+            if all(escape in escapes for escape in re.findall(r"\\(.)", content)):
+                return [re.sub(r"\\(.)", lambda match: escapes[match[1]], content)]
+        return []
+    if len(tokens) != 3 or not macro_at(tokens, 0, {"format"}):
+        return []
+    args = list(split(tokens[-1].children))
+    if not args or len(args[0]) != 1 or args[0][0].kind not in {"quoted", "raw"}:
+        return []
+    template = args[0][0].text
+    fragments = [part for text in output_fragments(args[0])
+                 for part in re.split(r"\{[^{}]*\}", text) if part]
+    fields = re.findall(r"\{[^{}]*\}", template)
+    if (len(fields) == len(args) - 1 and "{{" not in template and "}}" not in template
+            and all(re.fullmatch(r"\{(?::[<>^]?\d+)?\}", field) for field in fields)):
+        fragments.extend(text for arg in args[1:] if isinstance(text := literal(arg), str))
+    return fragments
+
+
+def output_parts(tokens):
+    if not tokens or tokens[-1].kind != "word":
+        return (), ()
+    name = tokens[-1].text
+    statements = list(split(tokens[:-1], ";"))
+    if not statements or shape(statements[0]) != ("let", "mut", name, "=", "String", "::", "new", "("):
+        return (), ()
+    prefix, dynamic = [], []
+
+    def appends(parts):
+        for index, token in enumerate(parts):
+            if token.text == "return":
+                return False
+            if token.text == name:
+                call = parts[index:index + 4]
+                if shape(call[:3]) != (name, ".", "push_str") or len(call) != 4 or call[-1].text != "(":
+                    return False
+                dynamic.extend(output_fragments(call[-1].children))
+            if token.kind == "group" and not appends(token.children):
+                return False
+        return True
+
+    end = 1
+    for statement in statements[1:]:
+        if shape(statement[:3]) != (name, ".", "push_str") or len(statement) != 4 or statement[3].text != "(":
+            break
+        prefix.extend(output_fragments(statement[3].children))
+        end += 1
+    if not all(appends(statement) for statement in statements[end:]):
+        return (), ()
+    return prefix, dynamic
 
 
 def return_expression(body):
@@ -979,12 +1105,134 @@ class Inspect:
                 if token.text != "[":
                     return
 
+    def fixed_output_check(self, tokens, line):
+        alternatives = list(split(tokens, "||"))
+        if len(alternatives) < 2:
+            return False
+        receivers, needles = [], []
+        for part in alternatives:
+            subject, name, args = method_call(part)
+            needle = literal(args)
+            if name != "contains" or type(needle) is not str or not needle:
+                return False
+            receivers.append(self.resolve(subject, line))
+            needles.append(needle)
+        value = receivers[0]
+        if not value or value[-1].text != "(" or not all(shape(value) == shape(other) for other in receivers):
+            return False
+        callee = qualified_name(value[:-1])
+        path = self.oracle_path(callee, line)
+        prefix, body = output_parts(self.file_iterables.function(path, external=callee[:1] == ("crate",)))
+        return prefix_satisfies(needles, prefix, body)
+
+    def order_without_cardinality(self, line, name, args):
+        if name.endswith("_eq") and len(args) >= 2:
+            subject = ()
+            for original, sorted_copy in (args[:2], args[:2][::-1]):
+                original = unborrow(original)
+                sorted_copy = unborrow(sorted_copy)
+                if original and original[0].text == "*":
+                    original = original[1:]
+                if len(sorted_copy) != 1:
+                    continue
+                source, method, _ = method_call(self.resolve(sorted_copy, line))
+                if method == "clone" and shape(original) == shape(source):
+                    sort_calls = self.calls.get((sorted_copy[0].text, ".", "sort"), ())
+                    if any(sorted_copy[0].line >= loc[0] > source[0].line for loc, _, _ in sort_calls):
+                        subject = source
+                        break
+        elif name in {"assert", "debug_assert", "prop_assert"}:
+            subject, method, parts = method_call(self.resolve(args[0], line))
+            if method == "all":
+                subject, method, width = method_call(subject)
+                if method != "windows" or integer_literal(width) != 2 or not parts:
+                    return False
+            elif method != "is_sorted":
+                return False
+        else:
+            return False
+        if not subject or subject[0].kind != "word" or subject[0].text in self.mutated:
+            return False
+        if len(subject) != 1 and not all(
+                token.text == "." if index % 2 else token.kind == "word"
+                for index, token in enumerate(subject)):
+            return False
+        subjects = {subject[0].text}
+        if len(subject) == 1:
+            value = self.resolve(subject, line)
+            if shape(value) in {shape(subject), ("Vec", "::", "new", "("), ("vec", "!", "[")}:
+                return False
+            if len(value) > 4 and value[-2].text == "clone":
+                return False
+            if self.fixed_projection(value, line):
+                return False
+            while source := self.projection_source(value):
+                if source in subjects:
+                    break
+                subjects.add(source)
+                value = self.resolve(value[:1], line)
+            for alias, bindings in self.bindings.items():
+                if len(bindings) == 1 and self.projection_source(bindings[0][1]) in subjects:
+                    subjects.add(alias)
+        for other_line, other_name, other_args, _ in self.checks:
+            if other_line == line or not other_args:
+                continue
+            if (other_name.endswith("_eq") and len(other_args) >= 2
+                    and all(method_call(arg)[1] == "len" for arg in other_args[:2])):
+                continue
+            if any(token.text in subjects for argument in other_args[:2]
+                   for token in check_arguments(argument) if token.kind == "word"):
+                return False
+        return True
+
+    @staticmethod
+    def projection_source(tokens):
+        if (len(tokens) > 7 and tokens[0].kind == "word"
+                and shape(tokens[1:4]) in {(".", "iter", "("), (".", "into_iter", "(")}
+                and {token.text for index, token in enumerate(tokens) if index and tokens[index - 1].text == "."}
+                == {tokens[2].text, "map", "collect"}):
+            return tokens[0].text
+        return None
+
+    def fixed_projection(self, tokens, line):
+        if tokens and tokens[-1].text == "(":
+            path = self.oracle_path(qualified_name(tokens[:-1]), line)
+            body = self.file_iterables.function(path)
+            if body:
+                tokens = tuple(split(body, ";"))[-1]
+        return (len(tokens) > 5 and tokens[0].text == "("
+                and tuple(token.text for token in tokens[1:6]) == (".", "map", "(", ".", "collect")
+                and any(shape(tokens[0].children[index:index + 2]) == (".", ".")
+                        for index in range(len(tokens[0].children) - 1)))
+
+    def file_measurement(self, callee, line):
+        if len(callee) != 1:
+            return False
+        body = self.resolve(callee, line)
+        if not body or body[0].text != "|":
+            return False
+        stack = [body]
+        while stack:
+            tokens = stack.pop()
+            if any(shape(tokens[index:index + 5]) in {
+                    ("std", "::", "fs", "::", "read_dir"),
+                    ("std", "::", "fs", "::", "read_to_string"),
+                    } for index in range(len(tokens) - 4)):
+                return True
+            stack.extend(token.children for token in tokens if token.children)
+        return False
+
     def argument_calls(self, test_name):
         checked, observed, direct, fixtures = set(), set(), set(), set()
         bound_checks = []
+        claims = argument_claims(test_name)
         for line, name, args, _ in self.checks:
             if name not in ASSERTIONS or not args:
                 continue
+            boolean = name in {"assert", "debug_assert", "prop_assert"}
+            if (boolean and self.fixed_output_check(args[0], line)
+                    or self.order_without_cardinality(line, name, args)):
+                yield line
             if name.endswith(("_eq", "_ne")) and len(args) >= 2:
                 predicates = [("==" if name.endswith("_eq") else "!=", *args[:2])]
             else:
@@ -1005,10 +1253,12 @@ class Inspect:
                         direct.add(id(arguments))
                         inputs = {position: literal(arg, signed_and_float=True)
                                   for position, arg in enumerate(split(arguments.children))}
-                        threshold = literal(other, signed_and_float=True)
-                        bounded = op in {">", ">=", "<", "<="} and type(threshold) in {int, float, SuffixedNumber}
-                        bound_checks.append((shape(value[:-1]), (first.line, first.column), inputs, bounded))
-
+                        threshold = number_value(other)
+                        bounded = op in {">", ">=", "<", "<="} and threshold is not None
+                        path = self.oracle_path(qualified_name(value[:-1]), line) if bounded else ()
+                        exempt = bounded and (self.file_measurement(value[:-1], line)
+                                              or threshold in literal_returns(self.file_iterables.function(path)))
+                        bound_checks.append((shape(value[:-1]), (first.line, first.column), inputs, bounded, exempt))
 
         for arguments in self.check_arguments:
             for token in check_arguments(arguments.children):
@@ -1027,7 +1277,8 @@ class Inspect:
                 if id(arguments) not in self.expected:
                     inputs = {position: value for position, value in literals.items() if position not in ignored}
                     unvaried.append((callee, location, inputs, id(arguments) in observed))
-                    coverage.append((callee, location, inputs, id(arguments) in observed, id(arguments) in fixtures))
+                    if any(claims):
+                        coverage.append((callee, location, inputs, id(arguments) in observed, id(arguments) in fixtures))
                     if id(arguments) in fixtures and id(arguments) not in observed:
                         nested.append((location, inputs))
             if fixed_boundary([inputs for _, inputs in nested]):
@@ -1039,7 +1290,7 @@ class Inspect:
                 if symmetric_input(name, legacy, shapes, peers, observed=id(args) in direct):
                     yield line
         yield from unvaried_arguments(unvaried)
-        yield from named_arguments(test_name, coverage, self.parameters_for)
+        yield from named_arguments(coverage, claims, self.parameters_for)
         yield from loose_bounds(bound_checks)
 
     def parameters_for(self, callee):

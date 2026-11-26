@@ -30,7 +30,7 @@ RULES = {
         "The test checks repeatability, a before-and-after observation, or a declared relation between different inputs or entry points.",
     ),
     "nondistinguishing-literal": (
-        "Symmetric inputs or an unvaried argument can hide an argument handling error.",
+        "The fixture or assertion can let a wrong implementation pass.",
         "The test's WHY explains the symmetric or fixed input. Examples include equal weights, a zero-write case, or a test that isolates another parameter.",
     ),
 }
@@ -140,7 +140,7 @@ def unvaried_arguments(calls):
             yield min(location for location, _, _ in group)[0]
 
 
-def name_claims(test_name):
+def argument_claims(test_name):
     words = re.findall(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|[0-9]+", test_name)
     words = [word.lower() for word in words]
     every = any(
@@ -150,8 +150,41 @@ def name_claims(test_name):
         for index, word in enumerate(words)
     )
     absent = {word[:-4] for word in words if word.endswith("less") and len(word) > 4}
-    general = any(word in {"empty", "missing", "none", "zero", "without", "no"} for word in words)
-    return every, absent, general
+    return every, absent
+
+
+def named_arguments(calls, claims, parameter_names):
+    """Check explicit coverage claims, including absence tied to a named parameter."""
+    every, absent = claims
+    by_callee = {}
+    for callee, location, inputs, observed, feeds_check in calls:
+        by_callee.setdefault(callee, []).append((location, inputs, observed, feeds_check))
+    for group in by_callee.values():
+        checked = [inputs for _, inputs, observed, _ in group if observed]
+        fixtures = sum(feeds_check for _, _, _, feeds_check in group)
+        samples = [inputs for _, inputs, _, _ in group]
+        positions = set().union(*(inputs.keys() for inputs in samples))
+        fixed = {position for position in positions
+                 if samples[0].get(position, UNKNOWN) is not UNKNOWN
+                 and all(literal_key(inputs.get(position, UNKNOWN)) == literal_key(samples[0][position])
+                         for inputs in samples)}
+        missing_input = every and bool(fixed) and (len(checked) >= 2 or (fixtures >= 2 and positions - fixed))
+        if absent and len(checked) >= 2:
+            names = parameter_names(callee)
+            # CLAIM(tq-named-absence): an exact parameter and variation in a separate empty slot
+            # identify which input cases the test claims [test_rust_negative_case_names].
+            # ↳ CLAIM(tq-named-absence)
+            for position in fixed:
+                if names.get(position) not in absent:
+                    continue
+                value = samples[0][position]
+                missing_input |= (not empty_input(value) and any(
+                    any(empty_input(inputs.get(other, UNKNOWN)) for inputs in checked)
+                    and any(inputs.get(other, UNKNOWN) is not UNKNOWN and
+                            not empty_input(inputs[other]) for inputs in checked)
+                    for other in positions - fixed))
+        if missing_input:
+            yield min(location for location, _, _, _ in group)[0]
 
 
 def empty_input(value):
@@ -160,55 +193,23 @@ def empty_input(value):
     return value is None or (type(value) is not bool and value in (0, "", b"", [], (), {}))
 
 
-def named_arguments(test_name, calls, parameter_names):
-    """Yield the first invocation of a callee when its examples miss the named case."""
-    every, absent, general = name_claims(test_name)
-    if not (every or absent or general):
-        return
-    by_callee = {}
-    for callee, location, inputs, observed, feeds_check in calls:
-        by_callee.setdefault(callee, []).append((location, inputs, observed, feeds_check))
-    observed_callees = sum(any(observed for _, _, observed, _ in group)
-                           for group in by_callee.values())
-    for callee, group in by_callee.items():
-        checked = [inputs for _, inputs, observed, _ in group if observed]
-        fixtures = [inputs for _, inputs, _, feeds_check in group if feeds_check]
-        samples = [inputs for _, inputs, _, _ in group]
-        positions = set().union(*(inputs.keys() for inputs in samples))
-        fixed = {position for position in positions
-                 if samples[0].get(position, UNKNOWN) is not UNKNOWN
-                 and all(literal_key(inputs.get(position, UNKNOWN)) == literal_key(samples[0][position])
-                         for inputs in samples)}
-        can_check_variety = len(checked) >= 2 or (len(fixtures) >= 2 and bool(positions - fixed))
-        uncovered = every and can_check_variety and bool(fixed)
-        if checked:
-            empty = {position for position in positions
-                     if any(empty_input(inputs.get(position, UNKNOWN)) for inputs in samples)}
-            # A named parameter can show which empty argument belongs to a “...less” case.
-            named = parameter_names(callee)
-            specific = {position for position in positions if named.get(position) in absent}
-            missing_specific = any(
-                position not in empty
-                and all(inputs.get(position, UNKNOWN) is not UNKNOWN for inputs in samples)
-                for position in specific
-            )
-            all_literal = all(inputs and UNKNOWN not in inputs.values() for inputs in checked)
-            missing_general = (bool(general or absent and not specific) and observed_callees == 1
-                               and not empty and all_literal)
-            uncovered |= missing_specific or missing_general
-        if uncovered:
-            yield min(location for location, _, _, _ in group)[0]
-
-
 def loose_bounds(checks):
     by_callee = {}
-    for callee, location, inputs, bounded in checks:
-        by_callee.setdefault(callee, []).append((location, inputs, bounded))
+    for callee, location, inputs, bounded, exempt in checks:
+        by_callee.setdefault(callee, []).append((location, inputs, bounded, exempt))
     for group in by_callee.values():
-        if all(bounded for _, _, bounded in group):
-            for location, inputs, _ in group:
-                if inputs and all(value is not UNKNOWN for value in inputs.values()):
+        if all(bounded for _, _, bounded, _ in group):
+            exempt_locations = {location for location, _, _, exempt in group if exempt}
+            for location, inputs, _, _ in group:
+                if location not in exempt_locations and inputs and UNKNOWN not in inputs.values():
                     yield location[0]
+
+
+def prefix_satisfies(needles, prefix, body):
+    """One alternative matches the fixed prefix while another requires the dynamic body."""
+    return (any(needle in text for text in prefix for needle in needles)
+            and any(any(needle in text for text in body) and not any(needle in text for text in prefix)
+                    for needle in needles))
 
 
 def fixed_boundary(calls):

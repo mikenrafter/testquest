@@ -31,7 +31,7 @@ class NondistinguishingLiteralsRound3(TqCase):
             """, "nondistinguishing-literal", ("period(&image(textured), 6, 2, 2)",), "checks.rs")
 
     def test_python_named_coverage(self):
-        # WHY: an every-input claim must vary flags, and an empty case must supply an empty input.
+        # WHY: an every-input claim must vary flags even when another argument varies.
         # catches: requiring numeric identities, or treating names with no relevant claim as coverage claims.
         self.check_lint("""
             def testEveryInputChangesTheKey():
@@ -41,34 +41,14 @@ class NondistinguishingLiteralsRound3(TqCase):
             def test_every_input_changes_the_hash():
                 assert digest("short", False) != digest("long", True)
 
-            def test_supports_empty_body():
-                assert message("content") == expected
-
-            def test_accepts_empty_body():
-                assert render("") == expected
-                assert render("content") == other
-
             def test_takes_noisy_input():
                 assert handle("content") == expected
-            """, "nondistinguishing-literal", ('original = key', 'message("content")'))
+            """, "nondistinguishing-literal", ('original = key',))
 
     def test_rust_named_coverage(self):
-        # WHY: the empty body does not cover a missing command or variation in an input fixture.
-        # catches: using an empty argument to cover unrelated named cases or excluding string and bool literals.
+        # WHY: an every-input claim requires variation in fixture arguments as well as in the checked call.
+        # catches: ignoring unvaried numeric fixture arguments or boolean inputs.
         self.check_lint("""
-            fn message(command: &str, instructions: &str) -> String { todo!() }
-
-            #[test]
-            fn supports_commandless_requests_and_empty_bodies() {
-                assert_eq!(message("/compact", "instructions"), combined);
-                assert_eq!(message("/compact", ""), command);
-            }
-
-            #[test]
-            fn handles_commandless_requests() {
-                assert_eq!(message("", "instructions"), instructions);
-            }
-
             #[test]
             fn every_argument_changes_the_key() {
                 let base = spec(100, 50);
@@ -81,7 +61,7 @@ class NondistinguishingLiteralsRound3(TqCase):
                 assert_ne!(digest(3, false), digest(5, true));
             }
             """, "nondistinguishing-literal", (
-                'message("/compact", "instructions")', 'let base = spec', 'let first = key',
+                'let base = spec', 'let first = key',
             ), "checks.rs")
 
     def test_python_checked_value_and_zero_origin(self):

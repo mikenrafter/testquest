@@ -6,8 +6,8 @@ from pathlib import Path
 import sys
 import tokenize
 
-from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, helper, loose_bounds, named_arguments,
-                   symmetric_input, unvaried_arguments)
+from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, argument_claims, helper, loose_bounds, named_arguments,
+                   prefix_satisfies, symmetric_input, unvaried_arguments)
 from .source import Comment, Test
 
 
@@ -141,7 +141,7 @@ ORACLE_FUNCTIONS = {"json.dumps", "json.loads"}
 
 class Inspect(ast.NodeVisitor):
     def __init__(self, imports, checking_helpers, local_helpers, iterables, parameters,
-                 oracle_imports, module_constants):
+                 oracle_imports, module_constants, definitions, owner):
         self.imports = imports
         self.checking_helpers = checking_helpers
         self.local_helpers = local_helpers
@@ -149,6 +149,8 @@ class Inspect(ast.NodeVisitor):
         self.parameters = parameters
         self.oracle_imports = oracle_imports
         self.module_constants = module_constants
+        self.definitions = definitions
+        self.owner = owner
         self.checks = []
         self.calls = []
         self.check_arguments = []
@@ -157,6 +159,7 @@ class Inspect(ast.NodeVisitor):
         self.writes = {}
         self.reads = set()
         self.guards = []
+        self.output_loops = {}
         self.constraints = set()
         self.measured = False
 
@@ -225,6 +228,8 @@ class Inspect(ast.NodeVisitor):
     def visit_For(self, node):
         self.visit(node.iter)
         runs = isinstance(node, ast.For) and self.iterables.nonempty(node.iter)
+        if not runs and isinstance(node.iter, ast.Attribute) and isinstance(node.target, ast.Name):
+            self.output_loops[node.iter] = node.target.id
         self.visit_loop((node.target, *node.body), node.orelse, None if runs else node.iter)
 
     visit_AsyncFor = visit_For
@@ -424,6 +429,7 @@ class Inspect(ast.NodeVisitor):
 
     def literal_issues(self, test_name):
         checked, observed, direct, fixtures = set(), set(), set(), set()
+        claims = argument_claims(test_name)
         expected = {call for value in self.expected_arguments for call in self.constructor_calls(value)}
         for argument in self.check_arguments:
             line = argument.lineno
@@ -463,7 +469,8 @@ class Inspect(ast.NodeVisitor):
                           if not names.get(position, "").startswith("_")}
                 location = (call.lineno, call.col_offset)
                 unvaried.append((callee, location, inputs, id(call) in observed))
-                coverage.append((callee, location, inputs, id(call) in observed, id(call) in fixtures))
+                if any(claims):
+                    coverage.append((callee, location, inputs, id(call) in observed, id(call) in fixtures))
 
         for callee, group in calls.items():
             peers = [(arguments, literals) for call, literals, arguments in group
@@ -483,8 +490,47 @@ class Inspect(ast.NodeVisitor):
                 if symmetric_input(name, literals, arguments, peers, observed=id(call) in direct):
                     yield call.lineno
         yield from unvaried_arguments(unvaried)
-        yield from named_arguments(test_name, coverage, lambda callee: self.parameters.get(callee, {}))
+        yield from named_arguments(coverage, claims, lambda callee: self.parameters.get(callee, {}))
         yield from loose_bounds(self.bound_checks())
+        yield from self.unchecked_item_order()
+
+    def definition_for(self, callee):
+        root, *parts = name_of(callee).split(".")
+        if root == "self" and len(parts) == 1:
+            return self.definitions.get((self.owner, parts[0]))
+        if root and root not in self.iterables.changed and root not in self.imports:
+            return self.definitions.get((tuple([root, *parts[:-1]]) if parts else (),
+                                         parts[-1] if parts else root))
+        return None
+
+    def reads_file_text(self, source, line):
+        source = self.resolve(source, line)
+        if (isinstance(source, ast.Attribute) and name_of(source.value) == "self"
+                and name_of(source) not in self.iterables.changed):
+            sources = []
+            for setup in ("setUp", "setUpClass"):
+                definition = self.definitions.get((self.owner, setup))
+                if definition:
+                    receiver = definition.args.args[0].arg if definition.args.args else ""
+                    sources.extend(value for _, target, value in assignments(definition.body)
+                                       if name_of(target) == f"{receiver}.{source.attr}")
+            source = sources[0] if len(sources) == 1 else source
+        if not isinstance(source, ast.Call):
+            return False
+        name = name_of(source.func).split(".")[-1]
+        return name == "read_text" or (
+            name == "read" and isinstance(source.func, ast.Attribute)
+            and isinstance(source.func.value, ast.Call) and name_of(source.func.value.func) == "open")
+
+    def counts_file_text(self, call, line):
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "count":
+            return self.reads_file_text(call.func.value, line)
+        if name_of(call.func) == "len" and len(call.args) == 1:
+            matches = self.resolve(call.args[0], line)
+            if isinstance(matches, ast.Call) and self.imported_name(matches.func) == "re.findall":
+                text = call_arguments(matches).get("string", call_arguments(matches).get(1))
+                return self.reads_file_text(text, line)
+        return False
 
     def bound_checks(self):
         for line, predicate, _ in self.checks:
@@ -499,10 +545,101 @@ class Inspect(ast.NodeVisitor):
                         call = self.resolve(operand, line)
                         if not isinstance(call, ast.Call):
                             continue
+                        threshold = literal(other)
                         bounded = (isinstance(operator, (ast.Gt, ast.GtE, ast.Lt, ast.LtE))
-                                   and type(literal(other)) in {int, float})
+                                   and type(threshold) in {int, float})
+                        exempt = False
+                        if bounded:
+                            definition = self.definition_for(call.func)
+                            exempt = self.counts_file_text(call, line) or (
+                                definition is not None and any(
+                                    isinstance(part, ast.Return)
+                                    and type(value := literal(part.value)) in {int, float}
+                                    and value == threshold for part in body_nodes(definition.body)))
                         yield (ast.unparse(call.func), (call.lineno, call.col_offset),
-                               argument_literals(call_arguments(call)), bounded)
+                               argument_literals(call_arguments(call)), bounded, exempt)
+
+    def fixed_output_check(self, node, line):
+        if not isinstance(node, ast.BoolOp) or not isinstance(node.op, ast.Or):
+            return False
+        alternatives = [comparison(part) for part in node.values]
+        if not all(op is ast.In and isinstance(literal(left), str) and literal(left)
+                   for op, left, _ in alternatives):
+            return False
+        receivers = [self.resolve(right, line) for _, _, right in alternatives]
+        call = receivers[0]
+        if not isinstance(call, ast.Call) or not all(same(call, other) for other in receivers[1:]):
+            return False
+        definition = self.definition_for(call.func)
+        if definition is None or not isinstance(definition.body[-1], ast.Return):
+            return False
+        result = definition.body[-1].value
+        if not isinstance(result, ast.Name):
+            return False
+        initializers = [literal(value) for _, target, value in assignments(definition.body)
+                        if name_of(target) == result.id]
+        if len(initializers) != 1 or not isinstance(initializers[0], str):
+            return False
+        # CLAIM(tq-python-prefix): only an initial assignment followed by appends is a fixed prefix
+        # [test_python_fixed_output].
+        prefix = initializers[0]
+        body = []
+        stores, appends = 0, 0
+        for part in body_nodes(definition.body):
+            if isinstance(part, ast.Return) and part is not definition.body[-1]:
+                return False
+            if isinstance(part, ast.Name) and part.id == result.id and isinstance(part.ctx, ast.Store):
+                stores += 1
+            if isinstance(part, ast.AugAssign) and name_of(part.target) == result.id:
+                if not isinstance(part.op, ast.Add):
+                    return False
+                appends += 1
+                values = part.value.values if isinstance(part.value, ast.JoinedStr) else [part.value]
+                body.extend(value for item in values if isinstance(value := literal(item), str))
+        return (stores == 1 + appends
+                # ↳ CLAIM(tq-python-prefix)
+                and prefix_satisfies([literal(left) for _, left, _ in alternatives], [prefix], body))
+
+    def order_without_cardinality(self, node, line):
+        operator, left, right = comparison(node)
+        if operator is not ast.Eq or "sorted" in self.iterables.changed or "sorted" in self.local_helpers:
+            return False
+        for subject, sorted_call in ((left, right), (right, left)):
+            if (not isinstance(subject, ast.Name) or not isinstance(sorted_call, ast.Call)
+                    or name_of(sorted_call.func) != "sorted" or len(sorted_call.args) != 1
+                    or not same(subject, sorted_call.args[0])):
+                continue
+            source = self.resolve(subject, line)
+            if not isinstance(source, (ast.Call, ast.ListComp, ast.Attribute, ast.Subscript)):
+                continue
+            if not any(other_line != line and any(
+                    isinstance(part, ast.Name) and part.id == subject.id for part in body_nodes((other,)))
+                       for other_line, other, _ in self.checks if other is not None):
+                return True
+        return False
+
+    def unchecked_item_order(self):
+        """Yield one finding when aggregate checks pass even if no per-item checks run."""
+        unguarded = [node for _, node, guards in self.checks if node is not None and not guards]
+        for source, item in self.output_loops.items():
+            owner = source.value
+            if not isinstance(owner, ast.Name) or not isinstance(self.resolve(owner, source.lineno), ast.Call):
+                continue
+            if not any(isinstance(part, ast.Name) and part.id == owner.id
+                       for part in body_nodes(unguarded)):
+                continue
+            if any(same(part, source) for _, node, guards in self.checks
+                   if node is not None and source not in guards for part in body_nodes((node,))):
+                continue
+            for line, node, guards in self.checks:
+                if guards != (source,):
+                    continue
+                op, left, right = comparison(node)
+                if (op in {ast.Lt, ast.LtE, ast.Gt, ast.GtE}
+                        and all(isinstance(part, ast.Attribute) and name_of(part.value) == item
+                                for part in (left, right))):
+                    yield line
+                    break
 
     @staticmethod
     def constructor_calls(value):
@@ -526,7 +663,8 @@ class Inspect(ast.NodeVisitor):
                 findings.append((line, "self-compare"))
             if operator is ast.Eq and self.coupled(left, right, line):
                 findings.append((line, "self-derived-expected"))
-            if operator is ast.Eq and self.zero_origin(self.resolve(left, line), right, line):
+            if (operator is ast.Eq and self.zero_origin(self.resolve(left, line), right, line)
+                    or self.fixed_output_check(node, line) or self.order_without_cardinality(node, line)):
                 findings.append((line, "nondistinguishing-literal"))
 
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
@@ -873,7 +1011,7 @@ def parse(source, path):
         oracle_imports.update((name, module) for name, module in imports_in(node.body).items()
                               if iterables.changed[name] == 1)
         inspector = Inspect(imports, checks_in(parents), local_helpers, iterables, test_parameters,
-                            oracle_imports, module_constants)
+                            oracle_imports, module_constants, definitions, parents)
         for statement in node.body:
             inspector.record_uses(statement)
             inspector.visit(statement)
