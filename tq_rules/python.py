@@ -8,7 +8,7 @@ import tokenize
 
 from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, argument_claims, helper, loose_bounds, named_arguments,
                    prefix_satisfies, DISTINCT_INPUTS, OUTCOME_CLAIM, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
-                   path_directories, pins_path)
+                   inverse_codecs, path_directories, pins_path)
 from .source import Comment, Test, project_root
 
 
@@ -454,46 +454,85 @@ class Inspect(ast.NodeVisitor):
         oracle = expected if len(actual) == 1 else actual
         return bool(oracle - pins)
 
-    def field_call(self, operand, line):
+    def observed_result(self, operand, line):
         operand = self.resolve(operand, line)
+        projection = ()
         if (isinstance(operand, ast.Call) and name_of(operand.func) == "len"
                 and "len" not in self.iterables.changed and "len" not in self.oracle_imports
                 and "len" not in self.local_helpers and len(operand.args) == 1 and not operand.keywords):
+            projection = ("len",)
             operand = self.resolve(operand.args[0], operand.lineno)
-        if isinstance(operand, ast.Attribute):
-            return operand.attr, self.resolve(operand.value, operand.lineno)
-        return "", None
+        while isinstance(operand, ast.Attribute):
+            projection = (operand.attr, *projection)
+            operand = self.resolve(operand.value, operand.lineno)
+        return projection, operand
+
+    def fixture(self, operand, line):
+        while isinstance(operand, ast.Name):
+            if any(isinstance(other.func, ast.Attribute) and name_of(other.func.value) == operand.id
+                   and other.lineno < line for other in self.calls):
+                return None
+            prior = [binding for binding in self.bindings.get(operand.id, ()) if binding[0] < line]
+            if len(prior) != 1:
+                break
+            _, operand = prior[0]
+        return operand
 
     def empty_parity(self, left, right, line):
-        field, first = self.field_call(left, line)
-        other_field, second = self.field_call(right, line)
-        if (not field or field != other_field or not all(isinstance(call, ast.Call) for call in (first, second))
+        projection, first = self.observed_result(left, line)
+        other_projection, second = self.observed_result(right, line)
+        if (projection != other_projection or not all(isinstance(call, ast.Call) for call in (first, second))
                 or not all(len(call.args) == 1 and not call.keywords for call in (first, second))):
             return False
         calls = self.oracle_calls(first, line), self.oracle_calls(second, line)
         if not all(calls) or calls[0] == calls[1]:
             return False
 
-        def fixture(call):
-            operand = call.args[0]
-            if isinstance(operand, ast.Name) and any(
-                    isinstance(other.func, ast.Attribute) and name_of(other.func.value) == operand.id
-                    and other.lineno < call.lineno for other in self.calls):
-                return UNKNOWN
-            return literal(self.resolve(operand, call.lineno))
-
-        value, other = fixture(first), fixture(second)
+        value, other = (literal(self.fixture(call.args[0], call.lineno)) for call in (first, second))
         if type(value) is not type(other) or value != other:
             return False
-        if value in ([], (), ""):
+        if value in ([], (), "", b""):
             return True
-        if field not in IMPORT_FIELDS or not isinstance(value, str) or IMPORT_TOKEN.search(value):
+        if not IMPORT_FIELDS.intersection(projection) or not isinstance(value, str) or IMPORT_TOKEN.search(value):
             return False
         try:
             ast.parse(value)
         except (SyntaxError, ValueError):
             return False
         return True
+
+    def result_key(self, observation):
+        projection, call = observation
+        if not isinstance(call, ast.Call) or call.keywords:
+            return None
+        path = tuple(self.imported_name(call.func).split("."))
+        if self.oracle_calls(call, call.lineno) != {path}:
+            return None
+        arguments = tuple(ast.dump(self.resolve(arg, call.lineno)) for arg in call.args)
+        return path, projection, arguments
+
+    def result_pins(self):
+        for line, check, guarded in self.checks:
+            operator, left, right = comparison(check)
+            if operator is ast.Eq and not guarded:
+                for operand, other in ((left, right), (right, left)):
+                    if literal(self.resolve(other, line)) is not UNKNOWN:
+                        if result := self.result_key(self.observed_result(operand, line)):
+                            yield result
+
+    def wrapper_parity(self, left, right, line, strings, result_pins):
+        first, second = (self.result_key(self.observed_result(operand, line)) for operand in (left, right))
+        if not first or not second or first[0] == second[0]:
+            return None
+        for wrapper, base in ((first, second), (second, first)):
+            if self.module_constants.delegate(wrapper[0]) != base[0]:
+                continue
+            if wrapper[1:] != base[1:] or first in result_pins or second in result_pins:
+                return False
+            if directories := self.module_constants.directories(base[0]):
+                return not pins_path(directories, strings)
+            return True
+        return None
 
     def literal_identity(self, left, right, line):
         first, second = (self.resolve(value, line) for value in (left, right))
@@ -517,14 +556,32 @@ class Inspect(ast.NodeVisitor):
             return False
         return method in STRING_TRANSFORMS and getattr(value, method)() == value
 
-    def coupled(self, left, right, line, pins, strings):
+    def codec_parity(self, outer, expected, line, result_pins):
+        result = self.result_key(outer)
+        projection, call = outer
+        if not result or projection or len(call.args) != 1:
+            return False
+        inner = self.resolve(call.args[0], call.lineno)
+        source = self.result_key(((), inner))
+        if (not source or source in result_pins or not inverse_codecs(result[0], source[0])
+                or not all(self.module_constants.definition(path) for path in (result[0], source[0]))):
+            return False
+        return len(source[2]) == 1 and source[2][0] == ast.dump(self.resolve(expected, line))
+
+    def coupled(self, left, right, line, pins, strings, result_pins):
+        if (self.empty_parity(left, right, line)
+                or self.codec_parity(self.observed_result(left, line), right, line, result_pins)
+                or self.codec_parity(self.observed_result(right, line), left, line, result_pins)):
+            return True
+        delegated = self.wrapper_parity(left, right, line, strings, result_pins)
+        if delegated is not None:
+            return delegated
         actual = self.oracle_calls(left, line)
         expected = self.oracle_calls(right, line)
         return (self.composition(actual, expected, pins, strings)
                 and not (self.uses_operand(left, right, line) or self.uses_operand(right, left, line))
                 or self.shared_constant(actual, left, right, line, pins)
                 or self.shared_constant(expected, right, left, line, pins)
-                or self.empty_parity(left, right, line)
                 or self.literal_identity(left, right, line)
                 or self.literal_identity(right, left, line))
 
@@ -938,6 +995,7 @@ class Inspect(ast.NodeVisitor):
                 self.alias_changes.add((part.lineno, path.split(".")[0]))
         recorders = {name for name, bindings in self.bindings.items()
                      if isinstance(bindings[0][1], ast.List) and not bindings[0][1].elts}
+        result_pins = set(self.result_pins())
         negative = defaultdict(list)
         positive = defaultdict(list)
         for line, node, _ in self.checks:
@@ -948,7 +1006,7 @@ class Inspect(ast.NodeVisitor):
                 findings.append((line, "const-truth"))
             if self.self_comparison(operator, left, right, line, test_name, line_comments):
                 findings.append((line, "self-compare"))
-            if operator is ast.Eq and self.coupled(left, right, line, pins, strings):
+            if operator is ast.Eq and self.coupled(left, right, line, pins, strings, result_pins):
                 findings.append((line, "self-derived-expected"))
             if (operator is ast.Eq and self.zero_origin(self.resolve(left, line), right, line)
                     or self.fixed_output_check(node, line) or self.order_without_cardinality(node, line)):
@@ -1271,6 +1329,7 @@ class ModuleConstants:
         self.path = Path(path).absolute()
         self.modules = {}
         self.trees = {}
+        self.delegates = {}
 
     @staticmethod
     def module_file(root, module):
@@ -1313,6 +1372,41 @@ class ModuleConstants:
         definitions = [node for node in tree.body
                        if isinstance(node, ast.FunctionDef) and node.name == path[-1]] if tree else []
         return definitions[0] if len(definitions) == 1 else None
+
+    def delegate(self, path):
+        if path not in self.delegates:
+            self.delegates[path] = self.find_delegate(path)
+        return self.delegates[path]
+
+    def find_delegate(self, path):
+        function = self.definition(path)
+        if function is None or function.decorator_list or function.args.vararg or function.args.kwarg:
+            return ()
+        body = function.body[1:] if ast.get_docstring(function) is not None else function.body
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
+            return ()
+        call = body[0].value
+        if not isinstance(call, ast.Call) or call.keywords:
+            return ()
+        owner = path[:-1]
+        tree = self.tree(owner)
+        imported = imports_in(tree.body)
+        parameters = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
+        if len(call.args) != len(parameters):
+            return ()
+        for operand, parameter in zip(call.args, parameters):
+            if (isinstance(operand, ast.Call) and isinstance(operand.func, ast.Name)
+                    and operand.func.id in {"list", "tuple", "str", "bytes", "int", "float"}
+                    and operand.func.id not in scope_changes(tree.body) and operand.func.id not in parameters
+                    and len(operand.args) == 1 and not operand.keywords):
+                operand = operand.args[0]
+            if not isinstance(operand, ast.Name) or operand.id != parameter:
+                return ()
+        root, dot, suffix = name_of(call.func).partition(".")
+        if not root or root in parameters:
+            return ()
+        target = tuple((imported[root] + dot + suffix).split(".")) if root in imported else (*owner, root)
+        return target if (root in imported or not dot) and self.definition(target) is not None else ()
 
     def directories(self, path):
         function = self.definition(path)

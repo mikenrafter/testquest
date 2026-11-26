@@ -286,6 +286,14 @@ def different_callees(actual, expected):
             and len({path[:-1] for path in actual | expected}) == 1)
 
 
+def inverse_codecs(first, second):
+    if not first or not second or first[:-1] != second[:-1]:
+        return False
+    names = {first[-1], second[-1]}
+    return (names in ({"encode", "decode"}, {"compress", "decompress"})
+            or any(name.startswith("encode_") and "decode_" + name[7:] in names for name in names))
+
+
 IMPORT_FIELDS = {"imports", "frameworks_detected"}
 IMPORT_TOKEN = re.compile(r"\b(?:import|from|require|use|extern)\b")
 
