@@ -8,7 +8,7 @@ fn test_strings_without_assertions() {
     let apostrophe = '\'';
     let byte_brace = b')';
     // assert!(true);
-    /* outer /* } assert!(true); */ still commented out #[test] */
+    /* outer /* inner */ } assert!(true); still commented out #[test] */
     consume((normal, byte_string, raw, byte_raw, close_brace, apostrophe, byte_brace));
 }
 
