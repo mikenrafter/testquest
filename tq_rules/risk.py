@@ -51,26 +51,11 @@ def rust_context(path):
     return crate, module
 
 
-def rust_use(tokens, prefix=()):
-    path = prefix
-    for token in tokens:
-        if token.text == "{":
-            for alternative in rust.split(token.children):
-                yield from rust_use(alternative, path)
-            return
-        if token.text == "as":
-            break
-        if token.kind == "word" and token.text != "self":
-            path = (*path, token.text)
-    if path:
-        yield path
-
-
 def rust_imports(tokens, module):
     for index, token in enumerate(tokens):
         if token.text == "use":
             clause = next(iter(rust.split(tokens[index + 1:], ";")), ())
-            for path in rust_use(clause):
+            for path, _ in rust.use_paths(clause):
                 if path[0] == "crate":
                     yield path[1:]
         if token.text == "mod" and index + 2 < len(tokens):
@@ -169,7 +154,7 @@ def map_risk(repository, budget):
         importers = len(callers[language, crate, module] - {importer})
         names = {path.stem} if not module else {module[-1]}
         mentions = sum(bool(names & names_used) for test_path, names_used in references if test_path != path)
-        score = 3 * fixes[path] + churn[path] + 2 * importers
+        score = max(0, 3 * fixes[path] + churn[path] + 2 * importers - min(2, mentions))
         rows.append(dict(path=str(path), fixes=fixes[path], churn=churn[path], importers=importers,
                          test_refs=mentions, score=score, gap=score >= 8 and not mentions, tests=0))
     rows.sort(key=lambda row: (-row["score"], row["path"]))
@@ -219,7 +204,7 @@ tbody td {{text-align: right; font-variant-numeric: tabular-nums}}
 <article><strong>{sum(row['tests'] for row in rows)} / {snapshot['budget']}</strong>Test slots allocated</article>
 </section>
 <p>Score counts each fix three times, each change once, and each importing module twice.
-A score of eight or higher with zero test references marks a gap.</p>
+Up to two test references each subtract one point. A score of eight or higher with zero test references marks a gap.</p>
 <div class="scroll"><table>
 <thead><tr><th scope="col">File</th><th scope="col">Score</th><th scope="col">Fixes</th>
 <th scope="col">Churn</th><th scope="col">Importers</th><th scope="col">Test references</th>

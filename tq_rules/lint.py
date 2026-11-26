@@ -26,11 +26,11 @@ RULES = {
     ),
     "self-derived-expected": (
         "Actual and expected values come from the same function or module.",
-        "The operations have independent oracles, or an independent check anchors the relation.",
+        "The test checks repeatability, a before-and-after observation, or a relation anchored by an independent oracle.",
     ),
     "nondistinguishing-literal": (
         "Symmetric input can hide an ordering or argument mix-up.",
-        "The test's WHY explains the symmetry, such as equal inputs or a permutation-invariant boundary.",
+        "The test's WHY explains the symmetry, such as an equal-input boundary, independent flags, or an intentional repeated option.",
     ),
 }
 ORDERED_NAME = re.compile(r"reverse|order|swap|endian|rotate|crc|encode", re.I)
@@ -38,17 +38,20 @@ UNKNOWN = object()
 
 
 def symmetric_input(name, literals):
-    seen = set()
+    seen = []
     for value in literals:
         if value is UNKNOWN:
             continue
-        key = (type(value), value)
-        if key in seen:
+        if value is not None and type(value) is not bool and not (
+                isinstance(value, str) and value.startswith("--")):
+            key = (type(value), value)
+            if key in seen:
+                return True
+            seen.append(key)
+        if (isinstance(value, list) and len(value) >= 2
+                and all(type(item) is type(value[0]) and item == value[0] for item in value[1:])):
             return True
-        seen.add(key)
-        if isinstance(value, tuple) and len(value) >= 2 and len(set(value)) == 1:
-            return True
-        if (isinstance(value, (str, bytes, tuple)) and len(value) >= 2
+        if (isinstance(value, (str, bytes, tuple, list)) and len(value) >= 2
                 and ORDERED_NAME.search(name) and value == value[::-1]):
             return True
     return False

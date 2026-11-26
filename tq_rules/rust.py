@@ -109,16 +109,16 @@ def split(tokens, delimiter=","):
 
 
 def literal(tokens):
-    if len(tokens) == 2 and tokens[0].text == "vec" and tokens[1].text == "!":
-        return UNKNOWN
     if len(tokens) == 3 and shape(tokens[:2]) == ("vec", "!") and tokens[2].kind == "group":
         tokens = tokens[2:]
     if len(tokens) != 1:
         return UNKNOWN
     token = tokens[0]
     if token.kind == "group" and token.text in {"[", "("}:
-        values = tuple(literal(part) for part in split(token.children))
-        return UNKNOWN if UNKNOWN in values else values
+        values = [literal(part) for part in split(token.children)]
+        if UNKNOWN in values:
+            return UNKNOWN
+        return tuple(values) if token.text == "(" else values
     if token.text in {"true", "false"}:
         return token.text == "true"
     if token.kind == "number":
@@ -155,7 +155,32 @@ def always_true(tokens):
     return literal(tokens) is True
 
 
-def test_functions(tokens):
+def use_paths(tokens, prefix=()):
+    path = prefix
+    for index, token in enumerate(tokens):
+        if token.text == "{":
+            for alternative in split(token.children):
+                yield from use_paths(alternative, path)
+            return
+        if token.text == "as" and index + 1 < len(tokens):
+            yield path, tokens[index + 1].text
+            return
+        if token.kind == "word" and token.text != "self":
+            path = (*path, token.text)
+    if path:
+        yield path, path[-1]
+
+
+def imports_in(tokens):
+    for index, token in enumerate(tokens):
+        if token.text == "use":
+            clause = next(iter(split(tokens[index + 1:], ";")), ())
+            yield from use_paths(clause)
+
+
+def test_functions(tokens, namespace=(), imports=None):
+    aliases = dict(imports or ())
+    aliases.update((alias, path) for path, alias in imports_in(tokens))
     attributes = []
     index = 0
     while index < len(tokens):
@@ -174,43 +199,91 @@ def test_functions(tokens):
                         break
                     if body.text == "{" and body.kind == "group":
                         panic = any(name and name[0] == "should_panic" for name in names)
-                        yield token, tokens[index + 1].text, attributes[0][0].line, body, panic
+                        name = tokens[index + 1].text
+                        yield token, name, "::".join((*namespace, name)), attributes[0][0].line, body, panic, aliases
                         index = body_index
                         break
             attributes.clear()
         elif token.text not in {"pub", "async", "const", "unsafe", "extern"} and token.text != "(":
             attributes.clear()
         if token.text == "{" and token.kind == "group":
-            yield from test_functions(token.children)
+            module = tokens[index - 1].text if index >= 2 and tokens[index - 2].text == "mod" else None
+            inside = (*namespace, module) if module else namespace
+            yield from test_functions(token.children, inside, aliases)
         index += 1
 
 
+FAILURES = {"panic", "unreachable", "todo", "unimplemented"}
+RECORDING_METHODS = {"push", "extend", "insert"}
+
+
+def macro_at(tokens, index, names):
+    return (index + 2 < len(tokens) and tokens[index].text in names
+            and tokens[index + 1].text == "!" and tokens[index + 2].kind == "group")
+
+
+def directly_checks(tokens):
+    return any(macro_at(tokens, index, ASSERTIONS | FAILURES) for index in range(len(tokens)))
+
+
+def conditional_blocks(tokens):
+    """Return the blocks whose direct checks can all be skipped."""
+    guarded = set()
+    for index, token in enumerate(tokens):
+        if token.text not in {"if", "else", "match"}:
+            continue
+        position = next((i for i in range(index + 1, len(tokens)) if tokens[i].text in {"{", ";"}), None)
+        if position is None or tokens[position].text != "{":
+            continue
+        block = tokens[position]
+        if token.text == "match":
+            arms = [next(iter(reversed(list(split(arm, "=>")))), ()) for arm in split(block.children)]
+            exhaustive = bool(arms) and all(directly_checks(arm[0].children if
+                len(arm) == 1 and arm[0].text == "{" else arm) for arm in arms)
+            if not exhaustive:
+                guarded.add(position)
+        elif token.text == "if":
+            following = tokens[position + 1:position + 3]
+            both = (len(following) == 2 and following[0].text == "else"
+                    and following[1].text == "{" and directly_checks(block.children)
+                    and directly_checks(following[1].children))
+            if not both:
+                guarded.add(position)
+                if len(following) == 2 and following[0].text == "else" and following[1].text == "{":
+                    guarded.add(position + 2)
+    return guarded
+
+
 class Inspect:
-    def __init__(self):
+    def __init__(self, aliases):
+        self.aliases = aliases
         self.checks = []
         self.bindings = {}
         self.writes = {}
+        self.reads = set()
         self.increments = set()
         self.assumes = False
         self.literal_issues = []
 
     def visit(self, tokens, guarded=False):
-        conditional = False
+        guarded_blocks = conditional_blocks(tokens)
+        declaration_names = set()
         for index, token in enumerate(tokens):
             text = token.text
-            if text in {"if", "else", "match"}:
-                conditional = True
             if text == "let":
                 declaration = next(iter(split(tokens[index + 1:], ";")), ())
                 parts = list(split(declaration, "="))
                 if len(parts) == 2:
                     lhs, rhs = parts
-                    name = next((item.text for item in lhs if item.kind == "word" and item.text != "mut"), "")
-                    if name:
-                        self.bindings.setdefault(name, []).append((token.line, rhs))
+                    target = next((item for item in lhs if item.kind == "word" and item.text != "mut"), None)
+                    if target:
+                        declaration_names.add(id(target))
+                        self.bindings.setdefault(target.text, []).append((token.line, rhs))
             following = shape(tokens[index + 1:index + 3])
-            if following == (".", "push") or following == (".", "extend"):
+            if len(following) == 2 and following[0] == "." and following[1] in RECORDING_METHODS:
                 self.writes.setdefault(text, token.line)
+            elif token.kind == "word" and id(token) not in declaration_names:
+                self.reads.add(text)
             if index + 1 < len(tokens) and tokens[index + 1].text == "+=":
                 increment = next(iter(split(tokens[index + 2:], ";")), ())
                 value = literal(increment)
@@ -225,31 +298,48 @@ class Inspect:
                 arguments = tokens[group_index]
                 if arguments.kind == "group" and (macro or arguments.text == "("):
                     args = list(split(arguments.children))
-                    if (text in ASSERTIONS and macro) or (helper(text) and text not in {"expect", "expect_err"}):
+                    if (macro and text in ASSERTIONS | FAILURES) or helper(text):
                         self.checks.append((token.line, text, args, guarded))
-                    elif symmetric_input(text, map(literal, args)):
+                    elif (not text[0].isupper() and not text.startswith(("assert_", "check_"))
+                          and symmetric_input(text, map(literal, args))):
                         self.literal_issues.append((token.line, "nondistinguishing-literal"))
             if token.kind == "group":
-                self.visit(token.children, guarded or (token.text == "{" and conditional))
-                if token.text == "{":
-                    conditional = False
-            elif text == ";":
-                conditional = False
+                self.visit(token.children, guarded or index in guarded_blocks)
 
-    def origin(self, tokens, line):
+    def resolve(self, tokens, line):
         while len(tokens) == 1 and tokens[0].kind == "word":
             previous = [(pos, rhs) for pos, rhs in self.bindings.get(tokens[0].text, ()) if pos <= line]
             if len(previous) != 1 or previous[0][1] == tokens:
                 break
             _, tokens = previous[0]
             line = min(line - 1, tokens[0].line) if tokens else line - 1
+        return tokens
+
+    def origin(self, tokens):
         if len(tokens) < 2 or tokens[-1].text != "(":
             return "", ""
         call = tokens[:-1]
         if not all(token.kind == "word" or token.text == "::" for token in call):
             return "", ""
-        name = "".join(token.text for token in call)
-        return name, name.rpartition("::")[0]
+        path = tuple(token.text for token in call if token.kind == "word")
+        if not path:
+            return "", ""
+        path = (*self.aliases.get(path[0], path[:1]), *path[1:])
+        if path[0] in {"std", "core", "alloc"} or any(part[:1].isupper() for part in path):
+            return "", ""
+        return "::".join(path), "::".join(path[:-1])
+
+    def coupled(self, left, right, line):
+        actual, expected = self.resolve(left, line), self.resolve(right, line)
+        first, first_module = self.origin(actual)
+        second, second_module = self.origin(expected)
+        if not ((first and first == second) or (first_module and first_module == second_module)):
+            return False
+        if (shape(actual) == shape(expected) and shape(left) != shape(right)
+                and any(word in first.rsplit("::", 1)[-1]
+                        for word in ("read", "snapshot", "digest", "identity", "listing", "tree"))):
+            return False
+        return True
 
     def issues(self):
         findings = self.literal_issues.copy()
@@ -283,11 +373,8 @@ class Inspect:
                 continue
             if op in {"==", "!="} and shape(left) == shape(right):
                 findings.append((line, "self-compare"))
-            if op == "==":
-                first, first_module = self.origin(left, line)
-                second, second_module = self.origin(right, line)
-                if ((first and first == second) or (first_module and first_module == second_module)):
-                    findings.append((line, "self-derived-expected"))
+            if op == "==" and self.coupled(left, right, line):
+                findings.append((line, "self-derived-expected"))
             reverse = {">": "<", ">=": "<=", "<": ">", "<=": ">="}
             for operand, other, ordered in ((left, right, op), (right, left, reverse.get(op, op))):
                 expression = shape(operand)
@@ -301,16 +388,18 @@ class Inspect:
                     measured = True
                 if subject not in recorders or expression[1:] not in {(), (".", "len", "(")}:
                     continue
-                if ordered == "==" and value in (0, ()):
+                nonempty_vector = (len(other) == 3 and shape(other[:2]) == ("vec", "!")
+                                   and bool(other[2].children))
+                if ordered == "==" and value in (0, [], ()):
                     negative.setdefault(subject, []).append(line)
-                elif ((ordered == "==" and value is not UNKNOWN and bool(value))
-                      or (ordered in {"!=", ">"} and value in (0, ()))
+                elif ((ordered == "==" and ((value is not UNKNOWN and bool(value)) or nonempty_vector))
+                      or (ordered in {"!=", ">"} and value in (0, [], ()))
                       or (ordered == ">=" and type(value) is int and value > 0)):
                     positive.add(subject)
         for name in recorders - positive:
             if name in negative:
                 findings.extend((line, "absence-no-control") for line in negative[name])
-            elif name in self.writes:
+            elif name in self.writes and name not in self.reads:
                 findings.append((self.writes[name], "absence-no-control"))
         return findings, measured
 
@@ -318,12 +407,12 @@ class Inspect:
 def parse(source, path):
     tokens, comments = tokenize(source)
     tests = []
-    for token, name, start, body, panic in test_functions(group(tokens)):
+    for token, name, identifier, start, body, panic, aliases in test_functions(group(tokens)):
         previous = {c.line for c in comments if c.standalone and c.column == token.column}
         while start - 1 in previous:
             start -= 1
-        test = Test(name, name, token.line, start, body.end, token.column)
-        inspector = Inspect()
+        test = Test(name, identifier, token.line, start, body.end, token.column)
+        inspector = Inspect(aliases)
         inspector.visit(body.children)
         test.issues, test.measured = inspector.issues()
         if not inspector.checks and not panic:

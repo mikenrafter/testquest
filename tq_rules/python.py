@@ -1,6 +1,8 @@
 import ast
+import builtins
 from collections import defaultdict
 import io
+import sys
 import tokenize
 
 from .lint import UNKNOWN, helper, symmetric_input
@@ -21,7 +23,7 @@ def literal(node):
     if isinstance(node, (ast.List, ast.Tuple)):
         values = tuple(literal(item) for item in node.elts)
         if UNKNOWN not in values:
-            return values
+            return list(values) if isinstance(node, ast.List) else values
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
         value = literal(node.operand)
         if type(value) in {int, float, complex}:
@@ -68,28 +70,40 @@ def predicate(call, method):
     return None
 
 
+RECORDING_METHODS = {"append", "extend", "insert"}
+OBSERVERS = {"len", "set", "list", "sorted", "tuple", "str", "bool", "int", "bytes",
+             "float", "dict", "repr", "iter", "reversed"}
+
+
 class Inspect(ast.NodeVisitor):
-    def __init__(self, imports):
+    def __init__(self, imports, checking_helpers):
         self.imports = imports
+        self.checking_helpers = checking_helpers
         self.checks = []
         self.calls = []
         self.bindings = defaultdict(list)
         self.writes = {}
+        self.reads = set()
         self.guards = []
         self.constraints = set()
         self.measured = False
 
     def visit_FunctionDef(self, node):
         # Closures can record effects, but their assertions need an actual call.
-        self.record_writes(node)
+        self.record_uses(node)
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
-    def record_writes(self, node):
+    def record_uses(self, node):
+        recording_receivers = set()
         for child in ast.walk(node):
-            if isinstance(child, ast.Attribute) and child.attr in {"append", "extend", "insert"}:
-                if isinstance(child.value, ast.Name):
-                    self.writes.setdefault(child.value.id, child.lineno)
+            if (isinstance(child, ast.Attribute) and child.attr in RECORDING_METHODS
+                    and isinstance(child.value, ast.Name)):
+                recording_receivers.add(id(child.value))
+                self.writes.setdefault(child.value.id, child.lineno)
+        self.reads.update(child.id for child in ast.walk(node)
+                          if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                          and id(child) not in recording_receivers)
 
     def visit_Assign(self, node):
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -104,9 +118,19 @@ class Inspect(ast.NodeVisitor):
     def visit_If(self, node):
         self.visit(node.test)
         self.guards.append(node.test)
+        start = len(self.checks)
+        covered = []
         for branch in (node.body, node.orelse):
+            before = len(self.checks)
             for statement in branch:
                 self.visit(statement)
+            covered.append(any(len(guards) == len(self.guards)
+                               for _, _, guards in self.checks[before:]))
+        if all(covered):
+            depth = len(self.guards) - 1
+            for index in range(start, len(self.checks)):
+                line, predicate, guards = self.checks[index]
+                self.checks[index] = (line, predicate, guards[:depth] + guards[depth + 1:])
         self.guards.pop()
 
     def visit_Match(self, node):
@@ -120,10 +144,16 @@ class Inspect(ast.NodeVisitor):
         self.checks.append((node.lineno, node.test, tuple(self.guards)))
         self.visit(node.test)
 
+    def visit_Raise(self, node):
+        value = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+        if name_of(value) == "AssertionError":
+            self.checks.append((node.lineno, None, tuple(self.guards)))
+        self.generic_visit(node)
+
     def visit_Call(self, node):
         name = name_of(node.func)
         method = name.rsplit(".", 1)[-1]
-        if helper(method) and method != "assert_never":
+        if helper(method) or name in self.checking_helpers:
             self.checks.append((node.lineno, predicate(node, method), tuple(self.guards)))
         if method in {"assume", "filter"}:
             self.constraints.add(method)
@@ -140,18 +170,35 @@ class Inspect(ast.NodeVisitor):
             line, node = prior[0]
         return node
 
-    def origin(self, node, line):
-        value = self.resolve(node, line)
+    def origin(self, value):
         if not isinstance(value, ast.Call):
             return "", ""
         name = name_of(value.func)
         root, dot, suffix = name.partition(".")
         if root in self.imports:
             name = self.imports[root] + dot + suffix
-            return name, name.rpartition(".")[0]
-        if not dot:
+            module = name.rpartition(".")[0]
+            if not name.rsplit(".", 1)[-1][:1].isupper() and name.split(".")[0] not in sys.stdlib_module_names:
+                return name, module
+        elif not dot and name not in OBSERVERS:
             return name, ""
         return "", ""
+
+    def coupled(self, left, right, line):
+        actual, expected = self.resolve(left, line), self.resolve(right, line)
+        first, first_module = self.origin(actual)
+        second, second_module = self.origin(expected)
+        if not ((first and first == second) or (first_module and first_module == second_module)):
+            return False
+        # A second application to the first result tests idempotence.
+        if any(same(arg, right) for arg in actual.args) or any(same(arg, left) for arg in expected.args):
+            return False
+        # An explicit before/after snapshot observes an intervening action.
+        if (same(actual, expected) and not same(left, right)
+                and any(word in first.rsplit(".", 1)[-1]
+                        for word in ("read", "snapshot", "digest", "identity", "getstate"))):
+            return False
+        return True
 
     def recorder(self, node, recorders):
         if name_of(node) in recorders:
@@ -175,11 +222,8 @@ class Inspect(ast.NodeVisitor):
                 findings.append((line, "const-truth"))
             if operator in {ast.Eq, ast.Is, ast.NotEq, ast.IsNot} and same(left, right):
                 findings.append((line, "self-compare"))
-            if operator is ast.Eq:
-                first, first_module = self.origin(left, line)
-                second, second_module = self.origin(right, line)
-                if ((first and first == second) or (first_module and first_module == second_module)):
-                    findings.append((line, "self-derived-expected"))
+            if operator is ast.Eq and self.coupled(left, right, line):
+                findings.append((line, "self-derived-expected"))
 
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
                 recorder = self.recorder(node.operand, recorders)
@@ -194,10 +238,12 @@ class Inspect(ast.NodeVisitor):
                 if not recorder:
                     continue
                 value = literal(other)
-                if ordered is ast.Eq and value in ((), 0, False):
+                if ordered is ast.Eq and value in ([], (), 0, False):
                     negative[recorder].append(line)
-                elif ((ordered is ast.Eq and value is not UNKNOWN and bool(value))
-                      or (ordered is ast.NotEq and value in ((), 0, False))
+                elif ((ordered is ast.Eq and (
+                           (value is not UNKNOWN and bool(value))
+                           or (isinstance(other, (ast.List, ast.Tuple)) and other.elts)))
+                      or (ordered is ast.NotEq and value in ([], (), 0, False))
                       or (ordered is ast.Gt and type(value) is int and value >= 0)
                       or (ordered is ast.GtE and type(value) is int and value > 0)):
                     positive.add(recorder)
@@ -205,12 +251,18 @@ class Inspect(ast.NodeVisitor):
         for name in recorders - positive:
             if name in negative:
                 findings.extend((line, "absence-no-control") for line in negative[name])
-            elif name in self.writes:
+            elif name in self.writes and name not in self.reads:
                 findings.append((self.writes[name], "absence-no-control"))
         for call in self.calls:
-            name = name_of(call.func).rsplit(".", 1)[-1]
-            if not helper(name) and symmetric_input(
-                    name, (literal(arg) for arg in [*call.args, *(kw.value for kw in call.keywords)])):
+            qualified = name_of(call.func)
+            root, _, name = qualified.rpartition(".")
+            module = self.imports.get(root.split(".")[0], root).split(".")[0]
+            if (not name or name[0].isupper() or helper(name) or qualified in self.checking_helpers
+                    or module == "self" or module in sys.stdlib_module_names
+                    or (not root and hasattr(builtins, name))):
+                continue
+            args = [*call.args, *(kw.value for kw in call.keywords)]
+            if symmetric_input(name, map(literal, args)):
                 findings.append((call.lineno, "nondistinguishing-literal"))
         return findings
 
@@ -221,6 +273,60 @@ def test_functions(nodes, parents=()):
             yield node, parents
         elif isinstance(node, ast.ClassDef):
             yield from test_functions(node.body, (*parents, node.name))
+
+
+def body_nodes(statements):
+    for node in statements:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        yield node
+        yield from body_nodes(ast.iter_child_nodes(node))
+
+
+def checking_helpers(tree):
+    definitions = {}
+    parents = {}
+
+    def index(nodes, scope):
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not node.name.startswith("test"):
+                    definitions[scope, node.name] = node
+            elif isinstance(node, ast.ClassDef):
+                child = (*scope, node.name)
+                parents[child] = [(*scope, name_of(base)) for base in node.bases]
+                index(node.body, child)
+
+    index(tree.body, ())
+    checked = set()
+
+    def available(scope):
+        scopes = {scope}
+        pending = [scope]
+        while pending:
+            for parent in parents.get(pending.pop(), ()):
+                if parent not in scopes:
+                    scopes.add(parent)
+                    pending.append(parent)
+        return {name for owner, name in checked if not owner} | {
+            f"self.{name}" for owner, name in checked if owner and owner in scopes
+        }
+
+    nodes = {key: list(body_nodes(fn.body)) for key, fn in definitions.items()}
+    while True:
+        found = set()
+        for key, inside in nodes.items():
+            if key in checked:
+                continue
+            known = available(key[0])
+            if any(isinstance(node, ast.Assert) or
+                   (isinstance(node, ast.Call) and
+                    (name_of(node.func) in known or helper(name_of(node.func).rsplit(".", 1)[-1])))
+                   for node in inside):
+                found.add(key)
+        if not found:
+            return available
+        checked.update(found)
 
 
 def parse(source, path):
@@ -241,11 +347,12 @@ def parse(source, path):
             for alias in node.names:
                 imports[alias.asname or alias.name] = module + "." + alias.name
 
+    checks_in = checking_helpers(tree)
     tests = []
     for node, parents in test_functions(tree.body):
-        inspector = Inspect(imports)
+        inspector = Inspect(imports, checks_in(parents))
         for statement in node.body:
-            inspector.record_writes(statement)
+            inspector.record_uses(statement)
             inspector.visit(statement)
         for decorator in node.decorator_list:
             for call in (part for part in ast.walk(decorator) if isinstance(part, ast.Call)):
