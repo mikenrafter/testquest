@@ -275,3 +275,17 @@ def different_callees(actual, expected):
     return (actual and expected and min(len(actual), len(expected)) == 1
             and actual.isdisjoint(expected)
             and len({path[:-1] for path in actual | expected}) == 1)
+
+
+IMPORT_FIELDS = {"imports", "frameworks_detected"}
+IMPORT_TOKEN = re.compile(r"\b(?:import|from|require|use|extern)\b")
+
+
+def path_directories(segments):
+    pieces = tuple(part for segment in segments for part in segment.replace("\\", "/").split("/") if part)
+    return pieces[:-1] if pieces and pieces[-1].rpartition(".")[0] else pieces
+
+
+def pins_path(directories, strings):
+    named = [value.replace("\\", "/").split("/") for value in strings]
+    return all(any(piece in parts for parts in named) for piece in directories)

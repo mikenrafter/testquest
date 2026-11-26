@@ -7,7 +7,8 @@ import sys
 import tokenize
 
 from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, argument_claims, helper, loose_bounds, named_arguments,
-                   prefix_satisfies, symmetric_input, unvaried_arguments)
+                   prefix_satisfies, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
+                   path_directories, pins_path)
 from .source import Comment, Test
 
 
@@ -137,6 +138,7 @@ OBSERVERS = {"len", "set", "list", "sorted", "tuple", "str", "bool", "int", "byt
 ORACLE_METHODS = {"to_json", "tobytes", "to_string", "clone", "read_bytes", "read_text",
                   "read_to_string"}
 ORACLE_FUNCTIONS = {"json.dumps", "json.loads"}
+STRING_TRANSFORMS = {"strip", "lstrip", "rstrip", "lower", "upper", "casefold"}
 
 
 class Inspect(ast.NodeVisitor):
@@ -300,7 +302,7 @@ class Inspect(ast.NodeVisitor):
 
     def resolve(self, node, line):
         while isinstance(node, ast.Name):
-            prior = [binding for binding in self.bindings[node.id] if binding[0] < line]
+            prior = [binding for binding in self.bindings.get(node.id, ()) if binding[0] < line]
             if len(prior) != 1:
                 break
             line, node = prior[0]
@@ -372,15 +374,131 @@ class Inspect(ast.NodeVisitor):
             for node in body_nodes((part,))
         )
 
-    def coupled(self, left, right, line):
+    def literal_pins(self):
+        for line, node, guards in self.checks:
+            operator, left, right = comparison(node)
+            if operator is ast.Eq and not guards:
+                for operand, other in ((left, right), (right, left)):
+                    if literal(self.resolve(other, line)) is UNKNOWN:
+                        continue
+                    resolved = self.resolve(operand, line)
+                    if (not isinstance(resolved, ast.Subscript)
+                            and (constant := self.oracle_constant(resolved, line)).rsplit(".", 1)[-1].isupper()):
+                        yield tuple(constant.split("."))
+                    if isinstance(resolved, ast.Call):
+                        path = tuple(self.imported_name(resolved.func).split("."))
+                        if self.oracle_calls(resolved, line) == {path}:
+                            yield path
+
+        unguarded = {line for line, _, guards in self.checks if not guards}
+        for call in self.calls:
+            if (call.lineno in unguarded and name_of(call.func).rsplit(".", 1)[-1] in {"assertIn", "assertNotIn"}
+                    and len(call.args) >= 2 and isinstance(literal(call.args[0]), str)):
+                yield from self.oracle_calls(call.args[1], call.lineno) or ()
+
+    def sized_from(self, node, constant, line):
+        node = self.resolve(node, line)
+        if (isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult))
+                and any(self.oracle_constant(operand, node.lineno) == constant
+                        and type(literal(other)) is int
+                        for operand, other in ((node.left, node.right), (node.right, node.left)))):
+            return True
+        return node is not None and any(self.sized_from(child, constant, getattr(node, "lineno", line))
+                                        for child in ast.iter_child_nodes(node))
+
+    def shared_constant(self, calls, actual, expected, line, pins):
+        constant = self.oracle_constant(expected, line)
+        if (not calls or len(calls) != 1 or tuple(constant.split(".")) in pins
+                or not self.module_constants.shared(next(iter(calls)), constant)):
+            return False
+        actual = self.resolve(actual, line)
+        while isinstance(actual, (ast.Attribute, ast.Subscript)):
+            actual = self.resolve(actual.value, actual.lineno)
+        return not isinstance(actual, ast.Call) or not self.sized_from(actual, constant, actual.lineno)
+
+    def composition(self, actual, expected, pins, strings):
+        if not different_callees(actual, expected):
+            return False
+        paths = actual | expected
+        directories = [parts for path in paths if (parts := self.module_constants.directories(path))]
+        if directories:
+            return any(not pins_path(parts, strings) for parts in directories)
+        oracle = expected if len(actual) == 1 else actual
+        return bool(oracle - pins)
+
+    def field_call(self, operand, line):
+        operand = self.resolve(operand, line)
+        if (isinstance(operand, ast.Call) and name_of(operand.func) == "len"
+                and "len" not in self.iterables.changed and "len" not in self.oracle_imports
+                and "len" not in self.local_helpers and len(operand.args) == 1 and not operand.keywords):
+            operand = self.resolve(operand.args[0], operand.lineno)
+        if isinstance(operand, ast.Attribute):
+            return operand.attr, self.resolve(operand.value, operand.lineno)
+        return "", None
+
+    def empty_parity(self, left, right, line):
+        field, first = self.field_call(left, line)
+        other_field, second = self.field_call(right, line)
+        if (not field or field != other_field or not all(isinstance(call, ast.Call) for call in (first, second))
+                or not all(len(call.args) == 1 and not call.keywords for call in (first, second))):
+            return False
+        calls = self.oracle_calls(first, line), self.oracle_calls(second, line)
+        if not all(calls) or calls[0] == calls[1]:
+            return False
+
+        def fixture(call):
+            operand = call.args[0]
+            if isinstance(operand, ast.Name) and any(
+                    isinstance(other.func, ast.Attribute) and name_of(other.func.value) == operand.id
+                    and other.lineno < call.lineno for other in self.calls):
+                return UNKNOWN
+            return literal(self.resolve(operand, call.lineno))
+
+        value, other = fixture(first), fixture(second)
+        if type(value) is not type(other) or value != other:
+            return False
+        if value in ([], (), ""):
+            return True
+        if field not in IMPORT_FIELDS or not isinstance(value, str) or IMPORT_TOKEN.search(value):
+            return False
+        try:
+            ast.parse(value)
+        except (SyntaxError, ValueError):
+            return False
+        return True
+
+    def literal_identity(self, left, right, line):
+        first, second = (self.resolve(value, line) for value in (left, right))
+        if not all(isinstance(call, ast.Call) and len(call.args) == 1 and not call.keywords
+                   for call in (first, second)):
+            return False
+        calls = self.oracle_calls(first, line)
+        if not calls or len(calls) != 1 or calls != self.oracle_calls(second, line):
+            return False
+        value = literal(self.resolve(first.args[0], first.lineno))
+        transformed = self.resolve(second.args[0], second.lineno)
+        if not isinstance(value, str) or not isinstance(transformed, ast.Call) or transformed.keywords:
+            return False
+        if (isinstance(transformed.func, ast.Attribute) and not transformed.args
+                and literal(self.resolve(transformed.func.value, transformed.lineno)) == value):
+            method = transformed.func.attr
+        elif (len(transformed.args) == 1 and self.oracle_calls(transformed, line) == calls
+              and literal(self.resolve(transformed.args[0], transformed.lineno)) == value):
+            method = self.module_constants.string_transform(next(iter(calls)))
+        else:
+            return False
+        return method in STRING_TRANSFORMS and getattr(value, method)() == value
+
+    def coupled(self, left, right, line, pins, strings):
         actual = self.oracle_calls(left, line)
         expected = self.oracle_calls(right, line)
-        return (different_callees(actual, expected)
+        return (self.composition(actual, expected, pins, strings)
                 and not (self.uses_operand(left, right, line) or self.uses_operand(right, left, line))
-                or (actual and len(actual) == 1
-                    and self.module_constants.shared(next(iter(actual)), self.oracle_constant(right, line)))
-                or (expected and len(expected) == 1
-                    and self.module_constants.shared(next(iter(expected)), self.oracle_constant(left, line))))
+                or self.shared_constant(actual, left, right, line, pins)
+                or self.shared_constant(expected, right, left, line, pins)
+                or self.empty_parity(left, right, line)
+                or self.literal_identity(left, right, line)
+                or self.literal_identity(right, left, line))
 
     def recorder(self, node, recorders):
         if name_of(node) in recorders:
@@ -647,7 +765,7 @@ class Inspect(ast.NodeVisitor):
             if isinstance(node, ast.Call) and name_of(node.func).rsplit(".", 1)[-1][:1].isupper():
                 yield id(node)
 
-    def issues(self, test_name):
+    def issues(self, test_name, pins, strings):
         findings = []
         recorders = {name for name, bindings in self.bindings.items()
                      if isinstance(bindings[0][1], ast.List) and not bindings[0][1].elts}
@@ -661,7 +779,7 @@ class Inspect(ast.NodeVisitor):
                 findings.append((line, "const-truth"))
             if operator in {ast.Eq, ast.Is, ast.NotEq, ast.IsNot} and same(left, right):
                 findings.append((line, "self-compare"))
-            if operator is ast.Eq and self.coupled(left, right, line):
+            if operator is ast.Eq and self.coupled(left, right, line, pins, strings):
                 findings.append((line, "self-derived-expected"))
             if (operator is ast.Eq and self.zero_origin(self.resolve(left, line), right, line)
                     or self.fixed_output_check(node, line) or self.order_without_cardinality(node, line)):
@@ -926,6 +1044,7 @@ class ModuleConstants:
     def __init__(self, path):
         self.path = Path(path).absolute()
         self.modules = {}
+        self.trees = {}
 
     @staticmethod
     def module_file(root, module):
@@ -947,16 +1066,57 @@ class ModuleConstants:
                 break
         return None
 
-    def dependencies(self, module):
+    def parse_module(self, module):
         source = self.source(module)
         if source is None or source == self.path:
-            return {}
+            return None
         try:
             with tokenize.open(source) as stream:
                 tree = ast.parse(stream.read(), filename=str(source))
         except (OSError, SyntaxError, UnicodeError, LookupError):
-            return {}
+            return None
+        return tree
 
+    def tree(self, module):
+        if module not in self.trees:
+            self.trees[module] = self.parse_module(module)
+        return self.trees[module]
+
+    def definition(self, path):
+        tree = self.tree(path[:-1])
+        definitions = [node for node in tree.body
+                       if isinstance(node, ast.FunctionDef) and node.name == path[-1]] if tree else []
+        return definitions[0] if len(definitions) == 1 else None
+
+    def directories(self, path):
+        function = self.definition(path)
+        if function is None or "path" not in path[-1]:
+            return ()
+        segments = sorted((node.right for node in body_nodes(function.body)
+                           if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)),
+                          key=lambda node: (node.lineno, node.col_offset))
+        return path_directories(value for node in segments if isinstance(value := literal(node), str))
+
+    def string_transform(self, path):
+        function = self.definition(path)
+        if function is None or function.decorator_list:
+            return ""
+        body = function.body
+        if ast.get_docstring(function) is not None:
+            body = body[1:]
+        args = parameter_names(function)
+        if len(body) == 1 and isinstance(body[0], ast.Return):
+            call = body[0].value
+            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name) and call.func.value.id == args.get(0)
+                    and not (call.args or call.keywords)):
+                return call.func.attr
+        return ""
+
+    def dependencies(self, module):
+        tree = self.tree(module)
+        if tree is None:
+            return {}
         names = scope_changes(tree.body)
         constants = {target.id for _, target, _ in assignments(tree.body)
                      if isinstance(target, ast.Name) and target.id.isupper()
@@ -1001,6 +1161,7 @@ def parse(source, path):
     module_names = scope_changes(tree.body)
     tables = dict(file_iterables(tree.body, module_names))
     tests = []
+    inspected = []
     for node, parents in test_functions(tree.body):
         iterables = Iterables(node, parents, tables, module_names)
         local_parameters = {local.name: parameter_names(local) for local in node.body
@@ -1030,11 +1191,16 @@ def parse(source, path):
             end += 1
         identifier = ".".join((*path.with_suffix("").parts, *parents, node.name))
         test = Test(node.name, identifier, node.lineno, start, end, node.col_offset)
-        test.issues = inspector.issues(node.name)
-        if not inspector.checks:
-            test.issues.append((test.line, "no-assert"))
+        inspected.append((test, inspector, node))
         test.guarded = bool(inspector.checks) and all(guards for _, _, guards in inspector.checks)
         test.conditional = bool(inspector.constraints)
         test.measured = inspector.measured
         tests.append(test)
+    pins = {pin for _, inspector, _ in inspected for pin in inspector.literal_pins()}
+    for test, inspector, node in inspected:
+        strings = {part.value for part in body_nodes(node.body)
+                   if isinstance(part, ast.Constant) and isinstance(part.value, str)}
+        test.issues = inspector.issues(test.name, pins, strings)
+        if not inspector.checks:
+            test.issues.append((test.line, "no-assert"))
     return tests, comments

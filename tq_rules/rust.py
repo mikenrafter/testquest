@@ -2,9 +2,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 import re
+from string import Formatter
 
 from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, argument_claims, fixed_boundary, helper, loose_bounds,
-                   named_arguments, prefix_satisfies, symmetric_input, unvaried_arguments)
+                   named_arguments, prefix_satisfies, symmetric_input, unvaried_arguments, IMPORT_FIELDS,
+                   IMPORT_TOKEN, path_directories, pins_path)
 from .source import Comment, Test
 
 
@@ -237,7 +239,10 @@ def test_functions(tokens, namespace=(), imports=None, *, module_scope=True):
                         panic = any(name and name[0] == "should_panic" for name in names)
                         name = tokens[index + 1].text
                         scope = tokens if module_scope else None
-                        yield token, name, "::".join((*namespace, name)), attributes[0][0].line, body, panic, aliases, scope
+                        header = next((part.children for part in tokens[index + 2:body_index]
+                                       if part.text == "("), ())
+                        yield (token, name, "::".join((*namespace, name)), attributes[0][0].line,
+                               body, panic, aliases, scope, header)
                         index = body_index
                         break
             attributes.clear()
@@ -432,6 +437,13 @@ def callee_start(tokens, index):
     if index and tokens[index - 1].text in {".", "fn"}:
         return None
     return index
+
+
+def walk_tokens(tokens):
+    for token in tokens:
+        yield token
+        if token.kind == "group":
+            yield from walk_tokens(token.children)
 
 
 def check_arguments(tokens):
@@ -824,6 +836,9 @@ def pattern_names(tokens):
 ORACLE_METHODS = {"to_json", "tobytes", "to_string", "clone", "iter", "into_iter", "collect",
                   "read_bytes", "read_to_string", "as_str", "as_slice", "as_ref", "as_bytes",
                   "unwrap", "expect"}
+STRING_TRANSFORMS = {"trim": "strip", "trim_start": "lstrip", "trim_end": "rstrip",
+                     "to_lowercase": "lower", "to_uppercase": "upper"}
+IDENTIFIER_STRATEGY = re.compile(r"\[(?:a-z|A-Z|_)+\](?:\+|\[(?:a-z|A-Z|0-9|_)+\]\{0,\d+\})?")
 ORACLE_OPERATORS = {"+", "-", "*", "/", "%", "|", "^"}
 ORACLE_FUNCTIONS = {("std", "fs", "read"), ("std", "fs", "read_to_string"),
                     ("serde_json", "to_string"), ("serde_json", "to_vec"), ("serde_json", "to_value")}
@@ -886,6 +901,8 @@ class Inspect:
         self.expected = set()
         self.calls = defaultdict(list)
         self.check_arguments = []
+        self.strategies = {}
+        self.paired_bindings = {}
 
     def visit(self, tokens, guarded=False, inherited=None):
         locals_here = dict(inherited or ())
@@ -939,6 +956,11 @@ class Inspect:
             if text == "let":
                 if len(parts) == 2:
                     lhs, rhs = parts
+                    if len(pattern) == 1 and pattern[0].text == "(":
+                        pair = list(split(pattern[0].children))
+                        if len(pair) == 2 and all(len(name) == 1 and name[0].kind == "word" for name in pair):
+                            for name in pair:
+                                self.paired_bindings[name[0].text] = rhs
                     target = next((item for item in lhs if item.kind == "word" and item.text != "mut"), None)
                     if target:
                         declaration_names.add(id(target))
@@ -1066,15 +1088,274 @@ class Inspect:
                    for part in value if part.text == "("
                    for token in check_arguments(part.children) if token.kind == "word")
 
-    def coupled(self, left, right, line):
+    @staticmethod
+    def equality(name, args):
+        if name in ASSERTIONS and name.endswith("_eq") and len(args) >= 2:
+            return args[:2]
+        if name in {"assert", "debug_assert", "prop_assert"} and args:
+            op, left, right = comparison(args[0])
+            if op == "==":
+                return left, right
+        return (), ()
+
+    def literal_pins(self):
+        for line, name, args, guarded in self.checks:
+            if guarded:
+                continue
+            left, right = self.equality(name, args)
+            for operand, other in ((left, right), (right, left)):
+                if literal(self.resolve(other, line), signed_and_float=True) is UNKNOWN:
+                    continue
+                resolved = self.resolve(operand, line)
+                if qualified_name(resolved) and (constant := self.oracle_constant(resolved, line)):
+                    yield constant
+                if resolved and resolved[-1].text == "(":
+                    yield from self.oracle_calls(resolved, line) or ()
+
+    def sized_from(self, tokens, constant, line, seen=frozenset()):
+        tokens = self.resolve(tokens, line)
+        if not tokens or id(tokens[0]) in seen:
+            return False
+        seen = seen | {id(tokens[0])}
+        for index, token in enumerate(tokens):
+            if token.text in {"+", "-", "*"}:
+                left, right = tokens[:index], tokens[index + 1:]
+                for operand, other in ((left, right), (right, left)):
+                    if integer_literal(other) is not None and self.oracle_constant(operand, line) == constant:
+                        return True
+            elif token.kind == "group":
+                for part in split(token.children, ";" if token.text == "[" else ","):
+                    if self.sized_from(part, constant, token.line, seen):
+                        return True
+            elif token.kind == "word" and token.text in self.bindings and token.text not in self.mutated:
+                original = self.resolve((token,), token.line)
+                if original != (token,) and self.sized_from(original, constant, token.line, seen):
+                    return True
+        return False
+
+    def shared_constant(self, calls, actual, expected, line, pins):
+        constant = self.oracle_constant(expected, line)
+        return (calls and len(calls) == 1 and constant not in pins
+                and self.file_iterables.shares_constant(next(iter(calls)), constant)
+                and not self.sized_from(actual, constant, line))
+
+    def composition(self, actual, expected, pins, strings):
+        if not different_callees(actual, expected):
+            return False
+        directories = []
+        for path in actual | expected:
+            if "path" not in path[-1]:
+                continue
+            body = self.file_iterables.function(path)
+            segments = (literal(token.children) for index, token in enumerate(body)
+                        if token.text == "(" and shape(body[max(0, index - 2):index]) == (".", "join"))
+            if parts := path_directories(segment for segment in segments if isinstance(segment, str)):
+                directories.append(parts)
+        if directories:
+            return any(not pins_path(parts, strings) for parts in directories)
+        oracle = expected if len(actual) == 1 else actual
+        return bool(oracle - pins)
+
+    def stable_expression(self, tokens, line):
+        tokens = unborrow(tokens)
+        seen = set()
+        while tokens and id(tokens[0]) not in seen:
+            seen.add(id(tokens[0]))
+            if len(tokens) == 1 and tokens[0].text == "(":
+                tokens = tokens[0].children
+                continue
+            if (len(tokens) == 1 and tokens[0].kind == "word"
+                    and tokens[0].text not in self.mutated):
+                resolved = self.resolve(tokens, line)
+                if resolved != tokens:
+                    tokens = unborrow(resolved)
+                    continue
+            break
+        return tokens
+
+    def field_call(self, operand, line):
+        operand = self.stable_expression(operand, line)
+        receiver, method, args = method_call(operand)
+        if method == "len" and not args:
+            operand = self.stable_expression(receiver, line)
+        if len(operand) > 2 and operand[-2].text == "." and operand[-1].kind == "word":
+            return operand[-1].text, self.stable_expression(operand[:-2], line)
+        return "", ()
+
+    def pipeline_call(self, tokens):
+        while True:
+            receiver, method, _ = method_call(tokens)
+            if method not in ORACLE_METHODS:
+                break
+            tokens = receiver
+        if tokens and tokens[-1].text == "(":
+            path = qualified_name(tokens[:-1])
+            if path:
+                return self.oracle_path(path, tokens[0].line), tuple(split(tokens[-1].children, type_arguments=True))
+        return (), ()
+
+    def identifier_strategy(self, tokens):
+        if len(tokens) != 1 or tokens[0].text in self.mutated:
+            return False
+        strategy = self.strategies.get(tokens[0].text, ())
+        path, arguments = self.pipeline_call(strategy)
+        if path and not arguments:
+            strategy = self.file_iterables.function(path)
+        receiver, method, arguments = method_call(strategy)
+        if (method == "prop_map" and len(arguments) == 4
+                and shape(arguments)[::2] == ("|", "|")
+                and arguments[1].kind == "word" and arguments[1].text == arguments[3].text):
+            strategy = receiver
+        value = literal(strategy)
+        return isinstance(value, str) and bool(IDENTIFIER_STRATEGY.fullmatch(value))
+
+    def source_text(self, tokens):
+        value = literal(tokens)
+        if isinstance(value, str):
+            return value
+        if len(tokens) == 1 and tokens[0].kind == "quoted":
+            parts = output_fragments(tokens)
+            return parts[0] if len(parts) == 1 else None
+        if len(tokens) != 3 or not macro_at(tokens, 0, {"format"}):
+            return None
+        parts = list(split(tokens[-1].children))
+        template = self.source_text(parts[0]) if parts else None
+        if template is None:
+            return None
+        try:
+            fields = list(Formatter().parse(template))
+        except ValueError:
+            return None
+        if any(field not in (None, "") or spec or conversion for _, field, spec, conversion in fields):
+            return None
+        if (sum(field == "" for _, field, _, _ in fields) != len(parts) - 1
+                or not all(self.identifier_strategy(self.stable_expression(arg, tokens[0].line)) for arg in parts[1:])):
+            return None
+        return "".join(span + ("\0" if field == "" else "") for span, field, _, _ in fields)
+
+    def fixture(self, tokens, line):
+        tokens = self.stable_expression(tokens, line)
+        if not tokens:
+            return ()
+        original = tokens
+        receiver, method, _ = method_call(tokens)
+        if method == "collect" and receiver:
+            files, method, converter = method_call(receiver)
+            source, iteration, parameters = method_call(files)
+            name = qualified_name(converter)
+            if (method == "map" and name and name[-1] == "from_parsed_file"
+                    and iteration == "iter" and not parameters):
+                tokens = self.stable_expression(source, tokens[0].line)
+                if not tokens or tokens == original:
+                    return ()
+        value = literal(tokens)
+        if value in ([], (), ""):
+            return ("empty",)
+        if macro_at(tokens, 0, {"vec"}) and len(tokens) == 3:
+            tokens = tokens[-1].children
+        elif len(tokens) == 1 and tokens[0].text == "[":
+            tokens = tokens[0].children
+        path, args = self.pipeline_call(tokens)
+        if path and path[-1] == "parse_file" and len(args) == 2:
+            filename = literal(args[0])
+            if not isinstance(filename, str) or not filename.endswith((".ts", ".tsx", ".js", ".jsx", ".py", ".rs")):
+                return ()
+            tokens = self.stable_expression(args[1], args[1][0].line)
+        source = self.source_text(tokens)
+        if source is not None and not IMPORT_TOKEN.search(source):
+            # A generated identifier can spell a keyword, so only accept holes
+            # in positions where they cannot form an import declaration.
+            if "\0" not in source or re.fullmatch(
+                    r"\s*function\s+\x00\(\)\s*\{\s*(?:\x00\(\);\s*)?\}\s*", source):
+                return "import-free", source
+        return ()
+
+    def empty_pair(self, first, second):
+        if (len(first) != 1 or len(second) != 1 or first[0].text == second[0].text
+                or first[0].text in self.mutated or second[0].text in self.mutated):
+            return False
+        rhs = self.paired_bindings.get(first[0].text)
+        if not rhs or rhs is not self.paired_bindings.get(second[0].text) or rhs[0].line >= first[0].line:
+            return False
+        path, args = self.pipeline_call(rhs)
+        if len(args) != 1 or self.fixture(args[0], rhs[0].line) != ("empty",):
+            return False
+        body = self.file_iterables.function(path)
+        if not body or body[-1].text != "(":
+            return False
+        pair = tuple(split(body[-1].children))
+        if len(pair) != 2:
+            return False
+        bindings = {}
+        for statement in split(body[:-1], ";"):
+            if shape(statement[:1]) == ("let",) and len(statement) > 3:
+                _, *declaration = statement
+                lhs, *value = split(declaration, "=")
+                if lhs[0].kind == "word" and len(value) == 1:
+                    bindings[lhs[0].text] = value[0]
+        callees = []
+        for member in pair:
+            value = bindings.get(member[0].text, member) if len(member) == 1 else member
+            if not value or value[-1].text != "(":
+                return False
+            callee = qualified_name(value[:-1])
+            if not callee:
+                return False
+            callees.append(callee)
+        return callees[0] != callees[1]
+
+    def empty_parity(self, left, right, line):
+        field, first = self.field_call(left, line)
+        other_field, second = self.field_call(right, line)
+        if not field or field != other_field:
+            return False
+        left_call, left_args = self.pipeline_call(first)
+        right_call, right_args = self.pipeline_call(second)
+        if not left_call or not right_call:
+            return self.empty_pair(first, second)
+        if left_call == right_call:
+            return False
+        if not left_args or not right_args or len(left_args) != len(right_args):
+            return False
+        if any(shape(a) != shape(b) for a, b in zip(left_args[1:], right_args[1:])):
+            return False
+        one, two = (self.fixture(args[0], line) for args in (left_args, right_args))
+        return bool(one and one == two and (one[0] == "empty" or field in IMPORT_FIELDS))
+
+    def literal_identity(self, left, right, line):
+        first, second = (self.stable_expression(value, line) for value in (left, right))
+        calls = self.oracle_calls(first, line)
+        if not calls or len(calls) != 1 or calls != self.oracle_calls(second, line):
+            return False
+        path, first_args = self.pipeline_call(first)
+        _, second_args = self.pipeline_call(second)
+        if not path or len(first_args) != 1 or len(second_args) != 1:
+            return False
+        value = literal(self.stable_expression(first_args[0], first[0].line))
+        transformed = self.stable_expression(second_args[0], second[0].line)
+        receiver, method, args = method_call(transformed)
+        if not isinstance(value, str) or not value.isascii():
+            return False
+        if not method or args or literal(self.stable_expression(receiver, line)) != value:
+            inner, args = self.pipeline_call(transformed)
+            if inner != path or len(args) != 1 or literal(self.stable_expression(args[0], line)) != value:
+                return False
+            body = self.file_iterables.function(path)
+            receiver, method, args = method_call(body)
+            if args or shape(receiver) != (self.parameters.get(path, {}).get(0),):
+                return False
+        return method in STRING_TRANSFORMS and getattr(value, STRING_TRANSFORMS[method])() == value
+
+    def coupled(self, left, right, line, pins, strings):
         actual = self.oracle_calls(left, line)
         expected = self.oracle_calls(right, line)
-        return (different_callees(actual, expected)
+        return (self.composition(actual, expected, pins, strings)
                 and not (self.uses_operand(left, right, line) or self.uses_operand(right, left, line))
-                or (actual and len(actual) == 1 and self.file_iterables.shares_constant(
-                    next(iter(actual)), self.oracle_constant(right, line)))
-                or (expected and len(expected) == 1 and self.file_iterables.shares_constant(
-                    next(iter(expected)), self.oracle_constant(left, line))))
+                or self.shared_constant(actual, left, right, line, pins)
+                or self.shared_constant(expected, right, left, line, pins)
+                or self.empty_parity(left, right, line)
+                or self.literal_identity(left, right, line)
+                or self.literal_identity(right, left, line))
 
     def observed_calls(self, tokens, line, seen=frozenset()):
         while tokens and tokens[0].text in {"!", "&", "mut", "*"}:
@@ -1304,7 +1585,7 @@ class Inspect:
         return self.parameters.get(absolute_path(self.scope, name),
                                    self.parameters.get(name, {}))
 
-    def issues(self, test_name):
+    def issues(self, test_name, pins, strings):
         findings = [(line, "nondistinguishing-literal") for line in self.argument_calls(test_name)]
         recorders = {
             name for name, bindings in self.bindings.items()
@@ -1336,7 +1617,7 @@ class Inspect:
                 continue
             if op in {"==", "!="} and shape(left) == shape(right):
                 findings.append((line, "self-compare"))
-            if op == "==" and self.coupled(left, right, line):
+            if op == "==" and self.coupled(left, right, line, pins, strings):
                 findings.append((line, "self-derived-expected"))
             reverse = {">": "<", ">=": "<=", "<": ">", "<=": ">="}
             for operand, other, ordered in ((left, right, op), (right, left, reverse.get(op, op))):
@@ -1374,11 +1655,12 @@ def parse(source, path):
     found = list(test_functions(grouped))
     if not found:
         return tests, comments
-    test_bodies = {id(body) for _, _, _, _, body, _, _, _ in found}
+    test_bodies = {id(row[4]) for row in found}
+    inspected = []
     helpers = {}
     parameters = dict(file_parameters(grouped))
     file_iterables = FileIterables(grouped, path, parameters)
-    for token, name, identifier, start, body, panic, aliases, scope in found:
+    for token, name, identifier, start, body, panic, aliases, scope, header in found:
         if scope is not None and id(scope) not in helpers:
             helpers[id(scope)] = checking_helpers(scope, test_bodies)
         previous = {c.line for c in comments if c.standalone and c.column == token.column}
@@ -1391,10 +1673,17 @@ def parse(source, path):
                             dict(parameter_names(body.children)))
         for local in declared_bindings(body.children):
             inspector.oracle_locals.setdefault(local.text, local.line)
+        inspector.strategies = {argument[0].text: argument[2:] for argument in split(header, type_arguments=True)
+                                if len(argument) >= 3 and argument[0].kind == "word" and argument[1].text == "in"}
         inspector.visit(body.children)
-        test.issues, test.measured = inspector.issues(name)
+        inspected.append((test, inspector, panic, body))
+    pins = {pin for _, inspector, _, _ in inspected for pin in inspector.literal_pins()}
+    for test, inspector, panic, body in inspected:
+        strings = {value for token in walk_tokens(body.children)
+                   if token.kind in {"quoted", "raw"} and isinstance(value := literal((token,)), str)}
+        test.issues, test.measured = inspector.issues(test.name, pins, strings)
         if not inspector.checks and not panic:
-            test.issues.append((token.line, "no-assert"))
+            test.issues.append((test.line, "no-assert"))
         test.guarded = bool(inspector.checks) and not panic and all(
             guarded for _, _, _, guarded in inspector.checks)
         test.conditional = inspector.assumes
