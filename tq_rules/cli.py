@@ -12,7 +12,7 @@ def print_findings(rows, as_json):
     else:
         for row in rows:
             print("{path}:{line} {rule} {message}".format(**row))
-    return int(bool(rows))
+    return int(any(row.get("level") != "advisory" for row in rows))
 
 
 def main():
@@ -84,7 +84,8 @@ def main():
                         print("  {source} ({section})".format(**citation))
         if options.command == "rules":
             for name, (message, allowed) in sorted(lint.RULES.items()):
-                print(f"{name}  {message}\n  allowed-when: {allowed}")
+                level = "advisory" if name in lint.ADVISORY else "error"
+                print(f"{name}  {message}\n  level: {level}\n  allowed-when: {allowed}")
     except (OSError, ValueError, SyntaxError, subprocess.SubprocessError) as error:
         print(f"tq: {error}", file=sys.stderr)
         return 2

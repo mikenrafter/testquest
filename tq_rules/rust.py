@@ -122,7 +122,7 @@ def literal(tokens):
     if token.text in {"true", "false"}:
         return token.text == "true"
     if token.kind == "number":
-        number = re.split(r"[ui]", token.text)[0]
+        number = re.sub(r"_?[ui](?:8|16|32|64|128|size)$", "", token.text).replace("_", "")
         return int(number, 0) if number.startswith(("0x", "0o", "0b")) else int(number)
     if token.kind == "raw":
         prefix = RAW.match(token.text)
@@ -178,6 +178,18 @@ def imports_in(tokens):
             yield from use_paths(clause)
 
 
+def test_attribute(name):
+    """`name` is shape(attribute): a path ending in `test`, or rstest/test_case, with optional arguments."""
+    if name and (name[-1] == "(" or (isinstance(name[-1], tuple) and name[-1][0] == "(")):
+        name = name[:-1]
+    if not name or any(not isinstance(part, str) for part in name):
+        return False
+    if len(name) == 1:
+        return name[0] in {"test", "rstest", "test_case"}
+    return name[-1] == "test" and name[-2] == "::" and all(
+        part == "::" if index % 2 else part.isidentifier() for index, part in enumerate(name[:-1]))
+
+
 def test_functions(tokens, namespace=(), imports=None):
     aliases = dict(imports or ())
     aliases.update((alias, path) for path, alias in imports_in(tokens))
@@ -191,7 +203,7 @@ def test_functions(tokens, namespace=(), imports=None):
             continue
         if token.text == "fn" and index + 1 < len(tokens) and attributes:
             names = [shape(attribute) for _, attribute in attributes]
-            is_test = any(name in {("test",), ("tokio", "::", "test")} for name in names)
+            is_test = any(test_attribute(name) for name in names)
             if is_test:
                 for body_index in range(index + 2, len(tokens)):
                     body = tokens[body_index]
@@ -254,9 +266,49 @@ def conditional_blocks(tokens):
     return guarded
 
 
+def function_bodies(tokens):
+    """Yield (name, body token) for every `fn` with a body, at any depth."""
+    for index, token in enumerate(tokens):
+        if token.text == "fn" and index + 1 < len(tokens) and tokens[index + 1].kind == "word":
+            for body in tokens[index + 2:]:
+                if body.text == ";":
+                    break
+                if body.text == "{" and body.kind == "group":
+                    yield tokens[index + 1].text, body
+                    break
+        if token.kind == "group":
+            yield from function_bodies(token.children)
+
+
+def checks_anywhere(tokens, known):
+    for index, token in enumerate(tokens):
+        if macro_at(tokens, index, ASSERTIONS | FAILURES):
+            return True
+        if (token.kind == "word" and index + 1 < len(tokens) and tokens[index + 1].kind == "group"
+                and tokens[index + 1].text == "(" and (token.text in known or helper(token.text))):
+            return True
+        if token.kind == "group" and checks_anywhere(token.children, known):
+            return True
+    return False
+
+
+def checking_helpers(tokens, tests):
+    """Names of non-test fns whose bodies check directly or call a known checker, to a fixpoint."""
+    tested = {id(body) for *_, body, _, _ in tests}
+    bodies = [(name, body) for name, body in function_bodies(tokens) if id(body) not in tested]
+    known = set()
+    while True:
+        found = {name for name, body in bodies if name not in known
+                 and checks_anywhere(body.children, known)}
+        if not found:
+            return known
+        known |= found
+
+
 class Inspect:
-    def __init__(self, aliases):
+    def __init__(self, aliases, helpers=frozenset()):
         self.aliases = aliases
+        self.helpers = helpers
         self.checks = []
         self.bindings = {}
         self.writes = {}
@@ -298,7 +350,8 @@ class Inspect:
                 arguments = tokens[group_index]
                 if arguments.kind == "group" and (macro or arguments.text == "("):
                     args = list(split(arguments.children))
-                    if (macro and text in ASSERTIONS | FAILURES) or helper(text):
+                    if (macro and text in ASSERTIONS | FAILURES) or helper(text) or (
+                            not macro and text in self.helpers):
                         self.checks.append((token.line, text, args, guarded))
                     elif (not text[0].isupper() and not (macro and text == "vec")
                           and symmetric_input(text, map(literal, args))):
@@ -407,12 +460,15 @@ class Inspect:
 def parse(source, path):
     tokens, comments = tokenize(source)
     tests = []
-    for token, name, identifier, start, body, panic, aliases in test_functions(group(tokens)):
+    grouped = group(tokens)
+    found = list(test_functions(grouped))
+    helpers = checking_helpers(grouped, found)
+    for token, name, identifier, start, body, panic, aliases in found:
         previous = {c.line for c in comments if c.standalone and c.column == token.column}
         while start - 1 in previous:
             start -= 1
         test = Test(name, identifier, token.line, start, body.end, token.column)
-        inspector = Inspect(aliases)
+        inspector = Inspect(aliases, helpers)
         inspector.visit(body.children)
         test.issues, test.measured = inspector.issues()
         if not inspector.checks and not panic:

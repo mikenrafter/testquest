@@ -7,14 +7,14 @@ REACHES = re.compile(r"reaches:\s*([\w.:/-]+)")
 
 
 def find(paths):
-    files = list(scan_paths(paths))
+    rows = []
+    files = list(scan_paths(paths, rows))
     names = {}
     for path, tests, _ in files:
         for test in tests:
             for name in {test.name, test.identifier}:
                 names.setdefault(name, set()).add((path, test.line))
 
-    rows = []
     for path, tests, comments in files:
         for test in tests:
             if test.measured or not (test.guarded or test.conditional):

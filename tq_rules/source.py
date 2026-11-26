@@ -32,7 +32,8 @@ class Test:
 IGNORED = {".git", "__pycache__", ".venv", "node_modules", "target"}
 
 
-def scan_paths(inputs):
+def scan_paths(inputs, errors):
+    """Yield parsed files; append a parse-error finding to `errors` for each unreadable one."""
     from . import python, rust
 
     paths = set()
@@ -50,12 +51,18 @@ def scan_paths(inputs):
     for path in sorted(paths, key=str):
         if not path.is_file():
             continue
-        if path.suffix == ".py":
-            with tokenize.open(path) as stream:
-                yield path, *python.parse(stream.read(), path)
-        else:
-            yield path, *rust.parse(path.read_text(encoding="utf-8"), path)
+        try:
+            if path.suffix == ".py":
+                with tokenize.open(path) as stream:
+                    parsed = python.parse(stream.read(), path)
+            else:
+                parsed = rust.parse(path.read_text(encoding="utf-8"), path)
+        except (SyntaxError, ValueError, UnicodeDecodeError) as error:
+            errors.append(finding(path, getattr(error, "lineno", None) or 1, "parse-error",
+                                  f"Cannot parse: {error}"))
+            continue
+        yield path, *parsed
 
 
-def finding(path, line, rule, message):
-    return dict(path=str(path), line=line, rule=rule, message=message)
+def finding(path, line, rule, message, level="error"):
+    return dict(path=str(path), line=line, rule=rule, message=message, level=level)

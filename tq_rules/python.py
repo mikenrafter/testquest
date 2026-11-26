@@ -263,7 +263,8 @@ class Inspect(ast.NodeVisitor):
                     or (not root and (name in self.local_helpers or hasattr(builtins, name)))):
                 continue
             args = [*call.args, *(kw.value for kw in call.keywords)]
-            if symmetric_input(name, map(literal, args)):
+            if symmetric_input(name, map(literal, args),
+                               [False] * len(call.args) + [True] * len(call.keywords)):
                 findings.append((call.lineno, "nondistinguishing-literal"))
         return findings
 

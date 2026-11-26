@@ -33,21 +33,25 @@ RULES = {
         "The test's WHY explains the symmetry. Examples include equal weights or durations, a zero-write case, or a rule that specifically rejects equal values.",
     ),
 }
+ADVISORY = {"nondistinguishing-literal", "self-derived-expected"}
 ORDERED_NAME = re.compile(r"reverse|order|swap|endian|rotate|crc|encode", re.I)
 UNKNOWN = object()
 
 
-def symmetric_input(name, literals):
+def symmetric_input(name, literals, keywords=()):
+    """`keywords` flags, per literal, a Python keyword argument; two keyword duplicates are not a mix-up risk."""
     seen = []
-    for value in literals:
+    keywords = list(keywords) + [False] * (len(literals := list(literals)) - len(keywords))
+    for value, keyword in zip(literals, keywords):
         if value is UNKNOWN:
             continue
         if value is not None and type(value) is not bool and not (
                 isinstance(value, str) and value.startswith("--")):
             key = (type(value), value)
-            if key in seen:
+            if any(key == earlier and not (keyword and earlier_keyword)
+                   for earlier, earlier_keyword in seen):
                 return True
-            seen.append(key)
+            seen.append((key, keyword))
         if (isinstance(value, list) and len(value) >= 2
                 and all(type(item) is type(value[0]) and item == value[0] for item in value[1:])):
             return True
@@ -63,7 +67,7 @@ def helper(name):
 
 def find(paths):
     rows = []
-    for path, tests, comments in scan_paths(paths):
+    for path, tests, comments in scan_paths(paths, rows):
         allows = {}
         for comment in comments:
             match = re.fullmatch(r"tq:\s*allow\s+([\w-]+)(?:\s+(.*))?", comment.text)
@@ -91,5 +95,7 @@ def find(paths):
                     del allows[key]
                     break
             else:
-                rows.append(finding(path, line, rule, RULES[rule][0]))
+                advisory = rule in ADVISORY
+                rows.append(finding(path, line, rule, ("advisory: " if advisory else "") + RULES[rule][0],
+                                    "advisory" if advisory else "error"))
     return sorted(rows, key=lambda row: (row["path"], row["line"], row["rule"]))

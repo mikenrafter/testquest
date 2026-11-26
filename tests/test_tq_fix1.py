@@ -24,7 +24,7 @@ class ParseErrors(contract.TqCase):
         rows = json.loads(self.tq("lint", ".", "--json", code=(1,)))
         pairs = sorted((contract.Path(row["path"]).name, row["rule"]) for row in rows)
         self.assertEqual(pairs, [
-            ("a_good.rs", "const-truth"), ("a_good.rs", "const-truth"),
+            ("a_good.rs", "const-truth"), ("a_good.rs", "const-truth"), ("a_good.rs", "self-compare"),
             ("b_syntax.py", "parse-error"), ("c_unclosed.rs", "parse-error"),
             ("d_bytes.py", "parse-error"), ("e_bytes.rs", "parse-error"),
             ("f_real_test.py", "const-truth"),

@@ -112,7 +112,7 @@ def run(repository, worktree, command):
         with chdir(base):
             notes = [
                 (path, comment.line, test.identifier, *match.groups())
-                for path, tests, comments in scan_paths([Path(".")])
+                for path, tests, comments in scan_paths([Path(".")], [])
                 for comment in comments if (match := NOTE.fullmatch(comment.text))
                 for test in tests if test.owns(comment)
             ]
