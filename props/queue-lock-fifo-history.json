@@ -1,0 +1,32 @@
+{
+  "id": "queue-lock-fifo-history",
+  "schema_version": 1,
+  "family": "queue-lock",
+  "variant": "Linearizable FIFO",
+  "applicability": "Each call has an invocation and response, and FIFO uses the order of effective enqueue operations.",
+  "kind": "transition-invariant",
+  "law": "An overlapping history admits at least one FIFO order consistent with real-time precedence.",
+  "input_strategy": {
+    "start": "Empty FIFO.",
+    "actions": "Enqueue one item, wait for its response, then overlap enqueue of a second item with a dequeue in separate processes. Drain the queue and record every result."
+  },
+  "edge_cases": [
+    "The completed first enqueue must precede both later operations."
+  ],
+  "oracle": {
+    "method": "Enumerate serial orders respecting the observed non-overlap edges, simulate each with a list, and require one order whose responses match. The first dequeue returns the first item."
+  },
+  "known_wrong_implementations": [
+    "Validate only final size.",
+    "Allow a later enqueue to overtake an already completed first enqueue."
+  ],
+  "evidence": [
+    {
+      "source": "https://www.cs.columbia.edu/~wing/publications/HerlihyWing90.pdf",
+      "section": "Sections 2.1\u20132.2, histories and linearizability",
+      "revision": "ACM TOPLAS 12(3), July 1990",
+      "license": "ACM copyright. Cite the correctness definition.",
+      "status": "proof"
+    }
+  ]
+}

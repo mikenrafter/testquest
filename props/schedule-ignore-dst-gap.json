@@ -1,0 +1,37 @@
+{
+  "id": "schedule-ignore-dst-gap",
+  "schema_version": 1,
+  "family": "recurring-schedule",
+  "variant": "iCalendar recurrence across a DST gap",
+  "applicability": "The gap policy follows the RFC recurrence rule. Use America/New_York data that includes the 2007 spring transition.",
+  "kind": "transition-invariant",
+  "law": "A generated nonexistent local occurrence is dropped and does not consume COUNT.",
+  "input_strategy": {
+    "start": "2007-03-04 02:30 America/New_York",
+    "rule": "FREQ=WEEKLY;BYDAY=SU;COUNT=2",
+    "action": "Enumerate the recurrence set."
+  },
+  "edge_cases": [
+    "The generated 2007-03-11 02:30 local time is in the DST gap."
+  ],
+  "oracle": {
+    "occurrences": [
+      "2007-03-04 02:30 America/New_York",
+      "2007-03-18 02:30 America/New_York"
+    ],
+    "derivation": "Use the gap documented in RFC 5545 section 3.3.5 and the skip-and-do-not-count rule in 3.3.10. Confirm existence of each wall time by a round trip via UTC with zoneinfo."
+  },
+  "known_wrong_implementations": [
+    "Shift the nonexistent time forward.",
+    "Skip the occurrence but charge it against COUNT."
+  ],
+  "evidence": [
+    {
+      "source": "https://www.rfc-editor.org/rfc/rfc5545#section-3.3.10",
+      "section": "Sections 3.3.10 and 3.8.5.3",
+      "revision": "RFC 5545 (2009)",
+      "license": "IETF Trust Legal Provisions as stated in the RFC.",
+      "status": "specification"
+    }
+  ]
+}

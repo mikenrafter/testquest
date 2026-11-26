@@ -1,0 +1,39 @@
+{
+  "id": "cobs-full-block-boundary",
+  "schema_version": 1,
+  "family": "cobs",
+  "variant": "Basic COBS with omitted terminal block after 0xFF",
+  "applicability": "The encoder omits an empty final block after a full nonzero block and excludes the framing delimiter.",
+  "kind": "known-answer",
+  "law": "A full code block represents 254 nonzero bytes and implies no zero.",
+  "input_strategy": {
+    "nonzero_run_lengths": [
+      253,
+      254,
+      255
+    ],
+    "bytes": "Cycle 01 4B D6 in order."
+  },
+  "edge_cases": [
+    "End one byte short of the block boundary, at the boundary, and one byte beyond it."
+  ],
+  "oracle": {
+    "253": "FE followed by all 253 bytes.",
+    "254": "FF followed by all 254 bytes.",
+    "255": "FF followed by the first 254 bytes, then 02 and the final byte.",
+    "derivation": "Table I assigns code n to n\u22121 data bytes. The full-block exception and final-block optimization are in section III-B."
+  },
+  "known_wrong_implementations": [
+    "Split after 253 bytes.",
+    "Insert an implicit interior zero after a full block."
+  ],
+  "evidence": [
+    {
+      "source": "https://www.stuartcheshire.org/papers/COBSforToN.pdf",
+      "section": "Section III-B and Table I",
+      "revision": "IEEE/ACM Transactions on Networking 7(2), 1999, DOI 10.1109/90.769765",
+      "license": "IEEE copyright. Fixtures derived from the published code-block rules.",
+      "status": "specification"
+    }
+  ]
+}

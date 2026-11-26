@@ -3,7 +3,7 @@ import json
 import subprocess
 import sys
 
-from . import catches, lint, risk, witness
+from . import catches, lint, props, risk, witness
 
 
 def print_findings(rows, as_json):
@@ -35,6 +35,11 @@ def main():
     map_risk.add_argument("--html")
     map_risk.add_argument("--json", action="store_true")
     map_risk.add_argument("--budget", default=12, type=int)
+    lookup = commands.add_parser("props", help="Retrieve cited test properties.")
+    query = lookup.add_mutually_exclusive_group(required=True)
+    query.add_argument("family", nargs="?")
+    query.add_argument("--search")
+    lookup.add_argument("--json", action="store_true")
     options = parser.parse_args()
     if options.command == "risk" and options.budget < 0:
         parser.error("--budget must be nonnegative")
@@ -68,6 +73,15 @@ def main():
                     gap = " (gap)" if row["gap"] else ""
                     print("{score:>5}  {fixes:>5}  {churn:>7}  {importers:>9}  {test_refs:>9}  "
                           "{tests:>10}  {path}".format(**row) + gap)
+        if options.command == "props":
+            records = props.find(options.family, options.search)
+            if options.json:
+                print(json.dumps(records, indent=2))
+            else:
+                for record in records:
+                    print("{id}  {variant}  {kind}\n  {law}".format(**record))
+                    for citation in record["evidence"]:
+                        print("  {source} ({section})".format(**citation))
         if options.command == "rules":
             for name, (message, allowed) in sorted(lint.RULES.items()):
                 print(f"{name}  {message}\n  allowed-when: {allowed}")

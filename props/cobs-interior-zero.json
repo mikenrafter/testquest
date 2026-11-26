@@ -1,0 +1,32 @@
+{
+  "id": "cobs-interior-zero",
+  "schema_version": 1,
+  "family": "cobs",
+  "variant": "Basic COBS with delimiter excluded",
+  "applicability": "The encoder returns only the encoded payload. Omit the framing delimiter.",
+  "kind": "known-answer",
+  "law": "An interior zero separates two code blocks and never appears in encoded payload bytes.",
+  "input_strategy": {
+    "raw_hex": "11 00 29"
+  },
+  "edge_cases": [
+    "Unequal nonzero bytes before and after the interior zero."
+  ],
+  "oracle": {
+    "encoded_hex": "02 11 02 29",
+    "derivation": "Table I assigns code 02 to one payload byte plus an implicit zero. Discard the implicit terminal zero only."
+  },
+  "known_wrong_implementations": [
+    "Drop all zero bytes before encoding.",
+    "Ignore offsets and emit an unchanged interior zero."
+  ],
+  "evidence": [
+    {
+      "source": "https://www.stuartcheshire.org/papers/COBSforToN.pdf",
+      "section": "Section III-B and Table I",
+      "revision": "IEEE/ACM Transactions on Networking 7(2), 1999, DOI 10.1109/90.769765",
+      "license": "IEEE copyright. Fixtures derived from the published code-block rules.",
+      "status": "specification"
+    }
+  ]
+}

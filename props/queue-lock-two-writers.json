@@ -1,0 +1,32 @@
+{
+  "id": "queue-lock-two-writers",
+  "schema_version": 1,
+  "family": "queue-lock",
+  "variant": "Persistent FIFO with process-shared lock",
+  "applicability": "Processes enqueue into the same queue. A successful enqueue must persist its item, and failures must be observable.",
+  "kind": "transition-invariant",
+  "law": "Two successful overlapping enqueues preserve both distinct item identities.",
+  "input_strategy": {
+    "start": "Empty shared queue.",
+    "actions": "Use separate processes, synchronize them before enqueue, and use a gate to force overlapping invocations. Inspect the reopened queue after both finish."
+  },
+  "edge_cases": [
+    "Both operations contend for a read/modify/write transition."
+  ],
+  "oracle": {
+    "method": "A two-item multiset model based on the successful calls. Either order is legal for two overlapping enqueues."
+  },
+  "known_wrong_implementations": [
+    "Use an in-process lock for separate processes.",
+    "Open the persisted queue before acquiring the exclusive lock."
+  ],
+  "evidence": [
+    {
+      "source": "https://www.cs.columbia.edu/~wing/publications/HerlihyWing90.pdf",
+      "section": "Sections 2.1\u20132.2, histories and linearizability",
+      "revision": "ACM TOPLAS 12(3), July 1990",
+      "license": "ACM copyright. Cite the correctness definition.",
+      "status": "proof"
+    }
+  ]
+}

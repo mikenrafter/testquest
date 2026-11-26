@@ -1,0 +1,34 @@
+{
+  "id": "schedule-next-weekday",
+  "schema_version": 1,
+  "family": "recurring-schedule",
+  "variant": "Weekly local iCalendar recurrence",
+  "applicability": "The scheduler advances to the first recurrence strictly after the completed occurrence.",
+  "kind": "transition-invariant",
+  "law": "Completing a single-weekday occurrence advances to the same weekday the following week.",
+  "input_strategy": {
+    "start": "1997-09-02 09:00 America/New_York",
+    "rule": "FREQ=WEEKLY;BYDAY=TU",
+    "action": "Complete the starting occurrence and ask for the next one."
+  },
+  "edge_cases": [
+    "A cutoff exactly at the completed occurrence."
+  ],
+  "oracle": {
+    "next": "1997-09-09 09:00 America/New_York",
+    "derivation": "RFC 5545 weekly-until example starts September 2 and lists September 9 as the next occurrence."
+  },
+  "known_wrong_implementations": [
+    "Return the completed occurrence.",
+    "Advance to the next day by comparing weekday without week."
+  ],
+  "evidence": [
+    {
+      "source": "https://www.rfc-editor.org/rfc/rfc5545#section-3.3.10",
+      "section": "Sections 3.3.10 and 3.8.5.3",
+      "revision": "RFC 5545 (2009)",
+      "license": "IETF Trust Legal Provisions as stated in the RFC.",
+      "status": "specification"
+    }
+  ]
+}

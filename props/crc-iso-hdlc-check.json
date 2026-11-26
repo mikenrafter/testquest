@@ -1,0 +1,39 @@
+{
+  "id": "crc-iso-hdlc-check",
+  "schema_version": 1,
+  "family": "crc",
+  "variant": "CRC-32/ISO-HDLC",
+  "applicability": "The API returns the finalized unsigned checksum using the parameters in the RevEng entry.",
+  "kind": "known-answer",
+  "law": "The checksum of the ASCII check string equals the named variant's attested value.",
+  "input_strategy": {
+    "ascii": "123456789"
+  },
+  "edge_cases": [
+    "Keep the bytes in their original order. Exclude a trailing newline."
+  ],
+  "oracle": {
+    "checksum_hex": "0xCBF43926",
+    "derivation": "RevEng check value, confirmed independently with zlib.crc32."
+  },
+  "known_wrong_implementations": [
+    "Plain byte sum gives 0x01DD.",
+    "Omitting the final XOR gives 0x340BC6D9."
+  ],
+  "evidence": [
+    {
+      "source": "https://reveng.sourceforge.io/crc-catalogue/17plus.htm#crc.cat.crc-32-iso-hdlc",
+      "section": "CRC-32/ISO-HDLC",
+      "revision": "width=32, poly=0x04c11db7, xorout=0xffffffff",
+      "license": "Catalogue license unspecified. Cite public algorithm parameters and check value.",
+      "status": "attested"
+    },
+    {
+      "source": "https://datatracker.ietf.org/doc/html/rfc1662#appendix-C.3",
+      "section": "Appendix C.3",
+      "revision": "RFC 1662 (1994)",
+      "license": "Unlimited distribution of the RFC under its stated terms.",
+      "status": "specification"
+    }
+  ]
+}

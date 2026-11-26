@@ -1,0 +1,45 @@
+{
+  "id": "crc-iso-hdlc-streaming",
+  "schema_version": 1,
+  "family": "crc",
+  "variant": "CRC-32/ISO-HDLC streaming",
+  "applicability": "The API can carry state across chunks and produce a final unsigned checksum.",
+  "kind": "metamorphic",
+  "law": "Changing chunk boundaries preserves the attested result after finalization.",
+  "input_strategy": {
+    "chunks_ascii": [
+      "12",
+      "34567",
+      "89"
+    ],
+    "transform": "Feed all chunks to one state in order."
+  },
+  "edge_cases": [
+    "Insert an empty update between chunks.",
+    "Move the split close to either end."
+  ],
+  "oracle": {
+    "checksum_hex": "0xCBF43926",
+    "derivation": "The chunks concatenate to the RevEng check string. RFC 1662 updates the same state across chunks and complements it once at the end."
+  },
+  "known_wrong_implementations": [
+    "Reset state on each update.",
+    "Feed the finalized CRC back to an API expecting raw state."
+  ],
+  "evidence": [
+    {
+      "source": "https://reveng.sourceforge.io/crc-catalogue/17plus.htm#crc.cat.crc-32-iso-hdlc",
+      "section": "CRC-32/ISO-HDLC",
+      "revision": "width=32, poly=0x04c11db7, xorout=0xffffffff",
+      "license": "Catalogue license unspecified. Cite public algorithm parameters and check value.",
+      "status": "attested"
+    },
+    {
+      "source": "https://datatracker.ietf.org/doc/html/rfc1662#appendix-C.3",
+      "section": "Appendix C.3",
+      "revision": "RFC 1662 (1994)",
+      "license": "Unlimited distribution of the RFC under its stated terms.",
+      "status": "specification"
+    }
+  ]
+}
