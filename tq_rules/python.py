@@ -31,6 +31,31 @@ def literal(node):
     return UNKNOWN
 
 
+def nonempty_iterable(node):
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(not isinstance(item, ast.Starred) for item in node.elts)
+    if isinstance(node, ast.Dict):
+        return any(key is not None for key in node.keys)
+    if (isinstance(node, ast.Call) and name_of(node.func) == "range"
+            and 1 <= len(node.args) <= 3 and not node.keywords):
+        bounds = [literal(arg) for arg in node.args]
+        if all(type(bound) is int for bound in bounds):
+            return (len(bounds) < 3 or bounds[2] != 0) and bool(range(*bounds))
+    return False
+
+
+def all_comprehension(node):
+    if (isinstance(node, ast.Call) and name_of(node.func) == "all"
+            and len(node.args) == 1 and not node.keywords
+            and isinstance(node.args[0], (ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp))):
+        return node.args[0]
+    return None
+
+
+def may_skip_iteration(generator):
+    return generator.is_async or not nonempty_iterable(generator.iter)
+
+
 def same(left, right):
     return ast.dump(left) == ast.dump(right)
 
@@ -141,8 +166,38 @@ class Inspect(ast.NodeVisitor):
             self.visit(arm)
         self.guards.pop()
 
+    def visit_loop(self, body, orelse, guard):
+        if guard is not None:
+            self.guards.append(guard)
+        for statement in body:
+            self.visit(statement)
+        if guard is not None:
+            self.guards.pop()
+        for statement in orelse:
+            self.visit(statement)
+
+    def visit_For(self, node):
+        self.visit(node.iter)
+        runs = isinstance(node, ast.For) and nonempty_iterable(node.iter)
+        self.visit_loop((node.target, *node.body), node.orelse, None if runs else node.iter)
+
+    visit_AsyncFor = visit_For
+
+    def visit_While(self, node):
+        self.visit(node.test)
+        runs = isinstance(node.test, ast.Constant) and node.test.value is True
+        self.visit_loop(node.body, node.orelse, None if runs else node.test)
+
+    def record_check(self, line, predicate):
+        guards = tuple(self.guards)
+        comprehension = all_comprehension(predicate)
+        if comprehension is not None and any(
+                may_skip_iteration(generator) or generator.ifs for generator in comprehension.generators):
+            guards += (comprehension,)
+        self.checks.append((line, predicate, guards))
+
     def visit_Assert(self, node):
-        self.checks.append((node.lineno, node.test, tuple(self.guards)))
+        self.record_check(node.lineno, node.test)
         self.visit(node.test)
 
     def visit_Raise(self, node):
@@ -155,13 +210,34 @@ class Inspect(ast.NodeVisitor):
         name = name_of(node.func)
         method = name.rsplit(".", 1)[-1]
         if helper(method) or name in self.checking_helpers:
-            self.checks.append((node.lineno, predicate(node, method), tuple(self.guards)))
+            self.record_check(node.lineno, predicate(node, method))
         if method in {"assume", "filter"}:
             self.constraints.add(method)
         if method in {"event", "target"}:
             self.measured = True
         self.calls.append(node)
-        self.generic_visit(node)
+        comprehension = all_comprehension(node)
+        if comprehension is None:
+            self.generic_visit(node)
+        else:
+            self.visit_all_comprehension(comprehension)
+
+    def visit_all_comprehension(self, comprehension):
+        depth = len(self.guards)
+        for generator in comprehension.generators:
+            self.visit(generator.iter)
+            if may_skip_iteration(generator):
+                self.guards.append(generator.iter)
+            self.visit(generator.target)
+            for condition in generator.ifs:
+                self.visit(condition)
+                self.guards.append(condition)
+        if isinstance(comprehension, ast.DictComp):
+            self.visit(comprehension.key)
+            self.visit(comprehension.value)
+        else:
+            self.visit(comprehension.elt)
+        del self.guards[depth:]
 
     def resolve(self, node, line):
         while isinstance(node, ast.Name):

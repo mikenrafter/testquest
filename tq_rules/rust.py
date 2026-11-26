@@ -239,10 +239,86 @@ def directly_checks(tokens):
     return any(macro_at(tokens, index, ASSERTIONS | FAILURES) for index in range(len(tokens)))
 
 
+def integer_literal(tokens):
+    negative = len(tokens) == 2 and tokens[0].text == "-"
+    digits = tokens[1:] if negative else tokens
+    if len(digits) != 1 or digits[0].kind != "number":
+        return None
+    value = literal(digits)
+    return -value if negative else value
+
+
+def nonempty_iterable(tokens):
+    if len(tokens) == 1 and tokens[0].text == "(":
+        return nonempty_iterable(tokens[0].children)
+    if tokens and tokens[0].text == "&":
+        start = 2 if len(tokens) > 1 and tokens[1].text == "mut" else 1
+        tokens = tokens[start:]
+
+    if len(tokens) == 1 and tokens[0].text == "[":
+        elements = tokens[0].children
+    elif len(tokens) == 3 and macro_at(tokens, 0, {"vec"}):
+        elements = tokens[2].children
+    else:
+        bounds = list(split(tokens, "."))
+        if len(bounds) != 3 or bounds[1]:
+            return False
+        lower, _, upper = bounds
+        inclusive = bool(upper) and upper[0].text == "="
+        start = integer_literal(lower)
+        end = integer_literal(upper[1:] if inclusive else upper)
+        return start is not None and end is not None and (start < end or (inclusive and start == end))
+
+    parts = list(split(elements, ";"))
+    if len(parts) == 2:
+        count = integer_literal(parts[1])
+        return count is not None and count > 0
+    return bool(elements)
+
+
+def guarded_loop_block(tokens, index):
+    """Return the body index of a loop that can execute zero times, if present."""
+    kind = tokens[index].text
+    start = index + 1
+    if kind == "for":
+        for separator in range(start, len(tokens)):
+            text = tokens[separator].text
+            if text == "in":
+                start = separator + 1
+                break
+            if text in {";", "<"} or (text == "{" and (
+                    separator + 1 == len(tokens) or tokens[separator + 1].text != "in")):
+                return None
+        else:
+            return None
+    pending_blocks = 0
+    for position in range(start, len(tokens)):
+        text = tokens[position].text
+        if text == ";":
+            break
+        if text in {"if", "match", "loop", "async", "unsafe", "const", "try"}:
+            pending_blocks += 1
+        elif text == "else" and position + 1 < len(tokens) and tokens[position + 1].text != "if":
+            pending_blocks += 1
+        elif text == "{" and position > start and tokens[position - 1].text not in {"!", "="}:
+            if pending_blocks:
+                pending_blocks -= 1
+                continue
+            header = tokens[start:position]
+            runs = nonempty_iterable(header) if kind == "for" else shape(header) == ("true",)
+            return None if runs else position
+    return None
+
+
 def conditional_blocks(tokens):
     """Return the blocks whose direct checks can all be skipped."""
     guarded = set()
     for index, token in enumerate(tokens):
+        if token.text in {"for", "while"}:
+            position = guarded_loop_block(tokens, index)
+            if position is not None:
+                guarded.add(position)
+            continue
         if token.text not in {"if", "else", "match"}:
             continue
         position = next((i for i in range(index + 1, len(tokens)) if tokens[i].text in {"{", ";"}), None)
