@@ -166,27 +166,28 @@ def always_true(tokens):
     return literal(tokens) is True
 
 
-def use_paths(tokens, prefix=()):
+def use_paths(tokens, prefix=(), *, keep_self=False):
     path = prefix
     for index, token in enumerate(tokens):
         if token.text == "{":
             for alternative in split(token.children):
-                yield from use_paths(alternative, path)
+                yield from use_paths(alternative, path, keep_self=keep_self)
             return
         if token.text == "as" and index + 1 < len(tokens):
             yield path, tokens[index + 1].text
             return
-        if token.kind == "word" and token.text != "self":
+        if token.kind == "word" and (token.text != "self" or
+                                     keep_self and not path and index + 1 < len(tokens)):
             path = (*path, token.text)
     if path:
         yield path, path[-1]
 
 
-def imports_in(tokens):
+def imports_in(tokens, *, keep_self=False):
     for index, token in enumerate(tokens):
         if token.text == "use":
             clause = next(iter(split(tokens[index + 1:], ";")), ())
-            yield from use_paths(clause)
+            yield from use_paths(clause, keep_self=keep_self)
 
 
 def test_attribute(name):
@@ -259,36 +260,77 @@ def integer_literal(tokens):
     return -value if negative else value
 
 
-def nonempty_iterable(tokens):
-    if len(tokens) == 1 and tokens[0].text == "(":
-        return nonempty_iterable(tokens[0].children)
+def unborrow(tokens):
     if tokens and tokens[0].text == "&":
         start = 2 if len(tokens) > 1 and tokens[1].text == "mut" else 1
-        tokens = tokens[start:]
+        return tokens[start:]
+    return tokens
 
+
+def literal_size(tokens, bound=integer_literal):
+    tokens = unborrow(tokens)
+    if len(tokens) == 1 and tokens[0].text == "(":
+        return literal_size(tokens[0].children, bound)
     if len(tokens) == 1 and tokens[0].text == "[":
         elements = tokens[0].children
     elif len(tokens) == 3 and macro_at(tokens, 0, {"vec"}):
         elements = tokens[2].children
     else:
-        bounds = list(split(tokens, "."))
-        if len(bounds) != 3 or bounds[1]:
-            return False
-        lower, _, upper = bounds
-        inclusive = bool(upper) and upper[0].text == "="
-        start = integer_literal(lower)
-        end = integer_literal(upper[1:] if inclusive else upper)
-        return start is not None and end is not None and (start < end or (inclusive and start == end))
-
+        return None
     parts = list(split(elements, ";"))
     if len(parts) == 2:
-        count = integer_literal(parts[1])
-        return count is not None and count > 0
-    return bool(elements)
+        return bound(parts[1])
+    return len(list(split(elements)))
 
 
-def guarded_loop_block(tokens, index):
-    """Return the body index of a loop that can execute zero times, if present."""
+def method_call(tokens):
+    if (len(tokens) >= 4 and tokens[-3].text == "." and tokens[-2].kind == "word"
+            and tokens[-1].text == "("):
+        return tokens[:-3], tokens[-2].text, tokens[-1].children
+    return (), "", ()
+
+
+def iterable_size(tokens, lookup):
+    size = literal_size(tokens, lambda count: known_integer(count, lookup))
+    if size is not None:
+        return size
+    tokens = unborrow(tokens)
+    if len(tokens) == 1 and tokens[0].text == "(":
+        return iterable_size(tokens[0].children, lookup)
+    receiver, method, args = method_call(tokens)
+    if method in {"iter", "iter_mut", "into_iter", "enumerate", "copied", "cloned", "rev"} and not args:
+        return iterable_size(receiver, lookup)
+    if method == "zip":
+        arguments = list(split(args))
+        if len(arguments) == 1:
+            sizes = iterable_size(receiver, lookup), iterable_size(arguments[0], lookup)
+            return min(sizes) if None not in sizes else None
+    for index in range(len(tokens) - 1):
+        if shape(tokens[index:index + 2]) == (".", "."):
+            upper = tokens[index + 2:]
+            inclusive = bool(upper) and upper[0].text == "="
+            start = known_integer(tokens[:index], lookup)
+            end = integer_bound(upper[1:] if inclusive else upper, lookup)
+            return max(0, end - start + inclusive) if None not in (start, end) else None
+    if tokens and tokens[-1].text == "(":
+        return lookup(tokens[:-1], "helper")
+    return lookup(tokens, "size")
+
+
+def known_integer(tokens, lookup):
+    number = integer_literal(tokens)
+    return number if number is not None else lookup(tokens, "number")
+
+
+def integer_bound(tokens, lookup):
+    receiver, method, args = method_call(tokens)
+    if method == "len" and not args:
+        return iterable_size(receiver, lookup)
+    return known_integer(tokens, lookup)
+
+
+def loop_block(tokens, index):
+    """Return the loop body index, pattern, and iterable or condition."""
     kind = tokens[index].text
     start = index + 1
     if kind == "for":
@@ -315,9 +357,7 @@ def guarded_loop_block(tokens, index):
             if pending_blocks:
                 pending_blocks -= 1
                 continue
-            header = tokens[start:position]
-            runs = nonempty_iterable(header) if kind == "for" else shape(header) == ("true",)
-            return None if runs else position
+            return position, tokens[index + 1:start - 1], tokens[start:position]
     return None
 
 
@@ -325,11 +365,6 @@ def conditional_blocks(tokens):
     """Return the blocks whose direct checks can all be skipped."""
     guarded = set()
     for index, token in enumerate(tokens):
-        if token.text in {"for", "while"}:
-            position = guarded_loop_block(tokens, index)
-            if position is not None:
-                guarded.add(position)
-            continue
         if token.text not in {"if", "else", "match"}:
             continue
         position = next((i for i in range(index + 1, len(tokens)) if tokens[i].text in {"{", ";"}), None)
@@ -431,10 +466,131 @@ def checking_helpers(scope, test_bodies):
         known |= found
 
 
+def qualified_name(tokens):
+    if (tokens and len(tokens) % 2
+            and all(token.kind == "word" for token in tokens[::2])
+            and all(token.text == "::" for token in tokens[1::2])):
+        return tuple(token.text for token in tokens[::2])
+    return ()
+
+
+def item_value(tokens, index):
+    declaration = next(iter(split(tokens[index:], ";")), ())
+    parts = list(split(declaration, "="))
+    return parts[1] if len(parts) == 2 else ()
+
+
+def absolute_path(scope, name):
+    if name[:1] == ("crate",):
+        return name[1:]
+    while name[:1] == ("super",):
+        scope, name = scope[:-1], name[1:]
+    return (*scope, *(name[1:] if name[:1] == ("self",) else name))
+
+
+class FileIterables:
+    def __init__(self, tokens):
+        self.definitions = {}
+        self.aliases = {}
+        self.globs = defaultdict(list)
+        self.index(tokens, ())
+
+    def add(self, name, kind, value):
+        self.definitions[name] = ("", ()) if name in self.definitions else (kind, value)
+
+    def index(self, tokens, scope):
+        self.aliases[scope] = {alias: path for path, alias in imports_in(tokens, keep_self=True)}
+        for index, token in enumerate(tokens):
+            if token.text in {"const", "static"}:
+                start = index + 1
+                if start < len(tokens) and tokens[start].text == "mut":
+                    continue
+                head = tokens[start:start + 2]
+                if len(head) == 2 and head[0].kind == "word" and head[1].text == ":":
+                    self.add((*scope, head[0].text), "constant", item_value(tokens, start))
+            elif token.text == "use":
+                path = next(iter(split(tokens[index + 1:], ";")), ())
+                if shape(path[-2:]) == ("::", "*"):
+                    name = qualified_name(path[:-2])
+                    if name:
+                        self.globs[scope].append(absolute_path(scope, name))
+            elif token.text in {"mod", "impl"}:
+                head = tokens[index + 1:index + 3]
+                if len(head) == 2 and head[0].kind == "word" and head[1].text == "{":
+                    self.index(head[1].children, (*scope, head[0].text))
+        for name, body in function_bodies(tokens):
+            self.add((*scope, name), "helper", return_expression(body))
+
+    def resolve(self, scope, name):
+        direct = absolute_path(scope, name)
+        if direct in self.definitions or name[0] in {"super", "self", "crate"}:
+            return direct
+        aliases = self.aliases.get(scope, {})
+        if name[0] in aliases:
+            imported = (*aliases[name[0]], *name[1:])
+            if imported[0] in {"super", "self", "crate"}:
+                return absolute_path(scope, imported)
+            return imported
+        matches = [(*path, *name) for path in self.globs.get(scope, ())
+                   if (*path, *name) in self.definitions]
+        return matches[0] if len(matches) == 1 else ()
+
+    def lookup(self, scope, name, kind):
+        if not name:
+            return None
+        path = self.resolve(scope, name)
+        source, expression = self.definitions.get(path, ("", ()))
+        if source == "constant" and kind == "number":
+            return integer_literal(expression)
+        if (source, kind) in {("constant", "size"), ("helper", "helper")}:
+            return literal_size(expression, lambda count: known_integer(
+                count, lambda tokens, kind: self.lookup(path[:-1], qualified_name(tokens), kind)))
+        return None
+
+
+def return_expression(body):
+    value = body.children
+    if shape(value[:1]) == ("return",) and shape(value[-1:]) == (";",):
+        return value[1:-1]
+    return value
+
+
+SHRINKING_METHODS = {"clear", "dedup_by", "drain", "extract_if", "pop", "pop_back",
+                     "pop_front", "remove", "retain", "retain_mut", "split_off", "swap_remove",
+                     "truncate"}
+
+
+def mutated_names(tokens):
+    for index, token in enumerate(tokens):
+        if token.kind == "group":
+            yield from mutated_names(token.children)
+        elif token.kind == "word":
+            following = tuple(part.text for part in tokens[index + 1:index + 3])
+            previous = tuple(part.text for part in tokens[max(0, index - 3):index])
+            declaration = previous[-1:] in {("let",), ("const",)} or previous[-2:] == ("let", "mut")
+            assignment = (following[:1] in {("=",), ("+=",)}
+                          or len(following) == 2 and following[0] in "-*/%&|^" and following[1] == "=")
+            shrinks = len(following) == 2 and following[0] == "." and following[1] in SHRINKING_METHODS
+            mutably_borrowed = previous[-2:] == ("&", "mut") and previous != ("in", "&", "mut")
+            if (assignment and not declaration) or shrinks or mutably_borrowed:
+                yield token.text
+
+
+def pattern_names(tokens):
+    for token in tokens:
+        if token.kind == "group":
+            yield from pattern_names(token.children)
+        elif token.kind == "word" and token.text not in {"mut", "ref", "_"}:
+            yield token.text
+
+
 class Inspect:
-    def __init__(self, aliases, helpers=frozenset()):
+    def __init__(self, aliases, helpers, file_iterables, scope, mutated):
         self.aliases = aliases
         self.helpers = helpers
+        self.file_iterables = file_iterables
+        self.scope = scope
+        self.mutated = mutated
         self.checks = []
         self.bindings = {}
         self.writes = {}
@@ -445,14 +601,56 @@ class Inspect:
         self.calls = defaultdict(list)
         self.check_arguments = []
 
-    def visit(self, tokens, guarded=False):
+    def visit(self, tokens, guarded=False, inherited=None):
+        locals_here = dict(inherited or ())
         guarded_blocks = conditional_blocks(tokens)
+        block_locals = {}
+
+        def lookup(expression, kind):
+            name = qualified_name(expression)
+            if name and name[0] in locals_here:
+                return locals_here[name[0]].get(kind) if len(name) == 1 else None
+            return self.file_iterables.lookup(self.scope, name, kind)
+
         declaration_names = set()
         for index, token in enumerate(tokens):
             text = token.text
-            if text == "let":
+            if text in {"for", "while"}:
+                loop = loop_block(tokens, index)
+                if loop is not None:
+                    position, pattern, header = loop
+                    block_locals[position] = tuple(pattern_names(pattern))
+                    if text == "for":
+                        runs = (iterable_size(header, lookup) or 0) > 0
+                    else:
+                        runs = shape(header) == ("true",)
+                    if not runs:
+                        guarded_blocks.add(position)
+            if text in {"let", "const"}:
                 declaration = next(iter(split(tokens[index + 1:], ";")), ())
                 parts = list(split(declaration, "="))
+                pattern = next(iter(split(parts[0], ":")), ()) if parts else ()
+                names = tuple(pattern_names(pattern))
+                if text == "const" and (not pattern or pattern[0].text == "fn"):
+                    names = ()
+                previous = tokens[index - 1].text if index else ""
+                if previous in {"if", "while"}:
+                    position = next((i for i in range(index + 1, len(tokens))
+                                     if tokens[i].text == "{"), None)
+                    if position is not None:
+                        block_locals[position] = names
+                else:
+                    locals_here.update((name, {}) for name in names)
+                    bare = pattern[1:] if shape(pattern[:1]) == ("mut",) else pattern
+                    if len(parts) == 2 and len(bare) == 1 and names:
+                        name = names[0]
+                        if name not in self.mutated:
+                            value = parts[1]
+                            locals_here[name] = {
+                                "size": literal_size(value, lambda count: known_integer(count, lookup)),
+                                "number": integer_literal(value),
+                            }
+            if text == "let":
                 if len(parts) == 2:
                     lhs, rhs = parts
                     target = next((item for item in lhs if item.kind == "word" and item.text != "mut"), None)
@@ -492,7 +690,10 @@ class Inspect:
                       and symmetric_input(text, map(literal, args))):
                     self.literal_issues.append((token.line, "nondistinguishing-literal"))
             if token.kind == "group":
-                self.visit(token.children, guarded or index in guarded_blocks)
+                in_block = locals_here
+                if index in block_locals:
+                    in_block = {**locals_here, **dict.fromkeys(block_locals[index], {})}
+                self.visit(token.children, guarded or index in guarded_blocks, in_block)
 
     def resolve(self, tokens, line):
         while len(tokens) == 1 and tokens[0].kind == "word":
@@ -614,8 +815,11 @@ def parse(source, path):
     tests = []
     grouped = group(tokens)
     found = list(test_functions(grouped))
+    if not found:
+        return tests, comments
     test_bodies = {id(body) for _, _, _, _, body, _, _, _ in found}
     helpers = {}
+    file_iterables = FileIterables(grouped)
     for token, name, identifier, start, body, panic, aliases, scope in found:
         if scope is not None and id(scope) not in helpers:
             helpers[id(scope)] = checking_helpers(scope, test_bodies)
@@ -623,7 +827,9 @@ def parse(source, path):
         while start - 1 in previous:
             start -= 1
         test = Test(name, identifier, token.line, start, body.end, token.column)
-        inspector = Inspect(aliases, helpers.get(id(scope), frozenset()))
+        namespace = tuple(identifier.split("::")[:-1])
+        inspector = Inspect(aliases, helpers.get(id(scope), frozenset()), file_iterables,
+                            namespace, set(mutated_names(body.children)))
         inspector.visit(body.children)
         test.issues, test.measured = inspector.issues()
         if not inspector.checks and not panic:

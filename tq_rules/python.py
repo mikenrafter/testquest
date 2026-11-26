@@ -1,6 +1,6 @@
 import ast
 import builtins
-from collections import defaultdict
+from collections import Counter, defaultdict
 import io
 import sys
 import tokenize
@@ -31,16 +31,11 @@ def literal(node):
     return UNKNOWN
 
 
-def nonempty_iterable(node):
+def nonempty_literal(node):
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         return any(not isinstance(item, ast.Starred) for item in node.elts)
     if isinstance(node, ast.Dict):
         return any(key is not None for key in node.keys)
-    if (isinstance(node, ast.Call) and name_of(node.func) == "range"
-            and 1 <= len(node.args) <= 3 and not node.keywords):
-        bounds = [literal(arg) for arg in node.args]
-        if all(type(bound) is int for bound in bounds):
-            return (len(bounds) < 3 or bounds[2] != 0) and bool(range(*bounds))
     return False
 
 
@@ -50,10 +45,6 @@ def all_comprehension(node):
             and isinstance(node.args[0], (ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp))):
         return node.args[0]
     return None
-
-
-def may_skip_iteration(generator):
-    return generator.is_async or not nonempty_iterable(generator.iter)
 
 
 def same(left, right):
@@ -101,10 +92,11 @@ OBSERVERS = {"len", "set", "list", "sorted", "tuple", "str", "bool", "int", "byt
 
 
 class Inspect(ast.NodeVisitor):
-    def __init__(self, imports, checking_helpers, local_helpers):
+    def __init__(self, imports, checking_helpers, local_helpers, iterables):
         self.imports = imports
         self.checking_helpers = checking_helpers
         self.local_helpers = local_helpers
+        self.iterables = iterables
         self.checks = []
         self.calls = []
         self.check_arguments = []
@@ -179,7 +171,7 @@ class Inspect(ast.NodeVisitor):
 
     def visit_For(self, node):
         self.visit(node.iter)
-        runs = isinstance(node, ast.For) and nonempty_iterable(node.iter)
+        runs = isinstance(node, ast.For) and self.iterables.nonempty(node.iter)
         self.visit_loop((node.target, *node.body), node.orelse, None if runs else node.iter)
 
     visit_AsyncFor = visit_For
@@ -193,7 +185,8 @@ class Inspect(ast.NodeVisitor):
         guards = tuple(self.guards)
         comprehension = all_comprehension(predicate)
         if comprehension is not None and any(
-                may_skip_iteration(generator) or generator.ifs for generator in comprehension.generators):
+                generator.is_async or generator.ifs or not self.iterables.nonempty(generator.iter)
+                for generator in comprehension.generators):
             guards += (comprehension,)
         self.checks.append((line, predicate, guards))
 
@@ -231,7 +224,7 @@ class Inspect(ast.NodeVisitor):
         depth = len(self.guards)
         for generator in comprehension.generators:
             self.visit(generator.iter)
-            if may_skip_iteration(generator):
+            if generator.is_async or not self.iterables.nonempty(generator.iter):
                 self.guards.append(generator.iter)
             self.visit(generator.target)
             for condition in generator.ifs:
@@ -393,6 +386,152 @@ def body_nodes(statements):
         yield from body_nodes(ast.iter_child_nodes(node))
 
 
+SHRINKING_METHODS = {"clear", "discard", "difference_update", "intersection_update",
+                     "pop", "popitem", "remove", "symmetric_difference_update", "__delitem__"}
+
+
+def assignments(statements):
+    for node in statements:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            yield node, node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            yield node, node.target, node.value
+
+
+def changed_names(statements):
+    for node in body_nodes(statements):
+        if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            yield name_of(node)
+        elif (isinstance(node, ast.Subscript)
+              and (isinstance(node.ctx, ast.Del)
+                   or isinstance(node.ctx, ast.Store) and isinstance(node.slice, ast.Slice))):
+            yield name_of(node.value)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield from (alias.asname or alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            yield node.name
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            yield node.rest
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr in SHRINKING_METHODS):
+            yield name_of(node.func.value)
+
+
+def literal_return(node):
+    body = node.body
+    if node.decorator_list:
+        return False
+    if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    return len(body) == 1 and isinstance(body[0], ast.Return) and nonempty_literal(body[0].value)
+
+
+def scope_changes(statements):
+    changed = Counter(changed_names(statements))
+    changed.update(node.name for node in statements
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+    return changed
+
+
+def file_iterables(statements, changed, scope=()):
+    for _, target, value in assignments(statements):
+        if (isinstance(target, ast.Name) and target.id.isupper()
+                and changed[target.id] == 1 and nonempty_literal(value)):
+            yield (*scope, target.id), value
+    for node in statements:
+        if isinstance(node, ast.FunctionDef) and changed[node.name] == 1 and literal_return(node):
+            yield (*scope, node.name), node
+        elif isinstance(node, ast.ClassDef) and changed[node.name] == 1:
+            yield from file_iterables(node.body, scope_changes(node.body), (*scope, node.name))
+
+
+class Iterables:
+    def __init__(self, test, scope, tables, module_names):
+        self.scope = scope
+        self.tables = tables
+        self.module_names = module_names
+        positional = test.args.posonlyargs + test.args.args
+        self.receiver = positional[0].arg if scope and positional else None
+        self.parents = {
+            child: (node, field)
+            for node in body_nodes(test.body)
+            for field, value in ast.iter_fields(node)
+            for child in (value if isinstance(value, list) else (value,))
+            if isinstance(child, ast.AST)
+        }
+        self.parents.update((node, (test, "body")) for node in test.body)
+        self.changed = Counter(changed_names(test.body))
+        self.changed.update(node.arg for node in ast.walk(test.args) if isinstance(node, ast.arg))
+        self.changed.update(node.name for node in self.parents
+                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+        self.locals = {
+            target.id: node for node, target, value in assignments(self.parents)
+            if (isinstance(target, ast.Name) and self.changed[target.id] == 1
+                and nonempty_literal(value))
+        }
+        self.locals.update(
+            (node.name, node) for node in self.parents
+            if isinstance(node, ast.FunctionDef) and self.changed[node.name] == 1 and literal_return(node)
+        )
+
+    def definition(self, node):
+        root = node
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if not isinstance(root, ast.Name):
+            return None
+        name = name_of(node)
+        if name in self.changed:
+            binding = self.locals.get(name)
+            if binding is not None:
+                block = self.parents[binding]
+                while node in self.parents:
+                    if self.parents[node] == block:
+                        if (binding.lineno, binding.col_offset) < (node.lineno, node.col_offset):
+                            return binding if isinstance(binding, ast.FunctionDef) else binding.value
+                        break
+                    node = self.parents[node][0]
+            return None
+
+        path = tuple(name.split("."))
+        if root.id == self.receiver and self.changed[root.id] == 1:
+            return self.tables.get((*self.scope, *path[1:]))
+        if root.id in self.changed:
+            return None
+        return self.tables.get(path)
+
+    def nonempty(self, node):
+        if nonempty_literal(node):
+            return True
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            return nonempty_literal(self.definition(node))
+        if not isinstance(node, ast.Call):
+            return False
+        if isinstance(self.definition(node.func), ast.FunctionDef):
+            return True
+        name = name_of(node.func)
+        if (isinstance(node.func, ast.Attribute) and node.func.attr in {"items", "keys", "values"}
+                and not node.args and not node.keywords):
+            receiver = node.func.value
+            table = receiver if isinstance(receiver, ast.Dict) else self.definition(receiver)
+            return isinstance(table, ast.Dict) and nonempty_literal(table)
+        if (not isinstance(node.func, ast.Name) or name in self.changed
+                or name in self.module_names):
+            return False
+        if name == "range" and 1 <= len(node.args) <= 3 and not node.keywords:
+            bounds = [literal(arg) for arg in node.args]
+            return (all(type(bound) is int for bound in bounds)
+                    and (len(bounds) < 3 or bounds[2] != 0) and bool(range(*bounds)))
+        keywords = {keyword.arg for keyword in node.keywords}
+        if name == "zip" and keywords <= {"strict"}:
+            return bool(node.args) and all(self.nonempty(arg) for arg in node.args)
+        if name == "enumerate" and 1 <= len(node.args) <= 2 and keywords <= {"start"}:
+            return self.nonempty(node.args[0])
+        return (name == "sorted" and len(node.args) == 1 and keywords <= {"key", "reverse"}
+                and self.nonempty(node.args[0]))
+
+
 def checking_helpers(tree):
     definitions = {}
     parents = {}
@@ -461,9 +600,12 @@ def parse(source, path):
     local_helpers = {node.name for node in tree.body
                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                      and not node.name.startswith("test")}
+    module_names = scope_changes(tree.body)
+    tables = dict(file_iterables(tree.body, module_names))
     tests = []
     for node, parents in test_functions(tree.body):
-        inspector = Inspect(imports, checks_in(parents), local_helpers)
+        iterables = Iterables(node, parents, tables, module_names)
+        inspector = Inspect(imports, checks_in(parents), local_helpers, iterables)
         for statement in node.body:
             inspector.record_uses(statement)
             inspector.visit(statement)
