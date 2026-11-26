@@ -769,6 +769,7 @@ class FileIterables:
         self.path = path
         self.aliases = {}
         self.globs = defaultdict(list)
+        self.relative_globs = defaultdict(list)
         self.test_items = set()
         self.test_file = test_module(path.stem) or any(map(test_module, path.parent.parts))
         self.parameters = parameters
@@ -793,6 +794,8 @@ class FileIterables:
                     name = qualified_name(path[:-2])
                     if name:
                         self.globs[scope].append(absolute_path(scope, name))
+                        if name[0] in {"crate", "self", "super"}:
+                            self.relative_globs[scope].append(name)
             elif token.text in {"mod", "impl"}:
                 head = tokens[index + 1:index + 3]
                 if len(head) == 2 and head[0].kind == "word":
@@ -1120,10 +1123,21 @@ class Inspect:
         self.check_arguments = []
         self.strategies = {}
         self.paired_bindings = {}
+        self.guard_iterables = None
 
     def visit(self, tokens, guarded=False, inherited=None, *, closure=False,
-              collector_path=(), collector_comparison=False):
+              collector_path=(), collector_comparison=False, counters=None, guard_imports=None):
+        if self.guard_iterables:
+            from . import rust_guard
+
         locals_here = dict(inherited or ())
+        counter_blocks = {}
+        if self.guard_iterables:
+            counters = dict(counters or ())
+            guard_imports = dict(guard_imports or ())
+            guard_imports.update((alias, path) for path, alias in imports_in(tokens, keep_self=True))
+        check_prefix = True
+        loop_growth = {}
         guarded_blocks = conditional_blocks(tokens)
         block_locals = {}
         collector_blocks = {}
@@ -1134,10 +1148,25 @@ class Inspect:
                 return locals_here[name[0]].get(kind) if len(name) == 1 else None
             return self.file_iterables.lookup(self.scope, name, kind)
 
+        def guard_lookup(expression, kind):
+            name = qualified_name(expression)
+            if name and name[0] in locals_here:
+                return locals_here[name[0]].get(kind) if len(name) == 1 else None
+            value = self.file_iterables.lookup(self.scope, name, kind)
+            return value if value is not None else self.guard_iterables.lookup(
+                self.scope, expression, kind, guard_imports)
+
+        def first_iteration_lookup(expression, kind):
+            if kind == "number" and (counter := counters.get(qualified_name(expression))):
+                return counter.start
+            return guard_lookup(expression, kind)
+
         declaration_names = set()
         in_closure = closure
         for index, token in enumerate(tokens):
             text = token.text
+            if self.guard_iterables and text in rust_guard.EXITS:
+                check_prefix = False
             if text == "||" and (not index or tokens[index - 1].text in {",", "=", "move", "return"}):
                 in_closure = True
             elif text in {",", ";"}:
@@ -1146,20 +1175,65 @@ class Inspect:
                 loop = loop_block(tokens, index)
                 if loop is not None:
                     position, pattern, header = loop
-                    block_locals[position] = tuple(pattern_names(pattern))
+                    block_locals[position] = dict.fromkeys(pattern_names(pattern), {})
                     if text == "for":
                         runs = (iterable_size(header, lookup) or 0) > 0
+                        if self.guard_iterables:
+                            loop_lookup = guard_lookup
+                            facts = rust_guard.iterable(header, loop_lookup)
+                            if counters and (not facts or facts.minimum == 0):
+                                probe = rust_guard.iterable(header, first_iteration_lookup)
+                                if probe and probe.minimum:
+                                    facts, loop_lookup = probe, first_iteration_lookup
+                                    counter_blocks[position] = {
+                                        name: range(reach.start, reach.start + 1)
+                                        for name, reach in counters.items()
+                                    }
+                            if check_prefix and facts and facts.minimum > 0:
+                                runs = True
+                                block_locals[position].update(
+                                    {name: evidence for name, evidence in rust_guard.pattern_facts(
+                                        pattern, facts.rows, guard_lookup).items()
+                                     if name not in self.mutated})
+                            name = qualified_name(pattern)
+                            loop_tokens = tokens[position].children
+                            if runs and check_prefix and not any(
+                                    part.text in rust_guard.EXITS for part in walk_tokens(loop_tokens)):
+                                if (len(name) == 1 and name[0] not in self.mutated
+                                        and (bounds := rust_guard.range_bounds(header, loop_lookup))
+                                        and bounds[0] < bounds[1]):
+                                    counter_blocks.setdefault(position, {})[name] = range(*bounds)
+                                if facts and facts.minimum and loop_lookup is guard_lookup:
+                                    shadowed = {part.text for part in declared_bindings(loop_tokens)}
+                                    shadowed.update(block_locals[position])
+                                    loop_growth[position] = (facts, [
+                                        (name, kind) for name, kind in rust_guard.direct_insertions(loop_tokens)
+                                        if name not in shadowed and name not in self.mutated
+                                    ])
                     else:
                         runs = shape(header) == ("true",)
+                        if self.guard_iterables and check_prefix:
+                            receiver = rust_guard.join_set_receiver(header)
+                            join_set = locals_here.get(receiver, {}).get("join_set")
+                            runs = runs or bool(join_set and join_set.minimum)
                     if not runs:
                         guarded_blocks.add(position)
                         source = binding_path(unborrow(header))
                         collector_blocks[position] = (source[0] if len(source) == 1 else "", False)
-            if text == "if":
+            if text in {"if", "match"}:
                 position = next((i for i in range(index + 1, len(tokens))
                                  if tokens[i].text in {"{", ";"}), len(tokens))
-                if position in guarded_blocks and comparison(tokens[index + 1:position])[0]:
+                condition = tokens[index + 1:position]
+                if text == "if" and position in guarded_blocks and comparison(condition)[0]:
                     collector_blocks[position] = (None, True)
+                if self.guard_iterables and check_prefix and position in guarded_blocks and counters:
+                    if text == "if" and (witness := rust_guard.branch_witness(condition, counters, guard_lookup)):
+                        guarded_blocks.discard(position)
+                        name, reach = witness
+                        counter_blocks[position] = {name: reach}
+                    elif text == "match" and (reach := counters.get(qualified_name(condition))):
+                        if rust_guard.arm_checks(tokens[position].children, reach):
+                            guarded_blocks.discard(position)
             if text in {"let", "const"}:
                 declaration = next(iter(split(tokens[index + 1:], ";")), ())
                 parts = list(split(declaration, "="))
@@ -1173,9 +1247,12 @@ class Inspect:
                     position = next((i for i in range(index + 1, len(tokens))
                                      if tokens[i].text == "{"), None)
                     if position is not None:
-                        block_locals[position] = names
+                        block_locals[position] = dict.fromkeys(names, {})
                 else:
                     locals_here.update((name, {}) for name in names)
+                    if counters:
+                        for name in names:
+                            counters.pop((name,), None)
                     if len(parts) == 2 and len(bare) == 1 and names:
                         name = names[0]
                         if name not in self.mutated:
@@ -1184,6 +1261,14 @@ class Inspect:
                                 "size": literal_size(value, lambda count: known_integer(count, lookup)),
                                 "number": integer_literal(value),
                             }
+                            if self.guard_iterables:
+                                annotation = parts[0][len(pattern):]
+                                locals_here[name].update(
+                                    iterable=rust_guard.iterable(value, guard_lookup,
+                                                                vector=shape(annotation[:3]) == (":", "Vec", "<")),
+                                    number=rust_guard.integer(value, guard_lookup))
+                                if shape(value) == ("tokio", "::", "task", "::", "JoinSet", "::", "new", "("):
+                                    locals_here[name]["join_set"] = rust_guard.Iterable(0, 0)
             if text == "let":
                 if len(parts) == 2:
                     lhs, rhs = parts
@@ -1244,6 +1329,14 @@ class Inspect:
             if invocation:
                 arguments, macro = invocation
                 args = list(split(arguments.children))
+                if (self.guard_iterables and check_prefix and not in_closure
+                        and text in {"push", "extend"} and len(args) == 1 and index >= 2
+                        and tokens[index - 1].text == "."
+                        and (index == 2 or tokens[index - 3].text in {";", "{"})):
+                    name = tokens[index - 2].text
+                    added = (rust_guard.Iterable(1, 1) if text == "push"
+                             else rust_guard.iterable(args[0], guard_lookup))
+                    rust_guard.extend_local(locals_here, name, added)
                 if assertion(text):
                     self.check_arguments.append(arguments)
                     if text in ASSERTIONS and text.endswith("_eq") and len(args) >= 2:
@@ -1252,7 +1345,7 @@ class Inspect:
                         self.expected.update(expected_constructors(args[0]))
                 checking = starts_check(tokens, index, macro, self.helpers)
                 if checking:
-                    self.checks.append((token.line, text, args, guarded))
+                    self.checks.append((token.line, text, args, guarded or not check_prefix))
 
                 start = callee_start(tokens, index)
                 callee = shape(tokens[start:index + 1]) if start is not None else None
@@ -1275,12 +1368,25 @@ class Inspect:
             if token.kind == "group":
                 in_block = locals_here
                 if index in block_locals:
-                    in_block = {**locals_here, **dict.fromkeys(block_locals[index], {})}
+                    in_block = {**locals_here, **block_locals[index]}
                 source, mismatch = collector_blocks.get(index, ("" if index in guarded_blocks else None, False))
                 path = (*collector_path, source) if source is not None else collector_path
-                self.visit(token.children, guarded or index in guarded_blocks, in_block,
+                block_counters = None
+                if self.guard_iterables:
+                    block_counters = {name: reach for name, reach in counters.items()
+                                      if name[0] not in block_locals.get(index, ())}
+                    block_counters.update(counter_blocks.get(index, ()))
+                self.visit(token.children, guarded or not check_prefix or index in guarded_blocks, in_block,
                            closure=in_closure or self.closure_block(tokens, index),
-                           collector_path=path, collector_comparison=collector_comparison or mismatch)
+                           collector_path=path, collector_comparison=collector_comparison or mismatch,
+                           counters=block_counters, guard_imports=guard_imports)
+                if index in loop_growth:
+                    growth, names = loop_growth[index]
+                    for name, kind in names:
+                        rust_guard.extend_local(locals_here, name, growth, kind)
+                if self.guard_iterables and token.text == "{" and any(
+                        part.text in rust_guard.EXITS for part in walk_tokens(token.children)):
+                    check_prefix = False
 
     @staticmethod
     def closure_block(tokens, index):
@@ -2008,7 +2114,7 @@ class Inspect:
         return findings, measured
 
 
-def parse(source, path):
+def parse(source, path, *, scan_root=None):
     tokens, comments = tokenize(source)
     line_comments = {comment.line: comment.text for comment in comments}
     tests = []
@@ -2046,8 +2152,23 @@ def parse(source, path):
         test.issues, test.measured = inspector.issues(test.name, pins, strings, line_comments)
         if not (panic or ignored or evidence.checks(body.children, tuple(test.identifier.split("::")))):
             test.issues.append((test.line, "no-assert"))
-        test.guarded = bool(inspector.checks) and not panic and all(
+        ignored_tool = (scan_root is not None and ignored
+                        and all(name == "expect" for _, name, _, _ in inspector.checks))
+        test.guarded = bool(inspector.checks) and not (panic or ignored_tool) and all(
             guarded for _, _, _, guarded in inspector.checks)
+        if test.guarded and scan_root is not None:
+            from . import rust_guard
+
+            mutated = inspector.mutated | set(rust_guard.possibly_drained(body.children))
+            guard_inspector = Inspect(inspector.aliases, inspector.helpers, file_iterables,
+                                      inspector.scope, mutated, parameters, inspector.local_parameters)
+            guard_inspector.strategies = inspector.strategies
+            guard_inspector.guard_iterables = rust_guard.GuardIterables(file_iterables, scan_root)
+            strategy_locals = {name: rust_guard.strategy_facts(strategy)
+                               for name, strategy in inspector.strategies.items()
+                               if name not in inspector.mutated}
+            guard_inspector.visit(body.children, inherited=strategy_locals or None)
+            test.guarded = all(guarded for _, _, _, guarded in guard_inspector.checks)
         test.conditional = inspector.assumes
         tests.append(test)
     return tests, comments

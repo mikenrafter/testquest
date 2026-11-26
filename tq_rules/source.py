@@ -32,31 +32,35 @@ class Test:
 IGNORED = {".git", "__pycache__", ".venv", "node_modules", "target"}
 
 
-def scan_paths(inputs, errors):
+def scan_paths(inputs, errors, *, refine_guards=False):
     """Yield parsed files; append a parse-error finding to `errors` for each unreadable one."""
     from . import python, rust
 
-    paths = set()
+    paths = {}
+    cwd = Path.cwd()
     for item in inputs:
         path = Path(item)
         if not path.exists():
             raise FileNotFoundError(path)
         if path.is_dir():
+            directory_root = path.resolve() if refine_guards else None
             for directory, children, files in os.walk(path):
                 children[:] = [child for child in children if child not in IGNORED]
-                paths.update(candidate for name in files if (candidate := Path(directory, name)).suffix in {".py", ".rs"}
-                             and not candidate.is_symlink())
+                for name in files:
+                    candidate = Path(directory, name)
+                    if candidate.suffix in {".py", ".rs"} and not candidate.is_symlink():
+                        paths[candidate] = directory_root
         elif path.suffix in {".py", ".rs"} and not path.is_symlink():
-            paths.add(path)
+            paths.setdefault(path, cwd if refine_guards else None)
     for path in sorted(paths, key=str):
         if not path.is_file():
             continue
         try:
             if path.suffix == ".py":
                 with tokenize.open(path) as stream:
-                    parsed = python.parse(stream.read(), path)
+                    parsed = python.parse(stream.read(), path, scan_root=paths[path])
             else:
-                parsed = rust.parse(path.read_text(encoding="utf-8"), path)
+                parsed = rust.parse(path.read_text(encoding="utf-8"), path, scan_root=paths[path])
         except (SyntaxError, ValueError, UnicodeDecodeError) as error:
             errors.append(finding(path, getattr(error, "lineno", None) or 1, "parse-error",
                                   f"Cannot parse: {error}"))
@@ -66,3 +70,14 @@ def scan_paths(inputs, errors):
 
 def finding(path, line, rule, message, level="error"):
     return dict(path=str(path), line=line, rule=rule, message=message, level=level)
+
+
+def project_root(path, scan_root, markers):
+    """Bound sibling resolution to a marked project or the scan directory."""
+    path = path.resolve()
+    for parent in path.parents:
+        if any((parent / marker).exists() for marker in markers):
+            return parent
+        if parent == scan_root:
+            return parent
+    return path.parent

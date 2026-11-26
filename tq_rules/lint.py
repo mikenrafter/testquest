@@ -238,7 +238,7 @@ def helper(name):
 
 def find(paths):
     rows = []
-    for path, tests, comments in scan_paths(paths, rows):
+    for path, tests, comments in scan_paths(paths, rows, refine_guards=True):
         allows = {}
         for comment in comments:
             match = re.fullmatch(r"tq:\s*allow\s+([\w-]+)(?:\s+(.*))?", comment.text)

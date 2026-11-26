@@ -9,7 +9,7 @@ import tokenize
 from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, argument_claims, helper, loose_bounds, named_arguments,
                    prefix_satisfies, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
                    path_directories, pins_path)
-from .source import Comment, Test
+from .source import Comment, Test, project_root
 
 
 def name_of(node):
@@ -253,7 +253,15 @@ class Inspect(ast.NodeVisitor):
         runs = isinstance(node, ast.For) and self.iterables.nonempty(node.iter)
         if not runs and isinstance(node.iter, ast.Attribute) and isinstance(node.target, ast.Name):
             self.output_loops[node.iter] = node.target.id
-        self.visit_loop((node.target, *node.body), node.orelse, None if runs else node.iter)
+        if isinstance(self.iterables, GuardIterables) and runs:
+            previous = self.iterables.loop_rows.copy()
+            self.iterables.enter_loop(node)
+            self.visit_loop((node.target, *node.body), (), None)
+            self.iterables.loop_rows = previous
+            for statement in node.orelse:
+                self.visit(statement)
+        else:
+            self.visit_loop((node.target, *node.body), node.orelse, None if runs else node.iter)
 
     visit_AsyncFor = visit_For
 
@@ -1304,7 +1312,217 @@ class ModuleConstants:
         return constant in self.modules[module].get(name, ())
 
 
-def parse(source, path):
+class GuardIterables(Iterables):
+    def __init__(self, test, scope, tables, module_names, tree, path, scan_root):
+        super().__init__(test, scope, tables, module_names)
+        self.root = project_root(path, scan_root, (".git", "pyproject.toml", "setup.py"))
+        self.path = path.resolve()
+        self.imports = imports_in(tree.body)
+        self.local_imports = {name: (binding, qualified)
+                              for binding in self.parents if isinstance(binding, (ast.Import, ast.ImportFrom))
+                              for name, qualified in imports_in((binding,)).items()
+                              if self.changed[name] == 1}
+        self.table_cache = {}
+        self.scripts = {}
+        self.module_calls = {name_of(node.value.func): node.value
+                             for node in tree.body if isinstance(node, ast.Expr)
+                             and isinstance(node.value, ast.Call)}
+        self.locals.update((target.id, node)
+                           for node, target, _ in assignments(self.parents)
+                           if isinstance(target, ast.Name) and self.changed[target.id] == 1)
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                changed = scope_changes(node.body)
+                for _, target, value in assignments(node.body):
+                    if isinstance(target, ast.Name) and changed[target.id] == 1:
+                        self.tables = {**self.tables, (node.name, target.id): value}
+        self.module_bindings = {target.id: value for _, target, value in assignments(tree.body)
+                                if isinstance(target, ast.Name) and module_names[target.id] == 1}
+        self.loop_rows = {}
+
+    def module_source(self, source, module):
+        relative = len(module) - len(module.lstrip("."))
+        parts = module.lstrip(".").split(".") if module.lstrip(".") else []
+        if relative:
+            if relative > len(source.parents):
+                return None
+            roots = (source.parents[relative - 1],)
+        else:
+            roots = (root for parent in source.parents if parent.is_relative_to(self.root)
+                     for root in (parent, parent / "src"))
+        for root in roots:
+            candidate = ModuleConstants.module_file(root, parts)
+            if candidate and candidate.resolve().is_relative_to(self.root):
+                return candidate.resolve()
+        return None
+
+    def imported_table(self, source, qualified):
+        module, dot, name = qualified.rpartition(".")
+        if not module.strip("."):
+            module += dot
+        if not dot or not name.isupper() or not (path := self.module_source(source, module)):
+            return None
+        return self.source_table(path, name)
+
+    def source_table(self, path, name):
+        key = path, name
+        if key in self.table_cache:
+            return self.table_cache[key]
+        self.table_cache[key] = None
+        try:
+            with tokenize.open(path) as stream:
+                tree = ast.parse(stream.read(), filename=str(path))
+        except (OSError, SyntaxError, UnicodeError, LookupError):
+            return None
+        changed = scope_changes(tree.body)
+        if changed[name] == 1:
+            values = dict(file_iterables(tree.body, changed))
+            value = values.get((name,))
+            if not nonempty_literal(value):
+                value = self.imported_table(path, imports_in(tree.body).get(name, ""))
+            self.table_cache[key] = value
+        return self.table_cache[key]
+
+    def script(self, alias):
+        if alias in self.scripts:
+            return self.scripts[alias]
+
+        def arguments(node, callee):
+            if isinstance(node, ast.Call) and name_of(node.func) == callee and not node.keywords:
+                return node.args
+            return ()
+
+        module_args = arguments(self.module_bindings.get(alias), "importlib.util.module_from_spec")
+        module_spec = self.module_bindings.get(name_of(module_args[0])) if len(module_args) == 1 else None
+        spec_args = arguments(module_spec, "importlib.util.spec_from_loader")
+        loader = spec_args[1] if len(spec_args) == 2 else None
+        loader_args = arguments(self.module_bindings.get(name_of(loader)), "importlib.machinery.SourceFileLoader")
+        path_arg = loader_args[1] if len(loader_args) == 2 else None
+        path_args = arguments(path_arg, "str")
+        path_expr = self.module_bindings.get(name_of(path_args[0])) if len(path_args) == 1 else None
+        path = None
+        loader_name = name_of(loader)
+        exec_args = arguments(self.module_calls.get(loader_name + ".exec_module"), loader_name + ".exec_module")
+        if len(exec_args) != 1 or name_of(exec_args[0]) != alias:
+            return None
+        if isinstance(path_expr, ast.BinOp) and isinstance(path_expr.op, ast.Div):
+            parent, filename = path_expr.left, literal(path_expr.right)
+            if (isinstance(parent, ast.Subscript) and isinstance(filename, str)
+                    and same(parent.value, ast.parse("Path(__file__).resolve().parents", mode="eval").body)):
+                level = literal(parent.slice)
+                if type(level) is int and 0 <= level < len(self.path.parents):
+                    candidate = (self.path.parents[level] / filename).resolve()
+                    if candidate.is_relative_to(self.root):
+                        path = candidate
+        self.scripts[alias] = path
+        return path
+
+    def definition(self, node):
+        name = binding_path(node)
+        if not name:
+            return None
+        if name in self.loop_rows:
+            return self.loop_rows[name]
+        value = super().definition(node)
+        if value is not None:
+            return value
+        root, dot, member = name.partition(".")
+        if member and self.changed[name]:
+            return None
+        if root in self.changed:
+            local = self.local_imports.get(root)
+            if local:
+                imported_at, imported = local
+                if self.precedes(imported_at, node):
+                    return self.imported_table(self.path, imported + dot + member)
+            return None
+        if self.module_names[root] != 1:
+            return None
+        if imported := self.imports.get(root):
+            return self.imported_table(self.path, imported + dot + member)
+        if member.isupper() and (path := self.script(root)):
+            return self.source_table(path, member)
+        return None
+
+    def rows(self, node):
+        value = self.definition(node) if isinstance(node, (ast.Name, ast.Attribute)) else node
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            if not any(isinstance(item, ast.Starred) for item in value.elts):
+                return value.elts
+        if isinstance(value, ast.Dict) and all(key is not None for key in value.keys):
+            return value.keys
+        if isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)) and all(
+                not generator.is_async and not generator.ifs and self.nonempty(generator.iter)
+                for generator in value.generators):
+            return [value.elt]
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and len(value.args) == 1:
+            if (value.func.id in {"set", "frozenset"} and not value.keywords
+                    and value.func.id not in self.changed and not self.module_names[value.func.id]):
+                return self.rows(value.args[0])
+        if isinstance(value, ast.Subscript) and isinstance(value.value, (ast.Name, ast.Attribute)):
+            mapping = self.definition(value.value)
+            if isinstance(mapping, ast.Dict) and mapping.values and all(
+                    nonempty_literal(item) for item in mapping.values):
+                return [None]
+        return []
+
+    def precedes(self, statement, node):
+        block = self.parents[statement]
+        while node in self.parents:
+            if self.parents[node] == block:
+                return (statement.lineno, statement.col_offset) < (node.lineno, node.col_offset)
+            node = self.parents[node][0]
+        return False
+
+    def appended(self, node):
+        binding = self.locals.get(node.id)
+        if not (isinstance(binding, (ast.Assign, ast.AnnAssign))
+                and isinstance(binding.value, ast.List)):
+            return False
+        return any(self.parents[statement] == self.parents[binding]
+                   and binding.lineno < statement.lineno and self.precedes(statement, node)
+                   and isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+                   and name_of(statement.value.func) == node.id + ".append"
+                   for statement in self.parents)
+
+    def nonempty(self, node):
+        if super().nonempty(node) or self.rows(node):
+            return True
+        if isinstance(node, ast.Name) and self.appended(node):
+            return True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
+            left = node.left
+            if (isinstance(left, ast.Call) and name_of(left.func) == "set"
+                    and len(left.args) == 1 and not left.keywords
+                    and "set" not in self.changed and not self.module_names["set"]
+                    and isinstance(node.right, ast.Set)):
+                removed = [literal(item) for item in node.right.elts]
+                return UNKNOWN not in removed and any(
+                    (value := literal(item)) is not UNKNOWN and value not in removed
+                    for item in self.rows(left.args[0]))
+        if (isinstance(node, ast.Call) and name_of(node.func) == "zip" and len(node.args) >= 2
+                and "zip" not in self.changed and not self.module_names["zip"]
+                and len(node.keywords) == 1 and node.keywords[0].arg == "strict"
+                and literal(node.keywords[0].value) is True):
+            return any(self.nonempty(arg) for arg in node.args)
+        return False
+
+    def enter_loop(self, node):
+        target = node.target
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return
+        rows = self.rows(node.iter)
+        if not rows or not all(isinstance(row, (ast.Tuple, ast.List))
+                               and len(row.elts) == len(target.elts) for row in rows):
+            return
+        for column, name in enumerate(target.elts):
+            if isinstance(name, ast.Name) and self.changed[name.id] == 1:
+                values = [row.elts[column] for row in rows]
+                if all(nonempty_literal(value) for value in values):
+                    self.loop_rows[name.id] = values[0]
+
+
+def parse(source, path, *, scan_root=None):
     tree = ast.parse(source, filename=str(path))
     comments = [
         Comment(start[0], start[1], text[1:].strip(), not raw[:start[1]].strip())
@@ -1358,6 +1576,13 @@ def parse(source, path):
         test = Test(node.name, identifier, node.lineno, start, end, node.col_offset)
         inspected.append((test, inspector, node))
         test.guarded = bool(inspector.checks) and all(guards for _, _, guards in inspector.checks)
+        if test.guarded and scan_root is not None:
+            guard_iterables = GuardIterables(node, parents, tables, module_names, tree, path, scan_root)
+            guard_inspector = Inspect(imports, checks_in(parents), local_helpers, guard_iterables,
+                                      test_parameters, oracle_imports, module_constants, definitions, parents)
+            for statement in node.body:
+                guard_inspector.visit(statement)
+            test.guarded = all(guards for _, _, guards in guard_inspector.checks)
         test.conditional = bool(inspector.constraints)
         test.measured = inspector.measured
         tests.append(test)
