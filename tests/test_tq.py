@@ -631,7 +631,11 @@ class CatchesTests(TqCase):
             "-s", "skills/build-loop/scripts/tests", "-p", "test_workq.py",
         ])
         rows = self.replay(code=(1,), command=command)
-        self.check_replay(rows, "remove the exclusive queue lock", "green")
+        # The audited suite's own patchless catches notes are reported too (unreplayable, per the
+        # brief); pick out the lock fault and check nothing else was replayed.
+        replayed = [row for row in rows if row["status"] != "unreplayable"]
+        self.check_replay(replayed, "remove the exclusive queue lock", "green")
+        self.assertTrue(any(row["status"] == "unreplayable" for row in rows), rows)
         self.assertEqual(self.git("status", "--porcelain=v1"), "")
 
 
