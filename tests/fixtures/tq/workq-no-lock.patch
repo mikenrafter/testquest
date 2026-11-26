@@ -1,0 +1,10 @@
+--- a/bin/workq
++++ b/bin/workq
+@@ -171,7 +171,6 @@
+     elif not (path / "events.jsonl").is_file():
+         raise OSError("no queue for this session; opt in with workq on")
+     with private_file(path / "events.jsonl") as events:
+-        fcntl.flock(events, fcntl.LOCK_EX)
+         queue = Queue(path, events)
+         if not queue.exists and not create:
+             raise OSError("no queue for this session; opt in with workq on")
