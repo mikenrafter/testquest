@@ -3,7 +3,7 @@ import json
 import subprocess
 import sys
 
-from . import catches, lint, witness
+from . import catches, lint, risk, witness
 
 
 def print_findings(rows, as_json):
@@ -30,7 +30,14 @@ def main():
     replay.add_argument("--cmd", default="python3 -m unittest {test}",
                         help="Test command with optional {test} placeholder.")
     replay.add_argument("--json", action="store_true")
+    map_risk = commands.add_parser("risk", help="Rank source files by change history and usage.")
+    map_risk.add_argument("--repo", default=".")
+    map_risk.add_argument("--html")
+    map_risk.add_argument("--json", action="store_true")
+    map_risk.add_argument("--budget", default=12, type=int)
     options = parser.parse_args()
+    if options.command == "risk" and options.budget < 0:
+        parser.error("--budget must be nonnegative")
     try:
         if options.command == "lint":
             return print_findings(lint.find(options.paths), options.json)
@@ -49,6 +56,18 @@ def main():
             if "green" in statuses:
                 return 1
             return 2 if statuses & {"error", "patch-failed"} else 0
+        if options.command == "risk":
+            snapshot = risk.map_risk(options.repo, options.budget)
+            if options.html:
+                risk.write_html(snapshot, options.html)
+            if options.json:
+                print(json.dumps(snapshot, indent=2))
+            elif not options.html:
+                print("Score  Fixes  Changes  Importers  Test refs  Test slots  File")
+                for row in snapshot["files"]:
+                    gap = " (gap)" if row["gap"] else ""
+                    print("{score:>5}  {fixes:>5}  {churn:>7}  {importers:>9}  {test_refs:>9}  "
+                          "{tests:>10}  {path}".format(**row) + gap)
         if options.command == "rules":
             for name, (message, allowed) in sorted(lint.RULES.items()):
                 print(f"{name}  {message}\n  allowed-when: {allowed}")
