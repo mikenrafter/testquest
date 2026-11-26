@@ -7,7 +7,7 @@ import sys
 import tokenize
 
 from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, argument_claims, helper, loose_bounds, named_arguments,
-                   prefix_satisfies, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
+                   prefix_satisfies, DISTINCT_INPUTS, OUTCOME_CLAIM, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
                    path_directories, pins_path)
 from .source import Comment, Test, project_root
 
@@ -818,7 +818,10 @@ class Inspect(ast.NodeVisitor):
             return bool(path) and path == self.alias_path(right, line)
         if op is not ast.Eq or not any(isinstance(part, ast.Call) for part in ast.walk(left)):
             return True
-        if REPEATABILITY.search(test_name) or REPEATABILITY.search(line_comments.get(line, "")):
+        comment = " ".join(line_comments.get(loc, "") for loc in (line - 1, line))
+        if DISTINCT_INPUTS.search(test_name) or DISTINCT_INPUTS.search(comment):
+            return True
+        if REPEATABILITY.search(test_name) or REPEATABILITY.search(comment):
             return False
         for other_line, node, _ in self.checks:
             if other_line == line:
@@ -830,6 +833,60 @@ class Inspect(ast.NodeVisitor):
                         operator is ast.Eq and literal(self.resolve(other, other_line)) is not UNKNOWN):
                     return False
         return True
+
+    def collection_checks(self, producers):
+        for line, predicate, guards in self.checks:
+            if guards or predicate is None:
+                continue
+            op, left, right = comparison(predicate)
+            candidates = []
+            if op is None:
+                negated = isinstance(predicate, ast.UnaryOp) and isinstance(predicate.op, ast.Not)
+                candidates.append((predicate.operand if negated else predicate, not negated))
+            reverse = {ast.Gt: ast.Lt, ast.GtE: ast.LtE, ast.Lt: ast.Gt, ast.LtE: ast.GtE}
+            for operand, other, ordered in ((left, right, op), (right, left, reverse.get(op, op))):
+                if isinstance(operand, ast.Call) and name_of(operand.func) == "len" and len(operand.args) == 1:
+                    size = literal(other)
+                    if type(size) is not int:
+                        continue
+                    operand = operand.args[0]
+                elif isinstance(other, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+                    size = len(other.keys if isinstance(other, ast.Dict) else other.elts)
+                else:
+                    continue
+                if ordered is ast.Eq or ordered in {ast.NotEq, ast.Gt, ast.GtE} and (
+                        size == 0 and ordered is not ast.GtE or size > 0 and ordered is ast.GtE):
+                    candidates.append((operand, ordered is not ast.Eq or size > 0))
+            for operand, present in candidates:
+                if isinstance(operand, ast.Name) and operand.id in self.writes:
+                    continue
+                value = self.resolve(operand, line)
+                if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+                    name = value.func.id
+                    if name in producers and name not in self.iterables.changed:
+                        yield name, present, line
+
+    def unchecked_mocks(self):
+        uses = defaultdict(list)
+        for part in self.iterables.parents:
+            if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Load):
+                uses[part.id].append(part)
+        for name, bindings in self.bindings.items():
+            if len(bindings) != 1:
+                continue
+            _, value = bindings[0]
+            if not isinstance(value, ast.Call) or value.args or value.keywords:
+                continue
+            root, dot, tail = name_of(value.func).partition(".")
+            module = self.imports.get(root, root) + dot + tail
+            if module not in {"unittest.mock.Mock", "unittest.mock.MagicMock", "unittest.mock.AsyncMock"}:
+                continue
+            if len(uses[name]) != 1:
+                continue
+            usage, = uses[name]
+            parent, field = self.iterables.parents[usage]
+            if isinstance(parent, ast.Call) and field == "args":
+                yield parent.lineno
 
     def failure_collector(self, name):
         sites = self.recorder_sites[name]
@@ -1522,6 +1579,71 @@ class GuardIterables(Iterables):
                     self.loop_rows[name.id] = values[0]
 
 
+def collection_producers(definitions):
+    for (owner, name), node in definitions.items():
+        if owner or name.startswith("test"):
+            continue
+        annotation = node.returns
+        annotation = annotation.value if isinstance(annotation, ast.Subscript) else annotation
+        if name_of(annotation) in {"list", "tuple", "set", "dict", "List", "Tuple", "Set", "Dict"}:
+            yield name
+            continue
+        returns = [part.value for part in body_nodes(node.body) if isinstance(part, ast.Return)]
+        if returns and all(isinstance(value, (ast.List, ast.Tuple, ast.Set, ast.Dict,
+                                             ast.ListComp, ast.SetComp, ast.DictComp)) for value in returns):
+            yield name
+
+
+def setup_only(node):
+    checked = set()
+    unchecked = False
+    for statement in node.body:
+        if isinstance(statement, ast.Assert):
+            if unchecked:
+                return False
+            parts = tuple(ast.walk(statement.test))
+            if any(isinstance(part, ast.Call) and name_of(part.func) not in {"len", "bool"}
+                   for part in parts):
+                return False
+            checked.update(part.id for part in parts if isinstance(part, ast.Name))
+        elif checked:
+            if isinstance(statement, ast.Expr):
+                value = statement.value
+            elif isinstance(statement, ast.Assign) and all(name_of(target) == "_" for target in statement.targets):
+                value = statement.value
+            else:
+                continue
+            if not isinstance(value, ast.Call):
+                continue
+            arguments = (*value.args, *(kw.value for kw in value.keywords))
+            callee = name_of(value.func)
+            receiver, _, method = callee.rpartition(".")
+            if callee == "print" or receiver in {"log", "logger", "logging"} and method in {
+                    "debug", "info", "warning", "error", "exception", "critical"}:
+                unchecked |= any(isinstance(part, ast.Call) for argument in arguments for part in ast.walk(argument))
+            else:
+                unchecked |= any(isinstance(part, ast.Name) and part.id in checked
+                                 for argument in arguments for part in ast.walk(argument))
+    return unchecked
+
+
+def has_outcome_evidence(node, scope, checks_call):
+    evidence = [part for part in body_nodes(node.body)
+                if isinstance(part, ast.Assert)
+                or isinstance(part, ast.Raise) and raises_assertion(part)
+                or isinstance(part, ast.Call) and checks_call(scope, name_of(part.func))]
+    if not evidence:
+        return False
+    if any(not isinstance(part, ast.Assert) for part in evidence):
+        return True
+    if OUTCOME_CLAIM.search(node.name) and all(
+            isinstance(part.test, ast.Call) and isinstance(part.test.func, ast.Attribute)
+            and part.test.func.attr == "is_ok" and not part.test.args and not part.test.keywords
+            for part in evidence):
+        return False
+    return not setup_only(node)
+
+
 def parse(source, path, *, scan_root=None):
     tree = ast.parse(source, filename=str(path))
     comments = [
@@ -1587,14 +1709,17 @@ def parse(source, path, *, scan_root=None):
         test.measured = inspector.measured
         tests.append(test)
     pins = {pin for _, inspector, _ in inspected for pin in inspector.literal_pins()}
-    for test, inspector, node in inspected:
+    producers = set(collection_producers(definitions))
+    collections = [list(inspector.collection_checks(producers)) for _, inspector, _ in inspected]
+    witnessed = {name for checks in collections for name, present, _ in checks if present}
+    for (test, inspector, node), collection_checks in zip(inspected, collections):
         strings = {part.value for part in body_nodes(node.body)
                    if isinstance(part, ast.Constant) and isinstance(part.value, str)}
         test.issues = inspector.issues(test.name, pins, strings, line_comments)
         scope = (*inspector.owner, node.name)
-        if not any(isinstance(part, ast.Assert)
-                   or (isinstance(part, ast.Raise) and raises_assertion(part))
-                   or (isinstance(part, ast.Call) and checks_call(scope, name_of(part.func)))
-                   for part in body_nodes(node.body)):
+        test.issues.extend((line, "absence-no-control") for name, present, line in collection_checks
+                           if not present and name not in witnessed)
+        test.issues.extend((line, "absence-no-control") for line in inspector.unchecked_mocks())
+        if not has_outcome_evidence(node, scope, checks_call):
             test.issues.append((test.line, "no-assert"))
     return tests, comments

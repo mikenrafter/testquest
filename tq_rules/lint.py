@@ -14,7 +14,7 @@ RULES = {
         "The stated property is reflexivity or repeatability, and both operands are independently evaluated.",
     ),
     "no-assert": (
-        "Test has no assertion, expected exception, or recognized checking helper.",
+        "Test has no check that verifies the outcome under test.",
         "The stated check is successful execution, such as passing output through a strict parser.",
     ),
     "guarded-assert": (
@@ -22,7 +22,7 @@ RULES = {
         "The branch is exercised by a named witness, or zero matching items is explicitly a valid case.",
     ),
     "absence-no-control": (
-        "Recorder has no positive check showing it can observe an action.",
+        "No check shows that the recorder or detector can report a result.",
         "An independent observation in the same test establishes that the recorder can fire.",
     ),
     "self-derived-expected": (
@@ -37,6 +37,14 @@ RULES = {
 ADVISORY = {"nondistinguishing-literal", "self-derived-expected"}
 ORDERED_NAME = re.compile(r"reverse|order|swap|endian|rotate|crc|encode", re.I)
 REPEATABILITY = re.compile(r"(?<![a-z])(?:determin(?:ism|istic)|stabl(?:e|ity)|same|repeat\w*|reproducib\w*|idempotent|consistent)(?![a-z])", re.I)
+DISTINCT_INPUTS = re.compile(
+    r"(?<![a-z])(?:(?:both|two)[ _-]+(?:inputs?|lines?|keys?|paths?|requests?|files?|jobs?)"
+    r"|(?:different|distinct)[ _-]+(?:inputs?|lines?|keys?|paths?|calls?|requests?|files?|jobs?))(?![a-z])",
+    re.I,
+)
+OUTCOME_CLAIM = re.compile(
+    r"(?:^|_)(?:returns_none|rejects|fails_when|errors_on|is_empty|truncat(?:es|ed)_before"
+    r"|prints?_\w+?_to_(?:stderr|stdout))(?:_|$)")
 UNKNOWN = object()
 
 
