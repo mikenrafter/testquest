@@ -3,7 +3,7 @@ import json
 import subprocess
 import sys
 
-from . import catches, lint
+from . import catches, lint, witness
 
 
 def print_findings(rows, as_json):
@@ -18,9 +18,11 @@ def print_findings(rows, as_json):
 def main():
     parser = argparse.ArgumentParser(description="Check how tests observe failures.")
     commands = parser.add_subparsers(dest="command", required=True)
-    scan = commands.add_parser("lint", help="Find weak assertions and fixtures.")
-    scan.add_argument("paths", nargs="+")
-    scan.add_argument("--json", action="store_true")
+    for name, help_text in (("lint", "Find weak assertions and fixtures."),
+                            ("witness", "Find conditional checks without reachability evidence.")):
+        scan = commands.add_parser(name, help=help_text)
+        scan.add_argument("paths", nargs="+")
+        scan.add_argument("--json", action="store_true")
     commands.add_parser("rules", help="Show lint rules and exceptions.")
     replay = commands.add_parser("catches", help="Replay named faults in a temporary copy.")
     replay.add_argument("--repo", default=".")
@@ -32,6 +34,8 @@ def main():
     try:
         if options.command == "lint":
             return print_findings(lint.find(options.paths), options.json)
+        if options.command == "witness":
+            return print_findings(witness.find(options.paths), options.json)
         if options.command == "catches":
             rows = catches.run(options.repo, options.worktree, options.cmd)
             if options.json:
