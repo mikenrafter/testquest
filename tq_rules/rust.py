@@ -229,7 +229,8 @@ def test_functions(tokens, namespace=(), imports=None, *, module_scope=True):
             continue
         if token.text == "fn" and index + 1 < len(tokens) and attributes:
             names = [shape(attribute) for _, attribute in attributes]
-            is_test = any(test_attribute(name) for name in names)
+            template = any(name in {("template",), ("rstest_reuse", "::", "template")} for name in names)
+            is_test = not template and any(test_attribute(name) for name in names)
             if is_test:
                 for body_index in range(index + 2, len(tokens)):
                     body = tokens[body_index]
@@ -237,12 +238,13 @@ def test_functions(tokens, namespace=(), imports=None, *, module_scope=True):
                         break
                     if body.text == "{" and body.kind == "group":
                         panic = any(name and name[0] == "should_panic" for name in names)
+                        ignored = any(name and name[0] == "ignore" for name in names)
                         name = tokens[index + 1].text
                         scope = tokens if module_scope else None
                         header = next((part.children for part in tokens[index + 2:body_index]
                                        if part.text == "("), ())
                         yield (token, name, "::".join((*namespace, name)), attributes[0][0].line,
-                               body, panic, aliases, scope, header)
+                               body, panic, ignored, aliases, scope, header)
                         index = body_index
                         break
             attributes.clear()
@@ -406,22 +408,45 @@ def conditional_blocks(tokens):
     return guarded
 
 
-def function_bodies(tokens):
-    """Yield (name, body token) for functions declared directly in this scope."""
-    for index, token in enumerate(tokens):
-        if token.text == "fn" and index + 1 < len(tokens) and tokens[index + 1].kind == "word":
-            for body in tokens[index + 2:]:
+def function_items(tokens):
+    for index, token in enumerate(tokens[:-1]):
+        if token.text == "fn" and tokens[index + 1].kind == "word":
+            for body_index in range(index + 2, len(tokens)):
+                body = tokens[body_index]
                 if body.text == ";":
                     break
-                if body.text == "{" and body.kind == "group":
-                    yield tokens[index + 1].text, body
+                if body.text == "{":
+                    yield index, body_index
                     break
 
 
-def invocation_at(tokens, index):
+def function_bodies(tokens):
+    """Yield (name, body token) for functions declared directly in this scope."""
+    for start, end in function_items(tokens):
+        yield tokens[start + 1].text, tokens[end]
+
+
+def type_arguments_end(tokens, start):
+    depth = 0
+    for index in range(start, len(tokens)):
+        text = tokens[index].text
+        if text == "<":
+            depth += 1
+        elif text == ">":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def invocation_at(tokens, index, *, generic=False):
     if tokens[index].kind != "word" or index + 1 >= len(tokens):
         return None
     following = tokens[index + 1]
+    if generic and following.text == "::" and index + 2 < len(tokens) and tokens[index + 2].text == "<":
+        end = type_arguments_end(tokens, index + 2)
+        if end is not None and end + 1 < len(tokens):
+            following = tokens[end + 1]
     if following.kind == "group" and following.text == "(":
         return following, False
     if following.text == "!" and index + 2 < len(tokens) and tokens[index + 2].kind == "group":
@@ -488,6 +513,154 @@ def checking_helpers(scope, test_bodies):
         if not found:
             return known
         known |= found
+
+
+def macro_expansions(tokens):
+    for index in range(len(tokens) - 3):
+        declaration = tokens[index:index + 4]
+        if (declaration[0].text != "macro_rules" or declaration[1].text != "!"
+                or declaration[2].kind != "word" or declaration[3].kind != "group"):
+            continue
+        arms = declaration[3].children
+        expansions = [arm.children for marker, arm in zip(arms, arms[1:])
+                      if marker.text == "=>" and arm.kind == "group"]
+        yield declaration[2].text, tuple(expansions)
+
+
+def validates_before_extraction(tokens, index):
+    if (index < 3 or tokens[index].text not in {"unwrap", "expect"}
+            or tokens[index - 1].text != "."):
+        return False
+    callee = tokens[index - 3]
+    return (tokens[index - 2].text == "(" and callee.kind == "word"
+            and callee.text.startswith(("validate", "verify", "check")))
+
+
+def has_trait_bound(signature):
+    if not signature or signature[0].text != "<":
+        return False
+    end = type_arguments_end(signature, 0)
+    if end is None:
+        return False
+    predicates = list(split(signature[1:end], type_arguments=True))
+    for index in range(end + 1, len(signature)):
+        if signature[index].text == "where":
+            predicates.extend(split(signature[index + 1:], type_arguments=True))
+            break
+    for predicate in predicates:
+        if predicate[0].text in {"const", "'"}:
+            continue
+        parts = list(split(predicate, ":"))
+        if len(parts) > 1 and any(bound[0].kind == "word" for bound in split(parts[1], "+")):
+            return True
+    return False
+
+
+class CheckEvidence:
+    """Resolve calls that supply evidence for no-assert."""
+
+    def __init__(self, file_iterables, tests):
+        self.file_iterables = file_iterables
+        self.functions = file_iterables.function_sources.copy()
+        self.macros = file_iterables.macro_sources.copy()
+        self.trait_checks = set()
+        self.known = set()
+        for scope, tokens in self.functions.copy().items():
+            self.index_local(scope, tokens)
+        for _, _, identifier, _, body, *_ in tests:
+            name = tuple(identifier.split("::"))
+            if name not in self.functions:
+                self.functions[name] = body.children
+                self.index_local(name, body.children)
+        pending = [(False, name, name, (tokens,)) for name, tokens in self.functions.items()]
+        pending.extend((True, name, name[:-1], arms) for name, arms in self.macros.items())
+        while pending:
+            remaining = []
+            for macro, name, scope, bodies in pending:
+                if any(self.checks(body, scope, in_helper=not macro) for body in bodies):
+                    self.known.add((macro, name))
+                else:
+                    remaining.append((macro, name, scope, bodies))
+            if len(remaining) == len(pending):
+                break
+            pending = remaining
+
+    def index_local(self, scope, tokens):
+        for name, arms in macro_expansions(tokens):
+            self.macros[(*scope, name)] = arms
+        for start, end in function_items(tokens):
+            name = tokens[start + 1].text
+            path = (*scope, name)
+            signature = tokens[start + 2:end]
+            if name.startswith(("assert", "check")) and has_trait_bound(signature):
+                self.trait_checks.add(path)
+            body = tokens[end].children
+            self.functions[path] = body
+            self.index_local(path, body)
+
+    def resolve(self, scope, name, macro):
+        definitions = self.macros if macro else self.functions
+        if len(name) == 1:
+            for depth in range(len(scope), -1, -1):
+                owner = scope[:depth]
+                path = (*owner, *name)
+                if (macro or owner in self.functions) and path in definitions:
+                    return path
+        scope = self.module_scope(scope)
+        if macro:
+            path = absolute_path(scope, name)
+            if path in definitions:
+                return path
+        return self.file_iterables.resolve(scope, name)
+
+    def module_scope(self, scope):
+        while scope in self.functions:
+            scope = scope[:-1]
+        return scope
+
+    def checks(self, tokens, scope, *, in_helper=False):
+        declarations = dict(function_items(tokens))
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if index in declarations:
+                index = declarations[index] + 1
+                continue
+            if token.text == "let" and index + 4 < len(tokens):
+                binding = tuple(part.text for part in tokens[index + 1:index + 5])
+                if binding == ("_", ":", "fn", "(") and item_value(tokens, index):
+                    return True
+            if token.text == "macro_rules" and index + 1 < len(tokens) and tokens[index + 1].text == "!":
+                index += 4
+                continue
+            invocation = invocation_at(tokens, index, generic=True)
+            if invocation:
+                _, macro = invocation
+                start = callee_start(tokens, index)
+                if start is not None and tokens[start].text == "::":
+                    start += 1
+                name = qualified_name(tokens[start:index + 1]) if start is not None else ()
+                path = self.resolve(scope, name, macro) if name else ()
+                definitions = self.macros if macro else self.functions
+                if path in definitions:
+                    if macro:
+                        if (True, path) in self.known:
+                            return True
+                        index += 3
+                        continue
+                    if path in self.trait_checks or ((False, path) in self.known and (
+                            self.module_scope(path) == self.module_scope(scope) or helper(path[-1]))):
+                        return True
+                elif (starts_check(tokens, index, macro, (), in_helper=in_helper)
+                      or (in_helper and macro and token.text == "panic"
+                          and scope[-1].startswith(("assert", "check", "verify")))):
+                    return True
+                if validates_before_extraction(tokens, index):
+                    return True
+            if token.kind == "group" and self.checks(token.children, scope, in_helper=in_helper):
+                return True
+            index += 1
+        return False
 
 
 def qualified_name(tokens):
@@ -591,6 +764,8 @@ def test_module(name):
 class FileIterables:
     def __init__(self, tokens, path, parameters):
         self.definitions = {}
+        self.function_sources = {}
+        self.macro_sources = {}
         self.path = path
         self.aliases = {}
         self.globs = defaultdict(list)
@@ -630,6 +805,8 @@ class FileIterables:
                 self.test_items.add((*scope, tokens[index + 1].text))
         for name, body in function_bodies(tokens):
             self.add((*scope, name), "helper", return_expression(body))
+            self.function_sources[(*scope, name)] = body.children
+        self.macro_sources.update(((*scope, name), bodies) for name, bodies in macro_expansions(tokens))
 
     def resolve(self, scope, name):
         direct = absolute_path(scope, name)
@@ -1660,7 +1837,8 @@ def parse(source, path):
     helpers = {}
     parameters = dict(file_parameters(grouped))
     file_iterables = FileIterables(grouped, path, parameters)
-    for token, name, identifier, start, body, panic, aliases, scope, header in found:
+    evidence = CheckEvidence(file_iterables, found)
+    for token, name, identifier, start, body, panic, ignored, aliases, scope, header in found:
         if scope is not None and id(scope) not in helpers:
             helpers[id(scope)] = checking_helpers(scope, test_bodies)
         previous = {c.line for c in comments if c.standalone and c.column == token.column}
@@ -1676,13 +1854,13 @@ def parse(source, path):
         inspector.strategies = {argument[0].text: argument[2:] for argument in split(header, type_arguments=True)
                                 if len(argument) >= 3 and argument[0].kind == "word" and argument[1].text == "in"}
         inspector.visit(body.children)
-        inspected.append((test, inspector, panic, body))
-    pins = {pin for _, inspector, _, _ in inspected for pin in inspector.literal_pins()}
-    for test, inspector, panic, body in inspected:
+        inspected.append((test, inspector, panic, ignored, body))
+    pins = {pin for _, inspector, _, _, _ in inspected for pin in inspector.literal_pins()}
+    for test, inspector, panic, ignored, body in inspected:
         strings = {value for token in walk_tokens(body.children)
                    if token.kind in {"quoted", "raw"} and isinstance(value := literal((token,)), str)}
         test.issues, test.measured = inspector.issues(test.name, pins, strings)
-        if not inspector.checks and not panic:
+        if not (panic or ignored or evidence.checks(body.children, tuple(test.identifier.split("::")))):
             test.issues.append((test.line, "no-assert"))
         test.guarded = bool(inspector.checks) and not panic and all(
             guarded for _, _, _, guarded in inspector.checks)

@@ -20,6 +20,11 @@ def name_of(node):
     return ""
 
 
+def raises_assertion(node):
+    value = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+    return name_of(value) == "AssertionError"
+
+
 def literal(node):
     if isinstance(node, ast.Constant):
         return node.value
@@ -256,8 +261,7 @@ class Inspect(ast.NodeVisitor):
         self.visit(node.test)
 
     def visit_Raise(self, node):
-        value = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
-        if name_of(value) == "AssertionError":
+        if raises_assertion(node):
             self.checks.append((node.lineno, None, tuple(self.guards)))
         self.generic_visit(node)
 
@@ -979,7 +983,7 @@ class Iterables:
                 and self.nonempty(node.args[0]))
 
 
-def checking_helpers(tree):
+def checking_helpers(tree, *, require_evidence=False):
     definitions = {}
     parents = {}
 
@@ -987,6 +991,8 @@ def checking_helpers(tree):
         for node in nodes:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 definitions[scope, node.name] = node
+                if require_evidence:
+                    index(node.body, (*scope, node.name))
             elif isinstance(node, ast.ClassDef):
                 child = (*scope, node.name)
                 parents[child] = [(*scope, name_of(base)) for base in node.bases]
@@ -1007,21 +1013,58 @@ def checking_helpers(tree):
             f"self.{name}" for owner, name in checked if owner and owner in scopes
         }
 
+    def local_definition(scope, name):
+        receiver, _, method = name.rpartition(".")
+        if receiver in {"self", "cls"}:
+            pending = [scope[:depth] for depth in range(len(scope), 0, -1)
+                       if scope[:depth] in parents][:1]
+            visited = set()
+            while pending:
+                owner = pending.pop(0)
+                if owner in visited:
+                    continue
+                visited.add(owner)
+                if (owner, method) in definitions:
+                    return owner, method
+                pending.extend(parents.get(owner, ()))
+        elif receiver:
+            return tuple(receiver.split(".")), method
+        else:
+            for depth in range(len(scope), -1, -1):
+                owner = scope[:depth]
+                if owner not in parents and (owner, name) in definitions:
+                    return owner, name
+        return (), name
+
+    def checks_call(scope, name):
+        key = local_definition(scope, name)
+        if key in definitions:
+            return key in checked
+        return helper(name.rsplit(".", 1)[-1])
+
     nodes = {key: list(body_nodes(fn.body)) for key, fn in definitions.items()
-             if not fn.name.startswith("test")}
+             if require_evidence or not fn.name.startswith("test")}
     while True:
         found = set()
         for key, inside in nodes.items():
             if key in checked:
                 continue
-            known = available(key[0])
-            if any(isinstance(node, ast.Assert) or
-                   (isinstance(node, ast.Call) and
-                    (name_of(node.func) in known or helper(name_of(node.func).rsplit(".", 1)[-1])))
-                   for node in inside):
+            if require_evidence:
+                owner, name = key
+                scope = (*owner, name)
+                verifies = any(isinstance(node, (ast.Assert, ast.Raise)) or
+                               (isinstance(node, ast.Call) and checks_call(scope, name_of(node.func)))
+                               for node in inside)
+            else:
+                known = available(key[0])
+                verifies = any(isinstance(node, ast.Assert) or
+                               (isinstance(node, ast.Call) and
+                                (name_of(node.func) in known or helper(name_of(node.func).rsplit(".", 1)[-1])))
+                               for node in inside)
+            if verifies:
                 found.add(key)
         if not found:
-            return available, definitions
+            return (checks_call if require_evidence else available), definitions
         checked.update(found)
 
 
@@ -1154,6 +1197,9 @@ def parse(source, path):
     module_constants = ModuleConstants(path)
 
     checks_in, definitions = checking_helpers(tree)
+    if not (functions := list(test_functions(tree.body))):
+        return [], comments
+    checks_call, _ = checking_helpers(tree, require_evidence=True)
     parameters, methods = file_parameters(definitions)
     local_helpers = {node.name for node in tree.body
                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -1162,7 +1208,7 @@ def parse(source, path):
     tables = dict(file_iterables(tree.body, module_names))
     tests = []
     inspected = []
-    for node, parents in test_functions(tree.body):
+    for node, parents in functions:
         iterables = Iterables(node, parents, tables, module_names)
         local_parameters = {local.name: parameter_names(local) for local in node.body
                           if isinstance(local, (ast.FunctionDef, ast.AsyncFunctionDef))}
@@ -1201,6 +1247,10 @@ def parse(source, path):
         strings = {part.value for part in body_nodes(node.body)
                    if isinstance(part, ast.Constant) and isinstance(part.value, str)}
         test.issues = inspector.issues(test.name, pins, strings)
-        if not inspector.checks:
+        scope = (*inspector.owner, node.name)
+        if not any(isinstance(part, ast.Assert)
+                   or (isinstance(part, ast.Raise) and raises_assertion(part))
+                   or (isinstance(part, ast.Call) and checks_call(scope, name_of(part.func)))
+                   for part in body_nodes(node.body)):
             test.issues.append((test.line, "no-assert"))
     return tests, comments
