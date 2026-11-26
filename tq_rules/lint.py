@@ -36,6 +36,7 @@ RULES = {
 }
 ADVISORY = {"nondistinguishing-literal", "self-derived-expected"}
 ORDERED_NAME = re.compile(r"reverse|order|swap|endian|rotate|crc|encode", re.I)
+REPEATABILITY = re.compile(r"(?<![a-z])(?:determin(?:ism|istic)|stabl(?:e|ity)|same|repeat\w*|reproducib\w*|idempotent|consistent)(?![a-z])", re.I)
 UNKNOWN = object()
 
 

@@ -5,7 +5,7 @@ import re
 from string import Formatter
 
 from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, argument_claims, fixed_boundary, helper, loose_bounds,
-                   named_arguments, prefix_satisfies, symmetric_input, unvaried_arguments, IMPORT_FIELDS,
+                   named_arguments, prefix_satisfies, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS,
                    IMPORT_TOKEN, path_directories, pins_path)
 from .source import Comment, Test
 
@@ -1006,6 +1006,40 @@ def mutated_names(tokens):
                 yield token.text
 
 
+def binding_path(tokens):
+    if not tokens or tokens[0].kind != "word" or len(tokens) % 2 != 1:
+        return ()
+    for dot, field in zip(tokens[1::2], tokens[2::2]):
+        if dot.text != "." or field.kind not in {"word", "number"}:
+            return ()
+    return shape(tokens)
+
+
+def contains_call(tokens):
+    return any((token.kind == "word" and invocation_at(tokens, i))
+               or (token.kind == "group" and contains_call(token.children))
+               for i, token in enumerate(tokens))
+
+
+def assertion_comparison(name, args):
+    if name in ASSERTIONS and name.endswith(("_eq", "_ne")) and len(args) >= 2:
+        return ("==" if name.endswith("_eq") else "!="), *args[:2]
+    if name in ASSERTIONS and args:
+        return comparison(args[0])
+    return "", (), ()
+
+
+def recorder_initializer(tokens):
+    if shape(tokens) in {("Vec", "::", "new", "("), ("vec", "!", "[")}:
+        return "vector"
+    if literal(tokens) in (False, 0):
+        return "scalar"
+    if (len(tokens) >= 4 and shape(tokens[-4:-1]) == ("Cell", "::", "new")
+            and tokens[-1].text == "(" and literal(tokens[-1].children) in (False, 0)):
+        return "cell"
+    return ""
+
+
 def pattern_names(tokens):
     return (token.text for token in binding_tokens(tokens))
 
@@ -1069,6 +1103,12 @@ class Inspect:
         self.bindings = {}
         self.writes = {}
         self.reads = set()
+        self.collector_writes = defaultdict(list)
+        self.callback_writes = {}
+        self.counter_reads = set()
+        self.recorder_inputs = defaultdict(set)
+        self.binding_changes = defaultdict(list)
+        self.alias_bindings = {}
         self.increments = set()
         self.assumes = False
         self.symmetric_calls = defaultdict(list)
@@ -1081,10 +1121,12 @@ class Inspect:
         self.strategies = {}
         self.paired_bindings = {}
 
-    def visit(self, tokens, guarded=False, inherited=None):
+    def visit(self, tokens, guarded=False, inherited=None, *, closure=False,
+              collector_path=(), collector_comparison=False):
         locals_here = dict(inherited or ())
         guarded_blocks = conditional_blocks(tokens)
         block_locals = {}
+        collector_blocks = {}
 
         def lookup(expression, kind):
             name = qualified_name(expression)
@@ -1093,8 +1135,13 @@ class Inspect:
             return self.file_iterables.lookup(self.scope, name, kind)
 
         declaration_names = set()
+        in_closure = closure
         for index, token in enumerate(tokens):
             text = token.text
+            if text == "||" and (not index or tokens[index - 1].text in {",", "=", "move", "return"}):
+                in_closure = True
+            elif text in {",", ";"}:
+                in_closure = closure
             if text in {"for", "while"}:
                 loop = loop_block(tokens, index)
                 if loop is not None:
@@ -1106,10 +1153,18 @@ class Inspect:
                         runs = shape(header) == ("true",)
                     if not runs:
                         guarded_blocks.add(position)
+                        source = binding_path(unborrow(header))
+                        collector_blocks[position] = (source[0] if len(source) == 1 else "", False)
+            if text == "if":
+                position = next((i for i in range(index + 1, len(tokens))
+                                 if tokens[i].text in {"{", ";"}), len(tokens))
+                if position in guarded_blocks and comparison(tokens[index + 1:position])[0]:
+                    collector_blocks[position] = (None, True)
             if text in {"let", "const"}:
                 declaration = next(iter(split(tokens[index + 1:], ";")), ())
                 parts = list(split(declaration, "="))
                 pattern = next(iter(split(parts[0], ":")), ()) if parts else ()
+                bare = pattern[1:] if shape(pattern[:1]) == ("mut",) else pattern
                 names = tuple(pattern_names(pattern))
                 if text == "const" and (not pattern or pattern[0].text == "fn"):
                     names = ()
@@ -1121,7 +1176,6 @@ class Inspect:
                         block_locals[position] = names
                 else:
                     locals_here.update((name, {}) for name in names)
-                    bare = pattern[1:] if shape(pattern[:1]) == ("mut",) else pattern
                     if len(parts) == 2 and len(bare) == 1 and names:
                         name = names[0]
                         if name not in self.mutated:
@@ -1142,10 +1196,41 @@ class Inspect:
                     if target:
                         declaration_names.add(id(target))
                         self.bindings.setdefault(target.text, []).append((token.line, rhs))
+                        if inherited is None and previous not in {"if", "while"} and rhs and binding_path(bare) == (target.text,):
+                            self.alias_bindings[target.text] = ((rhs[-1].line, rhs[-1].column), rhs)
             following = shape(tokens[index + 1:index + 3])
-            if len(following) == 2 and following[0] == "." and following[1] in RECORDING_METHODS:
-                self.writes.setdefault(text, token.line)
-            elif token.kind == "word" and id(token) not in declaration_names:
+            if token.kind == "word" and (not index or tokens[index - 1].text not in {".", "::"}):
+                end = index + 1
+                while end < len(tokens):
+                    if tokens[end].text == "[":
+                        end += 1
+                    elif end + 1 < len(tokens) and tokens[end].text == "." and tokens[end + 1].kind in {"word", "number"}:
+                        end += 2
+                    else:
+                        break
+                after_path = tuple(part.text for part in tokens[end:end + 2])
+                assigned = (after_path[:1] in {("=",), ("+=",)}
+                            or len(after_path) == 2 and after_path[0] in {"-", "*", "/", "%", "&", "|", "^"} and after_path[1] == "=")
+                borrowed = shape(tokens[max(0, index - 2):index]) == ("&", "mut")
+                method = following[1] if len(following) == 2 and following[0] == "." else ""
+                invokes_method = end > index + 1 and after_path[:1] in {("(",), ("::",)}
+                if assigned or borrowed or invokes_method or id(token) in declaration_names:
+                    self.binding_changes[text].append((token.line, token.column))
+                if method in RECORDING_METHODS:
+                    self.writes.setdefault(text, token.line)
+                    self.collector_writes[text].append((collector_path, collector_comparison))
+                elif in_closure and id(token) not in declaration_names and (
+                        end == index + 1 and assigned or method == "set"):
+                    kind = "cell" if method == "set" else "scalar"
+                    self.callback_writes.setdefault(text, (token.line, kind))
+                    if method == "set" and end < len(tokens) and tokens[end].text == "(":
+                        update = tokens[end].children
+                        if (len(update) == 6 and shape(update[:5]) == (text, ".", "get", "(", "+")
+                                and type(literal(update[5:])) is int):
+                            self.counter_reads.add(id(update[0]))
+                elif id(token) not in declaration_names and id(token) not in self.counter_reads:
+                    self.reads.add(text)
+            elif token.kind == "word":
                 self.reads.add(text)
             if index + 1 < len(tokens) and tokens[index + 1].text == "+=":
                 increment = next(iter(split(tokens[index + 2:], ";")), ())
@@ -1173,6 +1258,10 @@ class Inspect:
                 callee = shape(tokens[start:index + 1]) if start is not None else None
                 literals = {position: literal(arg, signed_and_float=True)
                             for position, arg in enumerate(args)}
+                if callee and not macro:
+                    for slot, arg in enumerate(args):
+                        if len(arg) == 3 and shape(arg[:2]) == ("&", "mut") and arg[2].kind == "word":
+                            self.recorder_inputs[arg[2].text].add(((callee, slot), token.line))
                 if callee and not (macro or assertion(text)
                                    or text in {"if", "while", "for", "match", "return", "break", "move"}):
                     first = tokens[start]
@@ -1187,7 +1276,16 @@ class Inspect:
                 in_block = locals_here
                 if index in block_locals:
                     in_block = {**locals_here, **dict.fromkeys(block_locals[index], {})}
-                self.visit(token.children, guarded or index in guarded_blocks, in_block)
+                source, mismatch = collector_blocks.get(index, ("" if index in guarded_blocks else None, False))
+                path = (*collector_path, source) if source is not None else collector_path
+                self.visit(token.children, guarded or index in guarded_blocks, in_block,
+                           closure=in_closure or self.closure_block(tokens, index),
+                           collector_path=path, collector_comparison=collector_comparison or mismatch)
+
+    @staticmethod
+    def closure_block(tokens, index):
+        return index > 1 and tokens[index].text == "{" and tokens[index - 1].text == "|" and any(
+            token.text == "|" for token in tokens[:index - 1])
 
     def resolve(self, tokens, line):
         while len(tokens) == 1 and tokens[0].kind == "word":
@@ -1762,14 +1860,78 @@ class Inspect:
         return self.parameters.get(absolute_path(self.scope, name),
                                    self.parameters.get(name, {}))
 
-    def issues(self, test_name, pins, strings):
+    def alias_path(self, operand, location):
+        path = binding_path(operand)
+        if not path:
+            return ()
+        root = path[0]
+        binding = self.alias_bindings.get(root)
+        if not binding or len(self.bindings[root]) != 1:
+            return path
+        start, value = binding
+        if start >= location:
+            return path
+        receiver, method, args = method_call(value)
+        source = binding_path(receiver if method == "clone" and not args else value)
+        if not source:
+            return path
+        original = self.alias_path(value if not receiver else receiver, start)
+        if original and not any(
+                start < change < location for name in {root, source[0], original[0]}
+                for change in self.binding_changes[name]):
+            return (*original, *path[1:])
+        return path
+
+    def self_comparison(self, op, left, right, line, test_name, line_comments):
+        if op not in {"==", "!="} or not left or not right:
+            return False
+        if shape(left) != shape(right):
+            location = (left[0].line, left[0].column)
+            path = self.alias_path(left, location)
+            return bool(path) and path == self.alias_path(right, location)
+        if op != "==" or not contains_call(left):
+            return True
+        if REPEATABILITY.search(test_name) or REPEATABILITY.search(line_comments.get(line, "")):
+            return False
+        for other_line, name, args, _ in self.checks:
+            if other_line == line:
+                continue
+            operator, first, second = assertion_comparison(name, args)
+            for call, other in ((first, second), (second, first)):
+                if shape(call) != shape(left):
+                    continue
+                expected = self.resolve(other, other_line)
+                if (operator == "!=" and shape(other) != shape(call)) or (operator == "==" and (
+                        literal(expected, signed_and_float=True) is not UNKNOWN
+                        or literal_size(expected) is not None)):
+                    return False
+        return True
+
+    def checked_iteration_sources(self):
+        for line, name, args, guarded in self.checks:
+            if guarded or name not in ASSERTIONS or not args:
+                continue
+            receiver, method, _ = method_call(args[0])
+            if method != "contains":
+                continue
+            value = self.resolve(receiver, line)
+            while value:
+                base, method, _ = method_call(value)
+                if method == "iter":
+                    path = binding_path(base)
+                    if len(path) == 1 and path[0] not in self.mutated:
+                        yield path[0]
+                    break
+                if method not in {"collect", "map"}:
+                    break
+                value = base
+
+    def issues(self, test_name, pins, strings, line_comments):
         findings = [(line, "nondistinguishing-literal") for line in self.argument_calls(test_name)]
-        recorders = {
-            name for name, bindings in self.bindings.items()
-            if shape(bindings[0][1]) in {("Vec", "::", "new", "("), ("vec", "!", "[")}
-        }
+        initializers = {name: recorder_initializer(bindings[0][1]) for name, bindings in self.bindings.items()}
+        recorders = {name for name, kind in initializers.items() if kind == "vector"}
         negative = {}
-        positive = set()
+        positive = defaultdict(list)
         measured = False
         for line, name, args, _ in self.checks:
             if name in ASSERTIONS and name.endswith(("_eq", "_ne")) and len(args) >= 2:
@@ -1782,17 +1944,23 @@ class Inspect:
                 if always_true(args[0]):
                     findings.append((line, "const-truth"))
                 if len(args[0]) == 1 and args[0][0].text in recorders:
-                    positive.add(args[0][0].text)
+                    positive[args[0][0].text].append(line)
                 if shape(args[0])[:1] == ("!",) and args[0][1:]:
                     expression = shape(args[0][1:])
                     if expression[0] in recorders and expression[1:] == (".", "is_empty", "("):
-                        positive.add(expression[0])
+                        positive[expression[0]].append(line)
+                receiver, method, _ = method_call(args[0])
+                if method == "any":
+                    base, iterator, params = method_call(receiver)
+                    if (iterator == "iter" and not params and len(base) == 1
+                            and base[0].text in recorders):
+                        positive[base[0].text].append(line)
                 expression = shape(args[0])
                 if expression and expression[0] in recorders and expression[1:] == (".", "is_empty", "("):
                     negative.setdefault(expression[0], []).append(line)
             else:
                 continue
-            if op in {"==", "!="} and shape(left) == shape(right):
+            if self.self_comparison(op, left, right, line, test_name, line_comments):
                 findings.append((line, "self-compare"))
             if op == "==" and self.coupled(left, right, line, pins, strings):
                 findings.append((line, "self-derived-expected"))
@@ -1816,17 +1984,33 @@ class Inspect:
                 elif ((ordered == "==" and ((value is not UNKNOWN and bool(value)) or nonempty_vector))
                       or (ordered in {"!=", ">"} and value in (0, [], ()))
                       or (ordered == ">=" and type(value) is int and value > 0)):
-                    positive.add(subject)
-        for name in recorders - positive:
+                    positive[subject].append(line)
+        controlled = {producer for name, lines in positive.items()
+                      for producer, call_line in self.recorder_inputs[name]
+                      if name not in self.writes
+                      and all(key == producer for key, _ in self.recorder_inputs[name])
+                      and any(call_line <= line for line in lines)}
+        checked_sources = set(self.checked_iteration_sources())
+        for name in recorders - positive.keys():
             if name in negative:
-                findings.extend((line, "absence-no-control") for line in negative[name])
+                sites = self.collector_writes[name]
+                failure_collector = sites and not self.recorder_inputs[name] and all(
+                    mismatch and checked_sources.issuperset(path) for path, mismatch in sites)
+                if not failure_collector:
+                    findings.extend((line, "absence-no-control") for line in negative[name]
+                                    if not any(key in controlled and call_line <= line
+                                               for key, call_line in self.recorder_inputs[name]))
             elif name in self.writes and name not in self.reads:
                 findings.append((self.writes[name], "absence-no-control"))
+        for name, (line, kind) in self.callback_writes.items():
+            if initializers.get(name) == kind and name not in self.reads:
+                findings.append((line, "absence-no-control"))
         return findings, measured
 
 
 def parse(source, path):
     tokens, comments = tokenize(source)
+    line_comments = {comment.line: comment.text for comment in comments}
     tests = []
     grouped = group(tokens)
     found = list(test_functions(grouped))
@@ -1859,7 +2043,7 @@ def parse(source, path):
     for test, inspector, panic, ignored, body in inspected:
         strings = {value for token in walk_tokens(body.children)
                    if token.kind in {"quoted", "raw"} and isinstance(value := literal((token,)), str)}
-        test.issues, test.measured = inspector.issues(test.name, pins, strings)
+        test.issues, test.measured = inspector.issues(test.name, pins, strings, line_comments)
         if not (panic or ignored or evidence.checks(body.children, tuple(test.identifier.split("::")))):
             test.issues.append((test.line, "no-assert"))
         test.guarded = bool(inspector.checks) and not panic and all(

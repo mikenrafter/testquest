@@ -7,7 +7,7 @@ import sys
 import tokenize
 
 from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, argument_claims, helper, loose_bounds, named_arguments,
-                   prefix_satisfies, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
+                   prefix_satisfies, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
                    path_directories, pins_path)
 from .source import Comment, Test
 
@@ -17,6 +17,14 @@ def name_of(node):
         return node.id
     if isinstance(node, ast.Attribute):
         return ".".join(filter(None, (name_of(node.value), node.attr)))
+    return ""
+
+
+def binding_path(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute) and (receiver := binding_path(node.value)):
+        return receiver + "." + node.attr
     return ""
 
 
@@ -165,6 +173,8 @@ class Inspect(ast.NodeVisitor):
         self.bindings = defaultdict(list)
         self.writes = {}
         self.reads = set()
+        self.recorder_sites = defaultdict(set)
+        self.callback_writes = {}
         self.guards = []
         self.output_loops = {}
         self.constraints = set()
@@ -173,6 +183,11 @@ class Inspect(ast.NodeVisitor):
     def visit_FunctionDef(self, node):
         # Closures can record effects, but their assertions need an actual call.
         self.record_uses(node)
+        parts = tuple(body_nodes(node.body))
+        captured = {name for part in parts if isinstance(part, ast.Nonlocal) for name in part.names}
+        for part in parts:
+            if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store) and part.id in captured:
+                self.callback_writes.setdefault(part.id, part.lineno)
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
@@ -183,6 +198,7 @@ class Inspect(ast.NodeVisitor):
                     and isinstance(child.value, ast.Name)):
                 recording_receivers.add(id(child.value))
                 self.writes.setdefault(child.value.id, child.lineno)
+                self.recorder_sites[child.value.id].add(child)
         self.reads.update(child.id for child in ast.walk(node)
                           if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
                           and id(child) not in recording_receivers)
@@ -769,19 +785,103 @@ class Inspect(ast.NodeVisitor):
             if isinstance(node, ast.Call) and name_of(node.func).rsplit(".", 1)[-1][:1].isupper():
                 yield id(node)
 
-    def issues(self, test_name, pins, strings):
+    def alias_path(self, operand, line):
+        path = binding_path(operand)
+        if not path:
+            return ""
+        root, _, suffix = path.partition(".")
+        prior = [(pos, value) for pos, value in self.bindings.get(root, ()) if pos < line]
+        if len(prior) == 1 and prior[0][1] in self.alias_stores:
+            start, value = prior[0]
+            if target := binding_path(value):
+                source = self.alias_path(value, start)
+                if source and not any(
+                        start < pos <= line and name in {root, target.split(".")[0],
+                                                       source.split(".")[0]}
+                        for pos, name in self.alias_changes):
+                    return ".".join(filter(None, (source, suffix)))
+        return path
+
+    def self_comparison(self, op, left, right, line, test_name, line_comments):
+        if op not in {ast.Eq, ast.Is, ast.NotEq, ast.IsNot}:
+            return False
+        if not same(left, right):
+            path = self.alias_path(left, line)
+            return bool(path) and path == self.alias_path(right, line)
+        if op is not ast.Eq or not any(isinstance(part, ast.Call) for part in ast.walk(left)):
+            return True
+        if REPEATABILITY.search(test_name) or REPEATABILITY.search(line_comments.get(line, "")):
+            return False
+        for other_line, node, _ in self.checks:
+            if other_line == line:
+                continue
+            operator, first, second = comparison(node)
+            for call, other in ((first, second), (second, first)):
+                if call is not None and same(call, left) and (
+                        operator is ast.NotEq and not same(call, other) or
+                        operator is ast.Eq and literal(self.resolve(other, other_line)) is not UNKNOWN):
+                    return False
+        return True
+
+    def failure_collector(self, name):
+        sites = self.recorder_sites[name]
+        if not sites:
+            return False
+        for site in sites:
+            comparison_branch = False
+            while site in self.iterables.parents:
+                site, field = self.iterables.parents[site]
+                if isinstance(site, ast.If) and field in {"body", "orelse"}:
+                    if comparison(site.test)[0] not in {ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE}:
+                        return False
+                    comparison_branch = True
+                elif isinstance(site, (ast.For, ast.AsyncFor)):
+                    if isinstance(site, ast.AsyncFor) or not self.iterables.nonempty(site.iter):
+                        return False
+                elif isinstance(site, (ast.While, ast.Match, ast.Try, ast.TryStar)):
+                    return False
+            if not comparison_branch:
+                return False
+        return True
+
+    def recorder_producers(self, recorders):
+        producers = defaultdict(set)
+        for call in self.calls:
+            callee = binding_path(call.func)
+            if not callee:
+                continue
+            for slot, argument in call_arguments(call).items():
+                if (isinstance(argument, ast.Attribute) and argument.attr in RECORDING_METHODS
+                        and name_of(argument.value) in recorders):
+                    producers[name_of(argument.value)].add(((callee, slot, argument.attr), call.lineno))
+        return producers
+
+    def issues(self, test_name, pins, strings, line_comments):
         findings = []
+        statements = self.iterables.parents
+        self.alias_stores = {value for node, _, value in assignments(statements)
+                             if isinstance(statements[node][0], (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.alias_changes = set()
+        for part in statements:
+            if isinstance(part, (ast.Name, ast.Attribute, ast.Subscript)) and isinstance(part.ctx, (ast.Store, ast.Del)):
+                path = binding_path(part.value if isinstance(part, ast.Subscript) else part)
+            elif isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute):
+                path = binding_path(part.func.value)
+            else:
+                continue
+            if path:
+                self.alias_changes.add((part.lineno, path.split(".")[0]))
         recorders = {name for name, bindings in self.bindings.items()
                      if isinstance(bindings[0][1], ast.List) and not bindings[0][1].elts}
         negative = defaultdict(list)
-        positive = set()
+        positive = defaultdict(list)
         for line, node, _ in self.checks:
             if node is None:
                 continue
             operator, left, right = comparison(node)
             if constant_truth(node):
                 findings.append((line, "const-truth"))
-            if operator in {ast.Eq, ast.Is, ast.NotEq, ast.IsNot} and same(left, right):
+            if self.self_comparison(operator, left, right, line, test_name, line_comments):
                 findings.append((line, "self-compare"))
             if operator is ast.Eq and self.coupled(left, right, line, pins, strings):
                 findings.append((line, "self-derived-expected"))
@@ -794,7 +894,7 @@ class Inspect(ast.NodeVisitor):
                 if recorder:
                     negative[recorder].append(line)
             if isinstance(node, ast.Name) and node.id in recorders:
-                positive.add(node.id)
+                positive[node.id].append(line)
             for operand, other, ordered in ((left, right, operator), (right, left, {
                     ast.Lt: ast.Gt, ast.LtE: ast.GtE, ast.Gt: ast.Lt, ast.GtE: ast.LtE,
                 }.get(operator, operator))):
@@ -810,13 +910,31 @@ class Inspect(ast.NodeVisitor):
                       or (ordered is ast.NotEq and value in ([], (), 0, False))
                       or (ordered is ast.Gt and type(value) is int and value >= 0)
                       or (ordered is ast.GtE and type(value) is int and value > 0)):
-                    positive.add(recorder)
+                    positive[recorder].append(line)
 
-        for name in recorders - positive:
+        producers = self.recorder_producers(recorders)
+        controlled = set()
+        for name, lines in positive.items():
+            keys = {key for key, _ in producers[name]}
+            if len(keys) != 1 or any(
+                    isinstance(parent, ast.Call) and parent.func is site
+                    for site in self.recorder_sites[name]
+                    if (parent := self.iterables.parents.get(site, (None, ""))[0]) is not None):
+                continue
+            if min(call_line for _, call_line in producers[name]) <= max(lines):
+                controlled.update(keys)
+        for name in recorders - positive.keys():
             if name in negative:
-                findings.extend((line, "absence-no-control") for line in negative[name])
+                if not self.failure_collector(name):
+                    findings.extend((line, "absence-no-control") for line in negative[name]
+                                    if not any(key in controlled and call_line <= line
+                                               for key, call_line in producers[name]))
             elif name in self.writes and name not in self.reads:
                 findings.append((self.writes[name], "absence-no-control"))
+        for name, line in self.callback_writes.items():
+            bindings = self.bindings.get(name)
+            if bindings and name not in self.reads and literal(bindings[0][1]) in (False, 0):
+                findings.append((line, "absence-no-control"))
         findings.extend((line, "nondistinguishing-literal") for line in self.literal_issues(test_name))
         return findings
 
@@ -1193,6 +1311,7 @@ def parse(source, path):
         for kind, text, start, _, raw in tokenize.generate_tokens(io.StringIO(source).readline)
         if kind == tokenize.COMMENT
     ]
+    line_comments = {comment.line: comment.text for comment in comments}
     imports = imports_in(tree.body)
     module_constants = ModuleConstants(path)
 
@@ -1246,7 +1365,7 @@ def parse(source, path):
     for test, inspector, node in inspected:
         strings = {part.value for part in body_nodes(node.body)
                    if isinstance(part, ast.Constant) and isinstance(part.value, str)}
-        test.issues = inspector.issues(test.name, pins, strings)
+        test.issues = inspector.issues(test.name, pins, strings, line_comments)
         scope = (*inspector.owner, node.name)
         if not any(isinstance(part, ast.Assert)
                    or (isinstance(part, ast.Raise) and raises_assertion(part))
