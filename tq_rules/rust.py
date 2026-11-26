@@ -2,7 +2,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import re
 
-from .lint import (UNKNOWN, SuffixedNumber, assertion, fixed_boundary, helper, loose_bounds,
+from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, fixed_boundary, helper, loose_bounds,
                    named_arguments, symmetric_input, unvaried_arguments)
 from .source import Comment, Test
 
@@ -554,11 +554,35 @@ def expected_constructors(tokens, *, expected=False):
             yield from expected_constructors(token.children, expected=in_expected)
 
 
+def test_only(tokens, index):
+    while index:
+        previous = tokens[index - 1]
+        if previous.text in {"pub", "async", "unsafe", "const"} or (
+                previous.text == "(" and index >= 2 and tokens[index - 2].text == "pub"):
+            index -= 1
+        elif previous.text == "[" and index >= 2 and tokens[index - 2].text == "#":
+            attribute = shape(previous.children)
+            if test_attribute(attribute) or attribute == ("cfg", ("(", ("test",))):
+                return True
+            index -= 2
+        else:
+            break
+    return False
+
+
+def test_module(name):
+    return (name in {"test", "tests"} or name.startswith("test_")
+            or name.endswith(("_test", "_tests")))
+
+
 class FileIterables:
-    def __init__(self, tokens):
+    def __init__(self, tokens, path, parameters):
         self.definitions = {}
         self.aliases = {}
         self.globs = defaultdict(list)
+        self.test_items = set()
+        self.test_file = test_module(path.stem) or any(map(test_module, path.parent.parts))
+        self.parameters = parameters
         self.index(tokens, ())
 
     def add(self, name, kind, value):
@@ -582,8 +606,14 @@ class FileIterables:
                         self.globs[scope].append(absolute_path(scope, name))
             elif token.text in {"mod", "impl"}:
                 head = tokens[index + 1:index + 3]
-                if len(head) == 2 and head[0].kind == "word" and head[1].text == "{":
-                    self.index(head[1].children, (*scope, head[0].text))
+                if len(head) == 2 and head[0].kind == "word":
+                    child = (*scope, head[0].text)
+                    if self.test_file or test_module(head[0].text) or test_only(tokens, index):
+                        self.test_items.add(child)
+                    if head[1].text == "{":
+                        self.index(head[1].children, child)
+            elif token.text == "fn" and index + 1 < len(tokens) and test_only(tokens, index):
+                self.test_items.add((*scope, tokens[index + 1].text))
         for name, body in function_bodies(tokens):
             self.add((*scope, name), "helper", return_expression(body))
 
@@ -600,6 +630,25 @@ class FileIterables:
         matches = [(*path, *name) for path in self.globs.get(scope, ())
                    if (*path, *name) in self.definitions]
         return matches[0] if len(matches) == 1 else ()
+
+    def production(self, path):
+        return (not (self.test_file and path in self.definitions)
+                and all(path[:depth] not in self.test_items for depth in range(1, len(path) + 1)))
+
+    def shares_constant(self, callee, expected):
+        if (not expected or expected[:-1] != callee[:-1]
+                or self.definitions.get(expected, ("", ()))[0] != "constant"
+                or not self.production(expected)):
+            return False
+        kind, body = self.definitions.get(callee, ("", ()))
+        if kind != "helper":
+            return False
+        scope = callee[:-1]
+        local = {token.text for token in declared_bindings(body)}
+        local.update(self.parameters.get(callee, {}).values())
+        return any((len(name) > 1 or name[0] not in local)
+                   and (scope + name[1:] if name[0] == "Self" else self.resolve(scope, name)) == expected
+                   for name in constant_references(body))
 
     def lookup(self, scope, name, kind):
         if not name:
@@ -643,11 +692,52 @@ def mutated_names(tokens):
 
 
 def pattern_names(tokens):
+    return (token.text for token in binding_tokens(tokens))
+
+
+ORACLE_METHODS = {"to_json", "tobytes", "to_string", "clone", "iter", "into_iter", "collect",
+                  "read_bytes", "read_to_string", "as_str", "as_slice", "as_ref", "as_bytes",
+                  "unwrap", "expect"}
+ORACLE_OPERATORS = {"+", "-", "*", "/", "%", "|", "^"}
+ORACLE_FUNCTIONS = {("std", "fs", "read"), ("std", "fs", "read_to_string"),
+                    ("serde_json", "to_string"), ("serde_json", "to_vec"), ("serde_json", "to_value")}
+
+
+def binding_tokens(tokens):
     for token in tokens:
         if token.kind == "group":
-            yield from pattern_names(token.children)
+            yield from binding_tokens(token.children)
         elif token.kind == "word" and token.text not in {"mut", "ref", "_"}:
-            yield token.text
+            yield token
+
+
+def declared_bindings(tokens):
+    for index, token in enumerate(tokens):
+        if token.text in {"let", "const", "static"}:
+            end = next((i for i in range(index + 1, len(tokens))
+                        if tokens[i].text in {"=", ":", ";"}), len(tokens))
+            yield from binding_tokens(tokens[index + 1:end])
+        elif token.kind == "group":
+            yield from declared_bindings(token.children)
+
+
+def constant_references(tokens):
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.kind == "group":
+            yield from constant_references(token.children)
+        elif token.kind == "word" and (not index or tokens[index - 1].text != "."):
+            end = index + 1
+            while (end + 1 < len(tokens) and tokens[end].text == "::"
+                   and tokens[end + 1].kind == "word"):
+                end += 2
+            path = qualified_name(tokens[index:end])
+            if path[-1].isupper():
+                yield path
+            index = end
+            continue
+        index += 1
 
 
 class Inspect:
@@ -666,6 +756,7 @@ class Inspect:
         self.symmetric_calls = defaultdict(list)
         self.parameters = parameters
         self.local_parameters = local_parameters
+        self.oracle_locals = {}
         self.expected = set()
         self.calls = defaultdict(list)
         self.check_arguments = []
@@ -782,31 +873,82 @@ class Inspect:
             line = min(line - 1, tokens[0].line) if tokens else line - 1
         return tokens
 
-    def origin(self, tokens):
-        if len(tokens) < 2 or tokens[-1].text != "(":
-            return "", ""
-        call = tokens[:-1]
-        if not all(token.kind == "word" or token.text == "::" for token in call):
-            return "", ""
-        path = tuple(token.text for token in call if token.kind == "word")
-        if not path:
-            return "", ""
-        path = (*self.aliases.get(path[0], path[:1]), *path[1:])
-        if path[0] in {"std", "core", "alloc"} or any(part[:1].isupper() for part in path):
-            return "", ""
-        return "::".join(path), "::".join(path[:-1])
+    def oracle_path(self, name, line):
+        if (not name or name[0] in self.local_parameters
+                or self.oracle_locals.get(name[0], line + 1) <= line):
+            return ()
+        found = self.file_iterables.resolve(self.scope, name)
+        if found:
+            return found
+        return (*self.aliases.get(name[0], name[:1]), *name[1:])
+
+    def oracle_calls(self, tokens, line, seen=frozenset()):
+        while tokens and tokens[0].text in {"&", "mut", "*"}:
+            tokens = tokens[1:]
+        if not tokens or id(tokens[0]) in seen:
+            return None
+        if len(tokens) == 1 and tokens[0].kind == "word":
+            seen = seen | {id(tokens[0])}
+        tokens = self.resolve(tokens, line)
+        if not tokens:
+            return None
+        line = tokens[0].line
+        if len(tokens) == 1 and tokens[0].text == "(":
+            return self.oracle_calls(tokens[0].children, line, seen)
+        # Expression groups already hide operators inside call arguments and indexes.
+        for index in range(1, len(tokens) - 1):
+            if tokens[index].text in ORACLE_OPERATORS:
+                left = self.oracle_calls(tokens[:index], line, seen)
+                right = self.oracle_calls(tokens[index + 1:], line, seen)
+                return left | right if left is not None and right is not None else None
+        if tokens[-1].text == "[" or (len(tokens) >= 3 and tokens[-2].text == "."):
+            return self.oracle_calls(tokens[:-1] if tokens[-1].text == "[" else tokens[:-2], line, seen)
+        if tokens[-1].text == "(":
+            member = next((i for i in range(len(tokens) - 3, 0, -1) if tokens[i].text == "."), 0)
+            if member and tokens[member + 1].text in ORACLE_METHODS:
+                return self.oracle_calls(tokens[:member], line, seen)
+            name = qualified_name(tokens[:-1])
+            path = self.oracle_path(name, line)
+            if path in ORACLE_FUNCTIONS:
+                first = next(iter(split(tokens[-1].children)), ())
+                return self.oracle_calls(first, line, seen)
+            if (path and path[0] not in {"std", "core", "alloc"}
+                    and not any(map(test_module, path[:-1]))
+                    and self.file_iterables.production(path)
+                    and (self.file_iterables.definitions.get(path, ("", ()))[0] == "helper"
+                         or (len(path) >= 2 and all(not part[:1].isupper() for part in path)))):
+                return {path}
+        if literal(tokens, signed_and_float=True) is not UNKNOWN or self.oracle_constant(tokens, line):
+            return set()
+        return None
+
+    def oracle_constant(self, tokens, line):
+        tokens = self.resolve(tokens, line)
+        if tokens and tokens[-1].text == "[":
+            tokens = tokens[:-1]
+        path = self.oracle_path(qualified_name(tokens), tokens[0].line) if tokens else ()
+        return path if path and self.file_iterables.definitions.get(path, ("", ()))[0] == "constant" else ()
+
+    def uses_operand(self, value, other, line):
+        if (not other or other[0].kind != "word"
+                or len(other) > 1 and other[1].text not in {"[", "."}):
+            return False
+        value = self.resolve(value, line)
+        if len(value) > 1 and value[0].kind == "word" and value[1].text in {"[", "."}:
+            value = self.resolve(value[:1], value[0].line)
+        return any(token.text == other[0].text
+                   for part in value if part.text == "("
+                   for token in check_arguments(part.children) if token.kind == "word")
 
     def coupled(self, left, right, line):
-        actual, expected = self.resolve(left, line), self.resolve(right, line)
-        first, first_module = self.origin(actual)
-        second, second_module = self.origin(expected)
-        if not ((first and first == second) or (first_module and first_module == second_module)):
-            return False
-        if (shape(actual) == shape(expected) and shape(left) != shape(right)
-                and any(word in first.rsplit("::", 1)[-1]
-                        for word in ("read", "snapshot", "digest", "identity", "listing", "tree"))):
-            return False
-        return True
+        actual = self.oracle_calls(left, line)
+        expected = self.oracle_calls(right, line)
+        return (different_callees(actual, expected)
+                and not (self.uses_operand(left, right, line) or self.uses_operand(right, left, line))
+                or (actual and len(actual) == 1 and self.file_iterables.shares_constant(
+                    next(iter(actual)), self.oracle_constant(right, line)))
+                or (expected and len(expected) == 1 and self.file_iterables.shares_constant(
+                    next(iter(expected)), self.oracle_constant(left, line))))
 
     def observed_calls(self, tokens, line, seen=frozenset()):
         while tokens and tokens[0].text in {"!", "&", "mut", "*"}:
@@ -983,8 +1125,8 @@ def parse(source, path):
         return tests, comments
     test_bodies = {id(body) for _, _, _, _, body, _, _, _ in found}
     helpers = {}
-    file_iterables = FileIterables(grouped)
     parameters = dict(file_parameters(grouped))
+    file_iterables = FileIterables(grouped, path, parameters)
     for token, name, identifier, start, body, panic, aliases, scope in found:
         if scope is not None and id(scope) not in helpers:
             helpers[id(scope)] = checking_helpers(scope, test_bodies)
@@ -996,6 +1138,8 @@ def parse(source, path):
         inspector = Inspect(aliases, helpers.get(id(scope), frozenset()), file_iterables,
                             namespace, set(mutated_names(body.children)), parameters,
                             dict(parameter_names(body.children)))
+        for local in declared_bindings(body.children):
+            inspector.oracle_locals.setdefault(local.text, local.line)
         inspector.visit(body.children)
         test.issues, test.measured = inspector.issues(name)
         if not inspector.checks and not panic:

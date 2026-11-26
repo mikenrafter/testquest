@@ -26,7 +26,7 @@ RULES = {
         "An independent observation in the same test establishes that the recorder can fire.",
     ),
     "self-derived-expected": (
-        "Actual and expected values come from the same function or module.",
+        "The expected value reuses production code from the module under test.",
         "The test checks repeatability, a before-and-after observation, or a declared relation between different inputs or entry points.",
     ),
     "nondistinguishing-literal": (
@@ -268,3 +268,9 @@ def find(paths):
                 rows.append(finding(path, line, rule, ("advisory: " if advisory else "") + RULES[rule][0],
                                     "advisory" if advisory else "error"))
     return sorted(rows, key=lambda row: (row["path"], row["line"], row["rule"]))
+
+
+def different_callees(actual, expected):
+    return (actual and expected and min(len(actual), len(expected)) == 1
+            and actual.isdisjoint(expected)
+            and len({path[:-1] for path in actual | expected}) == 1)

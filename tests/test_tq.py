@@ -315,7 +315,7 @@ class LintTests(TqCase):
 
     def test_python_expected_value_provenance(self):
         # WHY: tracking the source of each operand through locals exposes circular evidence.
-        # catches: detecting repeated calls only when both appear directly in the assertion
+        # catches: flagging repeatability or missing distinct same-module calls through locals
         self.check_lint("""
             import codec
             import reference
@@ -338,7 +338,7 @@ class LintTests(TqCase):
             def test_literal():
                 actual = codec.encode(frame)
                 assert actual == b"\\x03\\x14"
-            """, "self-derived-expected", ("# same function", "# same module"))
+            """, "self-derived-expected", ("# same module",))
 
     def test_rust_expected_value_provenance(self):
         # WHY: a different module named reference supplies an independent result.

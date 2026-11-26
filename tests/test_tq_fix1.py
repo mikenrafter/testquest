@@ -227,14 +227,14 @@ class AdvisoryRules(contract.TqCase):
                          [("const-truth", "error"), ("nondistinguishing-literal", "advisory")])
 
     def test_self_derived_expected_is_advisory_too(self):
-        # WHY: dogfood hits were mostly repeatability checks the rule itself allows.
+        # WHY: a circular oracle is advice and should leave the lint exit code at zero.
         # catches: marking only one of the two advisory rules.
         self.write("derived_test.py", """
             import codec
 
-            def test_same_function():
+            def test_same_module():
                 actual = codec.encode(1)
-                expected = codec.encode(2)
+                expected = codec.reference_bytes(1)
                 assert actual == expected
             """)
         rows = json.loads(self.tq("lint", "derived_test.py", "--json"))

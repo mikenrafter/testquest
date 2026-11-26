@@ -2,10 +2,11 @@ import ast
 import builtins
 from collections import ChainMap, Counter, defaultdict
 import io
+from pathlib import Path
 import sys
 import tokenize
 
-from .lint import (UNKNOWN, assertion, fixed_boundary, helper, loose_bounds, named_arguments,
+from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, helper, loose_bounds, named_arguments,
                    symmetric_input, unvaried_arguments)
 from .source import Comment, Test
 
@@ -133,13 +134,21 @@ OBSERVERS = {"len", "set", "list", "sorted", "tuple", "str", "bool", "int", "byt
              "float", "dict", "repr", "iter", "reversed"}
 
 
+ORACLE_METHODS = {"to_json", "tobytes", "to_string", "clone", "read_bytes", "read_text",
+                  "read_to_string"}
+ORACLE_FUNCTIONS = {"json.dumps", "json.loads"}
+
+
 class Inspect(ast.NodeVisitor):
-    def __init__(self, imports, checking_helpers, local_helpers, iterables, parameters):
+    def __init__(self, imports, checking_helpers, local_helpers, iterables, parameters,
+                 oracle_imports, module_constants):
         self.imports = imports
         self.checking_helpers = checking_helpers
         self.local_helpers = local_helpers
         self.iterables = iterables
         self.parameters = parameters
+        self.oracle_imports = oracle_imports
+        self.module_constants = module_constants
         self.checks = []
         self.calls = []
         self.check_arguments = []
@@ -292,35 +301,81 @@ class Inspect(ast.NodeVisitor):
             line, node = prior[0]
         return node
 
-    def origin(self, value):
-        if not isinstance(value, ast.Call):
-            return "", ""
-        name = name_of(value.func)
-        root, dot, suffix = name.partition(".")
-        if root in self.imports:
-            name = self.imports[root] + dot + suffix
-            module = name.rpartition(".")[0]
-            if not name.rsplit(".", 1)[-1][:1].isupper() and name.split(".")[0] not in sys.stdlib_module_names:
-                return name, module
-        elif not dot and name not in OBSERVERS:
-            return name, ""
-        return "", ""
+    def imported_name(self, value):
+        root, dot, suffix = name_of(value).partition(".")
+        imported = self.oracle_imports.get(root)
+        return imported + dot + suffix if imported else ""
+
+    def oracle_calls(self, value, line):
+        value = self.resolve(value, line)
+        if isinstance(value, ast.Call):
+            name = name_of(value.func)
+            imported = self.imported_name(value.func)
+            builtin = (isinstance(value.func, ast.Name) and name in OBSERVERS
+                       and name not in self.iterables.changed and name not in self.local_helpers
+                       and name not in self.oracle_imports)
+            if builtin or imported in ORACLE_FUNCTIONS or imported.endswith(".to_json"):
+                return self.oracle_calls(value.args[0], value.lineno) if value.args else None
+            if isinstance(value.func, ast.Attribute) and value.func.attr in ORACLE_METHODS:
+                return self.oracle_calls(value.func.value, value.lineno)
+            path = tuple(imported.split("."))
+            if (len(path) >= 2 and path[0] not in sys.stdlib_module_names
+                    and not path[-1][:1].isupper()
+                    and not any(part in {"test", "tests", "conftest"} or part.startswith("test_")
+                                for part in path[:-1])):
+                return {path}
+        elif isinstance(value, ast.Constant):
+            return set()
+        elif isinstance(value, ast.BinOp):
+            return self.composed_calls((value.left, value.right), value.lineno)
+        elif isinstance(value, ast.JoinedStr):
+            return self.composed_calls(value.values, value.lineno)
+        elif isinstance(value, ast.FormattedValue):
+            return self.oracle_calls(value.value, value.lineno)
+        elif isinstance(value, (ast.Subscript, ast.Attribute)):
+            if self.imported_name(value).rsplit(".", 1)[-1].isupper():
+                return set()
+            return self.oracle_calls(value.value, value.lineno)
+        return None
+
+    def composed_calls(self, values, line):
+        paths = set()
+        for value in values:
+            calls = self.oracle_calls(value, line)
+            if calls is None:
+                return None
+            paths.update(calls)
+        return paths
+
+    def oracle_constant(self, value, line):
+        value = self.resolve(value, line)
+        while isinstance(value, ast.Subscript):
+            value = self.resolve(value.value, value.lineno)
+        return self.imported_name(value)
+
+    def uses_operand(self, value, other, line):
+        while isinstance(other, (ast.Attribute, ast.Subscript)):
+            other = other.value
+        value = self.resolve(value, line)
+        while isinstance(value, (ast.Attribute, ast.Subscript)):
+            value = self.resolve(value.value, value.lineno)
+        return isinstance(other, ast.Name) and any(
+            isinstance(node, ast.Name) and node.id == other.id
+            for call in body_nodes((value,))
+            if isinstance(call, ast.Call)
+            for part in call_arguments(call).values()
+            for node in body_nodes((part,))
+        )
 
     def coupled(self, left, right, line):
-        actual, expected = self.resolve(left, line), self.resolve(right, line)
-        first, first_module = self.origin(actual)
-        second, second_module = self.origin(expected)
-        if not ((first and first == second) or (first_module and first_module == second_module)):
-            return False
-        # A second application to the first result tests idempotence.
-        if any(same(arg, right) for arg in actual.args) or any(same(arg, left) for arg in expected.args):
-            return False
-        # An explicit before/after snapshot observes an intervening action.
-        if (same(actual, expected) and not same(left, right)
-                and any(word in first.rsplit(".", 1)[-1]
-                        for word in ("read", "snapshot", "digest", "identity", "getstate"))):
-            return False
-        return True
+        actual = self.oracle_calls(left, line)
+        expected = self.oracle_calls(right, line)
+        return (different_callees(actual, expected)
+                and not (self.uses_operand(left, right, line) or self.uses_operand(right, left, line))
+                or (actual and len(actual) == 1
+                    and self.module_constants.shared(next(iter(actual)), self.oracle_constant(right, line)))
+                or (expected and len(expected) == 1
+                    and self.module_constants.shared(next(iter(expected)), self.oracle_constant(left, line))))
 
     def recorder(self, node, recorders):
         if name_of(node) in recorders:
@@ -714,6 +769,82 @@ def checking_helpers(tree):
         checked.update(found)
 
 
+def imports_in(statements):
+    imports = {}
+    for node in statements:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                imports[alias.asname or root] = alias.name if alias.asname else root
+        elif isinstance(node, ast.ImportFrom):
+            prefix = "." * node.level + (node.module + "." if node.module else "")
+            for alias in node.names:
+                imports[alias.asname or alias.name] = prefix + alias.name
+
+    return imports
+
+
+class ModuleConstants:
+    def __init__(self, path):
+        self.path = Path(path).absolute()
+        self.modules = {}
+
+    @staticmethod
+    def module_file(root, module):
+        stem = root.joinpath(*module)
+        candidates = (stem.with_suffix(".py"), stem / "__init__.py") if module else (stem / "__init__.py",)
+        return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+    def source(self, module):
+        if not module[0]:
+            levels = next((index for index, part in enumerate(module) if part), len(module))
+            if levels <= len(self.path.parents):
+                return self.module_file(self.path.parents[levels - 1], module[levels:])
+            return None
+        for parent in self.path.parents:
+            for root in (parent, parent / "src"):
+                if candidate := self.module_file(root, module):
+                    return candidate
+            if (parent / ".git").exists() or (parent / "pyproject.toml").is_file():
+                break
+        return None
+
+    def dependencies(self, module):
+        source = self.source(module)
+        if source is None or source == self.path:
+            return {}
+        try:
+            with tokenize.open(source) as stream:
+                tree = ast.parse(stream.read(), filename=str(source))
+        except (OSError, SyntaxError, UnicodeError, LookupError):
+            return {}
+
+        names = scope_changes(tree.body)
+        constants = {target.id for _, target, _ in assignments(tree.body)
+                     if isinstance(target, ast.Name) and target.id.isupper()
+                     and names[target.id] == 1}
+        reads = {}
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or names[node.name] != 1:
+                continue
+            local = set(scope_changes(node.body)) | set(parameter_names(node).values())
+            local.update(arg.arg for arg in (node.args.vararg, node.args.kwarg) if arg)
+            available = constants - local
+            reads[node.name] = {part.id for part in body_nodes(node.body)
+                                if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Load)
+                                and part.id in available}
+        return reads
+
+    def shared(self, callee, expected):
+        module, name = callee[:-1], callee[-1]
+        owner, _, constant = expected.rpartition(".")
+        if not constant.isupper() or owner != ".".join(module):
+            return False
+        if module not in self.modules:
+            self.modules[module] = self.dependencies(module)
+        return constant in self.modules[module].get(name, ())
+
+
 def parse(source, path):
     tree = ast.parse(source, filename=str(path))
     comments = [
@@ -721,16 +852,8 @@ def parse(source, path):
         for kind, text, start, _, raw in tokenize.generate_tokens(io.StringIO(source).readline)
         if kind == tokenize.COMMENT
     ]
-    imports = {}
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".")[0]
-                imports[alias.asname or root] = alias.name if alias.asname else root
-        elif isinstance(node, ast.ImportFrom):
-            module = "." * node.level + (node.module or "")
-            for alias in node.names:
-                imports[alias.asname or alias.name] = module + "." + alias.name
+    imports = imports_in(tree.body)
+    module_constants = ModuleConstants(path)
 
     checks_in, definitions = checking_helpers(tree)
     parameters, methods = file_parameters(definitions)
@@ -745,7 +868,12 @@ def parse(source, path):
         local_parameters = {local.name: parameter_names(local) for local in node.body
                           if isinstance(local, (ast.FunctionDef, ast.AsyncFunctionDef))}
         test_parameters = ChainMap(local_parameters, methods.get(parents, {}), parameters)
-        inspector = Inspect(imports, checks_in(parents), local_helpers, iterables, test_parameters)
+        oracle_imports = {name: module for name, module in imports.items()
+                          if module_names[name] == 1 and name not in iterables.changed}
+        oracle_imports.update((name, module) for name, module in imports_in(node.body).items()
+                              if iterables.changed[name] == 1)
+        inspector = Inspect(imports, checks_in(parents), local_helpers, iterables, test_parameters,
+                            oracle_imports, module_constants)
         for statement in node.body:
             inspector.record_uses(statement)
             inspector.visit(statement)
