@@ -6,6 +6,22 @@ import sys
 from . import catches, lint, props, risk, witness
 
 
+DIAGNOSTIC_RULES = {
+    "invalid-suppression": (
+        "A lint suppression names an unknown rule or gives no reason.",
+        "Name a supported lint rule and give a reason for the exception.",
+    ),
+    "missing-witness": (
+        "A conditional test has no evidence that its condition is reached.",
+        "Name another scanned test that reaches the condition, or measure coverage in this test.",
+    ),
+    "parse-error": (
+        "A source file could not be parsed.",
+        "Fix the source or its encoding before scanning. This diagnostic cannot be suppressed.",
+    ),
+}
+
+
 def print_findings(rows, as_json):
     if as_json:
         print(json.dumps(rows, indent=2))
@@ -23,7 +39,7 @@ def main():
         scan = commands.add_parser(name, help=help_text)
         scan.add_argument("paths", nargs="+")
         scan.add_argument("--json", action="store_true")
-    commands.add_parser("rules", help="Show lint rules and exceptions.")
+    commands.add_parser("rules", help="Show finding rules and exceptions.")
     replay = commands.add_parser("catches", help="Replay named faults in a temporary copy.")
     replay.add_argument("--repo", default=".")
     replay.add_argument("--worktree", action="store_true")
@@ -83,7 +99,7 @@ def main():
                     for citation in record["evidence"]:
                         print("  {source} ({section})".format(**citation))
         if options.command == "rules":
-            for name, (message, allowed) in sorted(lint.RULES.items()):
+            for name, (message, allowed) in sorted((lint.RULES | DIAGNOSTIC_RULES).items()):
                 level = "advisory" if name in lint.ADVISORY else "error"
                 print(f"{name}  {message}\n  level: {level}\n  allowed-when: {allowed}")
     except (OSError, ValueError, SyntaxError, subprocess.SubprocessError) as error:

@@ -190,7 +190,7 @@ def test_attribute(name):
         part == "::" if index % 2 else part.isidentifier() for index, part in enumerate(name[:-1]))
 
 
-def test_functions(tokens, namespace=(), imports=None):
+def test_functions(tokens, namespace=(), imports=None, *, module_scope=True):
     aliases = dict(imports or ())
     aliases.update((alias, path) for path, alias in imports_in(tokens))
     attributes = []
@@ -212,7 +212,8 @@ def test_functions(tokens, namespace=(), imports=None):
                     if body.text == "{" and body.kind == "group":
                         panic = any(name and name[0] == "should_panic" for name in names)
                         name = tokens[index + 1].text
-                        yield token, name, "::".join((*namespace, name)), attributes[0][0].line, body, panic, aliases
+                        scope = tokens if module_scope else None
+                        yield token, name, "::".join((*namespace, name)), attributes[0][0].line, body, panic, aliases, scope
                         index = body_index
                         break
             attributes.clear()
@@ -221,7 +222,7 @@ def test_functions(tokens, namespace=(), imports=None):
         if token.text == "{" and token.kind == "group":
             module = tokens[index - 1].text if index >= 2 and tokens[index - 2].text == "mod" else None
             inside = (*namespace, module) if module else namespace
-            yield from test_functions(token.children, inside, aliases)
+            yield from test_functions(token.children, inside, aliases, module_scope=module is not None)
         index += 1
 
 
@@ -267,7 +268,7 @@ def conditional_blocks(tokens):
 
 
 def function_bodies(tokens):
-    """Yield (name, body token) for every `fn` with a body, at any depth."""
+    """Yield (name, body token) for functions declared directly in this scope."""
     for index, token in enumerate(tokens):
         if token.text == "fn" and index + 1 < len(tokens) and tokens[index + 1].kind == "word":
             for body in tokens[index + 2:]:
@@ -276,26 +277,44 @@ def function_bodies(tokens):
                 if body.text == "{" and body.kind == "group":
                     yield tokens[index + 1].text, body
                     break
-        if token.kind == "group":
-            yield from function_bodies(token.children)
+
+
+def invocation_at(tokens, index):
+    if tokens[index].kind != "word" or index + 1 >= len(tokens):
+        return None
+    following = tokens[index + 1]
+    if following.kind == "group" and following.text == "(":
+        return following, False
+    if following.text == "!" and index + 2 < len(tokens) and tokens[index + 2].kind == "group":
+        return tokens[index + 2], True
+    return None
+
+
+def starts_check(tokens, index, macro, known, *, in_helper=False):
+    name = tokens[index].text
+    if in_helper:
+        if name.startswith("debug_assert") or (macro and name in FAILURES):
+            return False
+        if not macro and name.startswith("expect") and index and tokens[index - 1].text == ".":
+            return False
+    if macro:
+        return name in ASSERTIONS or name in FAILURES or helper(name)
+    return helper(name) or name in known
 
 
 def checks_anywhere(tokens, known):
     for index, token in enumerate(tokens):
-        if macro_at(tokens, index, ASSERTIONS | FAILURES):
-            return True
-        if (token.kind == "word" and index + 1 < len(tokens) and tokens[index + 1].kind == "group"
-                and tokens[index + 1].text == "(" and (token.text in known or helper(token.text))):
+        invocation = invocation_at(tokens, index)
+        if invocation and starts_check(tokens, index, invocation[1], known, in_helper=True):
             return True
         if token.kind == "group" and checks_anywhere(token.children, known):
             return True
     return False
 
 
-def checking_helpers(tokens, tests):
-    """Names of non-test fns whose bodies check directly or call a known checker, to a fixpoint."""
-    tested = {id(body) for *_, body, _, _ in tests}
-    bodies = [(name, body) for name, body in function_bodies(tokens) if id(body) not in tested]
+def checking_helpers(scope, test_bodies):
+    """Find non-test functions in this scope that check directly or call a known checker."""
+    bodies = [(name, body) for name, body in function_bodies(scope) if id(body) not in test_bodies]
     known = set()
     while True:
         found = {name for name, body in bodies if name not in known
@@ -344,18 +363,15 @@ class Inspect:
             if text == "prop_assume" and following[:1] == ("!",):
                 self.assumes = True
 
-            macro = index + 2 < len(tokens) and tokens[index + 1].text == "!"
-            group_index = index + (2 if macro else 1)
-            if token.kind == "word" and group_index < len(tokens):
-                arguments = tokens[group_index]
-                if arguments.kind == "group" and (macro or arguments.text == "("):
-                    args = list(split(arguments.children))
-                    if (macro and text in ASSERTIONS | FAILURES) or helper(text) or (
-                            not macro and text in self.helpers):
-                        self.checks.append((token.line, text, args, guarded))
-                    elif (not text[0].isupper() and not (macro and text == "vec")
-                          and symmetric_input(text, map(literal, args))):
-                        self.literal_issues.append((token.line, "nondistinguishing-literal"))
+            invocation = invocation_at(tokens, index)
+            if invocation:
+                arguments, macro = invocation
+                args = list(split(arguments.children))
+                if starts_check(tokens, index, macro, self.helpers):
+                    self.checks.append((token.line, text, args, guarded))
+                elif (not text[0].isupper() and not (macro and text == "vec")
+                      and symmetric_input(text, map(literal, args))):
+                    self.literal_issues.append((token.line, "nondistinguishing-literal"))
             if token.kind == "group":
                 self.visit(token.children, guarded or index in guarded_blocks)
 
@@ -462,13 +478,16 @@ def parse(source, path):
     tests = []
     grouped = group(tokens)
     found = list(test_functions(grouped))
-    helpers = checking_helpers(grouped, found)
-    for token, name, identifier, start, body, panic, aliases in found:
+    test_bodies = {id(body) for _, _, _, _, body, _, _, _ in found}
+    helpers = {}
+    for token, name, identifier, start, body, panic, aliases, scope in found:
+        if scope is not None and id(scope) not in helpers:
+            helpers[id(scope)] = checking_helpers(scope, test_bodies)
         previous = {c.line for c in comments if c.standalone and c.column == token.column}
         while start - 1 in previous:
             start -= 1
         test = Test(name, identifier, token.line, start, body.end, token.column)
-        inspector = Inspect(aliases, helpers)
+        inspector = Inspect(aliases, helpers.get(id(scope), frozenset()))
         inspector.visit(body.children)
         test.issues, test.measured = inspector.issues()
         if not inspector.checks and not panic:
