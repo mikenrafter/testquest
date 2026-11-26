@@ -102,7 +102,7 @@ def symmetric_input(name, literals, arguments, peers, *, observed):
                         ) for other, peer in peers)):
                     return True
             seen.append((position, key))
-        if (isinstance(value, list) and len(value) >= 2
+        if (observed and isinstance(value, list) and len(value) >= 2
                 and all(type(item) is type(value[0]) and item == value[0] for item in value[1:])):
             return True
         if (isinstance(value, (str, bytes, tuple, list)) and len(value) >= 2
@@ -133,18 +133,28 @@ def weak_fixed_values(values):
     return False
 
 
-def unvaried_arguments(calls):
+def fixed_operand(value, operators):
+    """A neutral arithmetic operand or a coordinate whose role could be swapped."""
+    if isinstance(value, SuffixedNumber):
+        value = value.value
+    if type(value) in {int, float}:
+        return ((value == 0 and bool(operators & {"+", "-"}))
+                or (value == 1 and bool(operators & {"*", "/"})))
+    return isinstance(value, (list, tuple)) and bool(operators)
+
+
+def unvaried_arguments(calls, relevant):
     """Yield a first call line when checked calls vary a literal and all calls share another."""
     by_callee = {}
     for callee, location, literals, checked in calls:
         by_callee.setdefault(callee, []).append((location, literals, checked))
-    for group in by_callee.values():
+    for callee, group in by_callee.items():
         checked = [literals for _, literals, checked in group if checked]
         if len(checked) < 2:
             continue
 
         varies = False
-        fixed = []
+        fixed = {}
         for position in {position for literals in checked for position in literals}:
             samples = [literals.get(position, UNKNOWN) for literals in checked]
             known = [value for value in samples
@@ -154,9 +164,11 @@ def unvaried_arguments(calls):
             first = literal_key(known[0])
             varies |= any(literal_key(sample) != first for sample in known[1:])
             if all(literal_key(literals.get(position, UNKNOWN)) == first for _, literals, _ in group):
-                fixed.append(known[0])
-        if varies and weak_fixed_values(fixed):
-            yield min(location for location, _, _ in group)[0]
+                fixed[position] = known[0]
+        if varies and weak_fixed_values(fixed.values()):
+            line = min(location for location, _, _ in group)[0]
+            if weak_fixed_values(relevant(callee, line, fixed)):
+                yield line
 
 
 def argument_claims(test_name):

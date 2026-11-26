@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import tokenize
 
-from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, argument_claims, helper, loose_bounds, named_arguments,
+from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, fixed_operand, argument_claims, helper, loose_bounds, named_arguments,
                    prefix_satisfies, DISTINCT_INPUTS, claims_effect, OUTCOME_CLAIM, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
                    inverse_codecs, path_directories, pins_path)
 from .source import Comment, Test, project_root
@@ -693,10 +693,34 @@ class Inspect(ast.NodeVisitor):
                     continue
                 if symmetric_input(name, literals, arguments, peers, observed=id(call) in direct):
                     yield call.lineno
-        yield from unvaried_arguments(unvaried)
+        yield from unvaried_arguments(
+            unvaried, lambda callee, _, fixed: self.fixed_operands(calls[callee][0][0].func, fixed))
         yield from named_arguments(coverage, claims, lambda callee: self.parameters.get(callee, {}))
         yield from loose_bounds(self.bound_checks())
         yield from self.unchecked_item_order()
+
+    def fixed_operands(self, expression, fixed):
+        callee = binding_path(expression)
+        if not callee:
+            return fixed.values()
+        definition = self.definition_for(expression)
+        imported = self.imported_name(expression)
+        if definition is None and imported:
+            definition = self.module_constants.definition(tuple(imported.split(".")))
+        if definition is None:
+            return fixed.values()
+        names = parameter_names(definition, bound=callee.startswith("self."))
+        operations = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/", ast.FloorDiv: "/"}
+        operands = defaultdict(set)
+        for node in body_nodes(definition.body):
+            if isinstance(node, ast.BinOp) and type(node.op) in operations:
+                for operand in (node.left, node.right):
+                    while isinstance(operand, (ast.Attribute, ast.Subscript)):
+                        operand = operand.value
+                    if isinstance(operand, ast.Name):
+                        operands[operand.id].add(operations[type(node.op)])
+        return [value for position, value in fixed.items()
+                if fixed_operand(value, operands[names.get(position)])]
 
     def definition_for(self, callee):
         root, *parts = name_of(callee).split(".")
@@ -804,11 +828,12 @@ class Inspect(ast.NodeVisitor):
                 # ↳ CLAIM(tq-python-prefix)
                 and prefix_satisfies([literal(left) for _, left, _ in alternatives], [prefix], body))
 
-    def order_without_cardinality(self, node, line):
+    def order_without_cardinality(self, node, line, check_guards):
         operator, left, right = comparison(node)
         if operator is not ast.Eq or "sorted" in self.iterables.changed or "sorted" in self.local_helpers:
             return False
         for subject, sorted_call in ((left, right), (right, left)):
+            sorted_call = self.resolve(sorted_call, line)
             if (not isinstance(subject, ast.Name) or not isinstance(sorted_call, ast.Call)
                     or name_of(sorted_call.func) != "sorted" or len(sorted_call.args) != 1
                     or not same(subject, sorted_call.args[0])):
@@ -816,9 +841,31 @@ class Inspect(ast.NodeVisitor):
             source = self.resolve(subject, line)
             if not isinstance(source, (ast.Call, ast.ListComp, ast.Attribute, ast.Subscript)):
                 continue
-            if not any(other_line != line and any(
-                    isinstance(part, ast.Name) and part.id == subject.id for part in body_nodes((other,)))
-                       for other_line, other, _ in self.checks if other is not None):
+            projection = source.generators[0].iter if isinstance(source, ast.ListComp) else None
+
+            def mentions_subject(node):
+                return any(isinstance(part, ast.Name) and part.id == subject.id
+                           for part in body_nodes((node,)))
+
+            def independent_check(other, other_line):
+                op, first, second = comparison(other)
+                if op is ast.Eq and all(isinstance(part, ast.Call) and name_of(part.func) == "len"
+                                       and len(part.args) == 1 for part in (first, second)):
+                    return any(mentions_subject(part) for part in (first, second)) and not all(
+                        mentions_subject(part.args[0]) or mentions_subject(self.resolve(part.args[0], other_line))
+                        for part in (first, second))
+                if op is ast.Eq and isinstance(projection, (ast.Attribute, ast.Subscript)):
+                    for item, peer in ((first, second), (second, first)):
+                        if (isinstance(item, ast.Subscript) and same(item.value, subject)
+                                and literal(item.slice) == 0
+                                and isinstance(peer, (ast.Attribute, ast.Subscript))
+                                and same(peer.value, projection.value)):
+                            return False
+                return mentions_subject(other)
+
+            if not any(other_line != line and independent_check(other, other_line)
+                       for other_line, other, guards in self.checks
+                       if other is not None and (not guards or guards == check_guards)):
                 return True
         return False
 
@@ -1017,7 +1064,7 @@ class Inspect(ast.NodeVisitor):
         result_pins = set(self.result_pins())
         negative = defaultdict(list)
         positive = defaultdict(list)
-        for line, node, _ in self.checks:
+        for line, node, guards in self.checks:
             if node is None:
                 continue
             operator, left, right = comparison(node)
@@ -1028,7 +1075,8 @@ class Inspect(ast.NodeVisitor):
             if operator is ast.Eq and self.coupled(left, right, line, pins, strings, result_pins):
                 findings.append((line, "self-derived-expected"))
             if (operator is ast.Eq and self.zero_origin(self.resolve(left, line), right, line)
-                    or self.fixed_output_check(node, line) or self.order_without_cardinality(node, line)):
+                    or self.fixed_output_check(node, line)
+                    or self.order_without_cardinality(node, line, guards)):
                 findings.append((line, "nondistinguishing-literal"))
 
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):

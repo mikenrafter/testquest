@@ -4,7 +4,7 @@ from functools import lru_cache
 import re
 from string import Formatter
 
-from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, argument_claims, fixed_boundary, helper, loose_bounds,
+from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, argument_claims, fixed_boundary, fixed_operand, helper, loose_bounds,
                    named_arguments, prefix_satisfies, DISTINCT_INPUTS, claims_effect, OUTCOME_CLAIM, REPEATABILITY,
                    symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN, inverse_codecs, path_directories, pins_path)
 from .source import Comment, Test
@@ -1084,6 +1084,56 @@ def function_call(tokens):
     return (), ()
 
 
+def arithmetic_operands(tokens):
+    operators = {"+", "-", "*", "/", "+=", "-=", "*=", "/="}
+    for index, token in enumerate(tokens):
+        if token.children:
+            yield from arithmetic_operands(token.children)
+        if token.kind != "word" or index and tokens[index - 1].text in {".", "::"}:
+            continue
+        end = index + 1
+        path = [token.text]
+        while end < len(tokens):
+            part = tokens[end]
+            if part.text == "." and end + 1 < len(tokens) and tokens[end + 1].kind != "group":
+                path.append(tokens[end + 1].text)
+                end += 2
+            elif part.text == "[" and integer_literal(part.children) is not None:
+                path.append(str(integer_literal(part.children)))
+                end += 1
+            elif part.text == "as" and end + 1 < len(tokens):
+                end += 2
+            else:
+                break
+        if end < len(tokens) and tokens[end].text in {"(", "::"}:
+            continue
+        if index and (operator := tokens[index - 1].text) in operators:
+            if operator != "*" or index >= 2 and tokens[index - 2].kind in {"word", "number", "float", "group"}:
+                yield tuple(path), operator[0]
+        if end < len(tokens) and (operator := tokens[end].text) in operators:
+            yield tuple(path), operator[0]
+
+
+def stored_operands(body, methods):
+    if len(body) != 2 or body[0].kind != "word" or body[1].text != "{":
+        return {}
+    fields = {}
+    for field in split(body[1].children):
+        parts = shape(field)
+        if len(parts) == 1 and field[0].kind == "word":
+            fields[parts[0]] = parts[0]
+        elif len(parts) == 3 and parts[1] == ":" and field[0].kind == field[2].kind == "word":
+            fields[parts[0]] = parts[2]
+        else:
+            return {}
+    operands = defaultdict(set)
+    for method in methods:
+        for path, operator in arithmetic_operands(method):
+            if len(path) >= 2 and path[0] == "self" and path[1] in fields:
+                operands[fields[path[1]]].add(operator)
+    return operands
+
+
 def local_returns(body):
     statements = list(split(body, ";"))
     if not statements:
@@ -1328,6 +1378,17 @@ def assertion_comparison(name, args):
     return "", (), ()
 
 
+def adjacent_pair_order(pair, arguments):
+    predicate = next(split(arguments), ())
+    operator, left, right = comparison(predicate)
+    if operator not in {"<", "<=", ">", ">="} or min(len(left), len(right)) < 2:
+        return False
+    return (left[0].text == right[0].text == pair and left[1].text == right[1].text == "["
+            and {integer_literal(left[1].children), integer_literal(right[1].children)} == {0, 1}
+            and shape(left[2:]) == shape(right[2:])
+            and (len(left) == 2 or binding_path((left[0], *left[2:]))))
+
+
 def recorder_initializer(tokens):
     if shape(tokens) in {("Vec", "::", "new", "("), ("vec", "!", "[")}:
         return "vector"
@@ -1417,6 +1478,7 @@ class Inspect:
         self.expected = set()
         self.calls = defaultdict(list)
         self.check_arguments = []
+        self.window_order = {}
         self.strategies = {}
         self.paired_bindings = {}
         self.parity_mutations = set()
@@ -1474,6 +1536,12 @@ class Inspect:
                     position, pattern, header = loop
                     block_locals[position] = dict.fromkeys(pattern_names(pattern), {})
                     if text == "for":
+                        receiver, method, width = method_call(header)
+                        if method == "windows" and integer_literal(width) == 2 and len(pattern) == 1:
+                            for statement in split(tokens[position].children, ";"):
+                                if (macro_at(statement, 0, {"assert", "debug_assert", "prop_assert"})
+                                        and adjacent_pair_order(pattern[0].text, statement[2].children)):
+                                    self.window_order[statement[0].line] = receiver
                         runs = (iterable_size(header, lookup) or 0) > 0
                         if self.guard_iterables:
                             loop_lookup = guard_lookup
@@ -2155,8 +2223,10 @@ class Inspect:
         prefix, body = output_parts(self.file_iterables.function(path, external=callee[:1] == ("crate",)))
         return prefix_satisfies(needles, prefix, body)
 
-    def order_without_cardinality(self, line, name, args):
-        if name.endswith("_eq") and len(args) >= 2:
+    def order_without_cardinality(self, line, name, args, check_guarded):
+        if line in self.window_order:
+            subject = self.window_order[line]
+        elif name.endswith("_eq") and len(args) >= 2:
             subject = ()
             for original, sorted_copy in (args[:2], args[:2][::-1]):
                 original = unborrow(original)
@@ -2167,8 +2237,11 @@ class Inspect:
                     continue
                 source, method, _ = method_call(self.resolve(sorted_copy, line))
                 if method == "clone" and shape(original) == shape(source):
-                    sort_calls = self.calls.get((sorted_copy[0].text, ".", "sort"), ())
-                    if any(sorted_copy[0].line >= loc[0] > source[0].line for loc, _, _ in sort_calls):
+                    start = (source[0].line, source[0].column)
+                    end = (sorted_copy[0].line, sorted_copy[0].column)
+                    if any(start < loc < end and not params.children
+                           for sort in ("sort", "sort_unstable")
+                           for loc, params, _ in self.calls.get((sorted_copy[0].text, ".", sort), ())):
                         subject = source
                         break
         elif name in {"assert", "debug_assert", "prop_assert"}:
@@ -2177,7 +2250,11 @@ class Inspect:
                 subject, method, width = method_call(subject)
                 if method != "windows" or integer_literal(width) != 2 or not parts:
                     return False
-            elif method != "is_sorted":
+            elif method in {"is_sorted", "is_sorted_by", "is_sorted_by_key"}:
+                receiver, iterator, params = method_call(subject)
+                if iterator in {"iter", "into_iter"} and not params:
+                    subject = receiver
+            else:
                 return False
         else:
             return False
@@ -2204,16 +2281,56 @@ class Inspect:
             for alias, bindings in self.bindings.items():
                 if len(bindings) == 1 and self.projection_source(bindings[0][1]) in subjects:
                     subjects.add(alias)
-        for other_line, other_name, other_args, _ in self.checks:
-            if other_line == line or not other_args:
+        for other_line, other_name, other_args, guarded in self.checks:
+            if other_line == line or not other_args or (guarded and not check_guarded):
                 continue
-            if (other_name.endswith("_eq") and len(other_args) >= 2
-                    and all(method_call(arg)[1] == "len" for arg in other_args[:2])):
-                continue
+            if other_name.endswith("_eq") and len(other_args) >= 2:
+                first, second = other_args[:2]
+                if all(method_call(arg)[1] == "len" for arg in (first, second)):
+                    continue
+                if (any(shape(measured) == (*shape(subject), ".", "len", "(")
+                        and integer_literal(expected) in {2, 3}
+                        for measured, expected in ((first, second), (second, first)))
+                        and self.sorts_hash_iteration(self.resolve(subject, line), line)):
+                    continue
             if any(token.text in subjects for argument in other_args[:2]
                    for token in check_arguments(argument) if token.kind == "word"):
                 return False
         return True
+
+    def sorts_hash_iteration(self, value, line):
+        callee, _ = function_call(value)
+        _, _, body = self.call_definition(callee, line)
+        if len(body) < 2 or body[-1].kind != "word" or body[-2].text != ";":
+            return False
+        result = body[-1].text
+        bindings = {}
+        for offset, token in enumerate(body[:-1]):
+            if token.text != "let":
+                continue
+            head = next(split(body[offset + 1:], ";"), ())
+            if shape(head[:1]) == ("mut",):
+                head = head[1:]
+            parts = list(split(head, "="))
+            if len(parts) == 2 and all(parts) and parts[0][0].kind == "word":
+                bindings[parts[0][0].text] = parts
+        if result not in bindings:
+            return False
+        _, initialization = bindings[result]
+        receiver, collection, args = method_call(initialization)
+        parent, iteration, inputs = method_call(receiver)
+        if (collection != "collect" or args or iteration not in {"into_iter", "iter", "keys", "into_keys"}
+                or inputs or len(parent) != 1 or parent[0].text not in bindings):
+            return False
+        definition = bindings[parent[0].text]
+        if not any(token.text in {"HashSet", "HashMap"} for part in definition for token in part):
+            return False
+        return any(shape(body[offset:offset + 4]) in {
+                       (result, ".", "sort", "("),
+                       (result, ".", "sort_unstable", "("),
+                   } for offset in range(len(body) - 3)
+                   if (body[offset].line, body[offset].column) >
+                   (initialization[0].line, initialization[0].column))
 
     @staticmethod
     def projection_source(tokens):
@@ -2256,12 +2373,12 @@ class Inspect:
         checked, observed, direct, fixtures = set(), set(), set(), set()
         bound_checks = []
         claims = argument_claims(test_name)
-        for line, name, args, _ in self.checks:
+        for line, name, args, guarded in self.checks:
             if name not in ASSERTIONS or not args:
                 continue
             boolean = name in {"assert", "debug_assert", "prop_assert"}
             if (boolean and self.fixed_output_check(args[0], line)
-                    or self.order_without_cardinality(line, name, args)):
+                    or self.order_without_cardinality(line, name, args, guarded)):
                 yield line
             if name.endswith(("_eq", "_ne")) and len(args) >= 2:
                 predicates = [("==" if name.endswith("_eq") else "!=", *args[:2])]
@@ -2313,15 +2430,63 @@ class Inspect:
                         nested.append((location, inputs))
             if fixed_boundary([inputs for _, inputs in nested]):
                 yield min(location for location, _ in nested)[0]
-        for group in self.symmetric_calls.values():
+        for callee, group in self.symmetric_calls.items():
             peers = [(shapes, values) for _, _, args, _, values, shapes in group
                      if id(args) in checked and id(args) not in self.expected]
             for name, line, args, legacy, _, shapes in group:
-                if symmetric_input(name, legacy, shapes, peers, observed=id(args) in direct):
-                    yield line
-        yield from unvaried_arguments(unvaried)
+                if not symmetric_input(name, legacy, shapes, peers, observed=id(args) in direct):
+                    continue
+                if id(args) not in checked and id(args) not in observed:
+                    _, _, body = self.call_definition(callee, line)
+                    if shape(body[:2]) == ("format", "!") or name in self.bindings:
+                        continue
+                yield line
+        yield from unvaried_arguments(
+            unvaried, lambda callee, line, values: self.fixed_operands(callee, line, values, direct))
         yield from named_arguments(coverage, claims, self.parameters_for)
         yield from loose_bounds(bound_checks)
+
+    def call_definition(self, callee, line):
+        index = self.file_iterables
+        name = tuple(part for part in callee or () if part != "::")
+        if not name or "." in name or "!" in name:
+            return index, (), ()
+        path = self.oracle_path(name, line)
+        if path in index.function_sources:
+            return index, path, index.function_sources[path]
+        for depth in range(len(path) - 1, 0, -1):
+            source = index.module_file(path[:depth])
+            if source and (module := module_items(source)):
+                local = path[depth:]
+                if local in module.function_sources:
+                    return module, local, module.function_sources[local]
+        return index, (), ()
+
+    def fixed_operands(self, callee, line, fixed, direct):
+        if "." in callee:
+            return ()
+        index, path, body = self.call_definition(callee, line)
+        if not path:
+            return fixed.values()
+        names = index.parameters.get(path, {})
+        if path[-1] == "new" and len(path) > 1 and not any(
+                id(arguments) in direct for _, arguments, _ in self.calls[callee]):
+            operations = stored_operands(body, (method for owner, method in index.method_sources.items()
+                                                if owner[:-1] == path[:-1] and owner != path))
+        else:
+            operations = defaultdict(set)
+            destructured = {}
+            for offset in range(len(body) - 4):
+                if (body[offset].text == "let" and body[offset + 1].text == "("
+                        and body[offset + 2].text == "=" and body[offset + 4].text == ";"):
+                    for name in split(body[offset + 1].children):
+                        if len(name) == 1 and name[0].kind == "word":
+                            destructured[name[0].text] = body[offset + 3].text
+            for operand, operator in arithmetic_operands(body):
+                name = destructured.get(operand[0], operand[0])
+                operations[name].add(operator)
+        return [value for position, value in fixed.items()
+                if fixed_operand(value, operations.get(names.get(position), set()))]
 
     def parameters_for(self, callee):
         if "." in callee:
