@@ -382,7 +382,7 @@ class LintTests(TqCase):
 
     def test_rust_nondistinguishing_literals(self):
         # WHY: the same fixture weakness appears in Rust literal inputs to macros.
-        # catches: applying the literal symmetry rule only to Python
+        # catches: missing Rust palindromes or reporting the already distinguished pair
         self.check_lint("""
             #[test]
             fn test_swaps() {
@@ -394,7 +394,7 @@ class LintTests(TqCase):
                 assert_eq!(difference(6, 2), 4);
             }
             """, "nondistinguishing-literal",
-            ('encode(b"aba")', "swap([1, 2, 1])", "difference(6, 6)"), "checks.rs")
+            ('encode(b"aba")', "swap([1, 2, 1])"), "checks.rs")
 
     def test_local_suppressions_require_a_reason(self):
         # WHY: a reasoned exception covers one occurrence at its point of use.

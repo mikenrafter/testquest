@@ -2,7 +2,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 import re
 
-from .lint import UNKNOWN, assertion, helper, symmetric_input, unvaried_arguments
+from .lint import (UNKNOWN, SuffixedNumber, assertion, fixed_boundary, helper, loose_bounds,
+                   named_arguments, symmetric_input, unvaried_arguments)
 from .source import Comment, Test
 
 
@@ -15,6 +16,8 @@ EXPONENT = rf"[eE][+-]?_*{DECIMAL}"
 FLOAT = re.compile(rf"(?:{DECIMAL}(?:\.{DECIMAL}(?:{EXPONENT})?|{EXPONENT})(?:f32|f64)?"
                    rf"|{DECIMAL}(?:f32|f64|\.(?![.\w])))")
 NUMBER = re.compile(r"(?:0[xob][0-9a-fA-F_]+|[0-9][0-9_]*)(?:[ui](?:8|16|32|64|128|size))?")
+FLOAT_SUFFIX = re.compile(r"_?(f32|f64)$")
+INTEGER_SUFFIX = re.compile(r"_?([ui](?:8|16|32|64|128|size))$")
 SYMBOL = re.compile(r"::|=>|->|==|!=|<=|>=|&&|\|\||\+=|[^\s]")
 CLOSE = {"(": ")", "[": "]", "{": "}"}
 ASSERTIONS = {"assert", "assert_eq", "assert_ne", "prop_assert", "prop_assert_eq", "prop_assert_ne",
@@ -99,11 +102,11 @@ def shape(tokens):
     return tuple((token.text, shape(token.children)) if token.children else token.text for token in tokens)
 
 
-def split(tokens, delimiter=","):
+def split(tokens, delimiter=",", *, type_arguments=False):
     start = 0
     generic_depth = 0
     for index, token in enumerate(tokens):
-        if token.text == "<" and (generic_depth or (index and tokens[index - 1].text == "::")):
+        if token.text == "<" and (type_arguments or generic_depth or (index and tokens[index - 1].text == "::")):
             generic_depth += 1
         elif token.text == ">" and generic_depth:
             generic_depth -= 1
@@ -115,9 +118,10 @@ def split(tokens, delimiter=","):
 
 
 def literal(tokens, *, signed_and_float=False):
-    if (signed_and_float and len(tokens) == 2 and tokens[0].text == "-"
-            and tokens[1].kind in {"number", "float"}):
-        return -literal(tokens[1:], signed_and_float=True)
+    signed = (signed_and_float and len(tokens) == 2 and tokens[0].text == "-"
+              and tokens[1].kind in {"number", "float"})
+    if signed:
+        tokens = tokens[1:]
     if len(tokens) == 3 and shape(tokens[:2]) == ("vec", "!") and tokens[2].kind == "group":
         tokens = tokens[2:]
     if len(tokens) != 1:
@@ -130,11 +134,18 @@ def literal(tokens, *, signed_and_float=False):
         return tuple(values) if token.text == "(" else values
     if token.text in {"true", "false"}:
         return token.text == "true"
-    if signed_and_float and token.kind == "float":
-        return float(re.sub(r"_?f(?:32|64)$", "", token.text).replace("_", ""))
-    if token.kind == "number":
-        number = re.sub(r"_?[ui](?:8|16|32|64|128|size)$", "", token.text).replace("_", "")
-        return int(number, 0) if number.startswith(("0x", "0o", "0b")) else int(number)
+    if signed_and_float and token.text == "None":
+        return None
+    if token.kind == "number" or (signed_and_float and token.kind == "float"):
+        suffix = (FLOAT_SUFFIX if token.kind == "float" else INTEGER_SUFFIX).search(token.text)
+        number = (token.text[:suffix.start()] if suffix else token.text).replace("_", "")
+        if token.kind == "float":
+            value = float(number)
+        else:
+            value = int(number, 0) if number.startswith(("0x", "0o", "0b")) else int(number)
+        if signed:
+            value = -value
+        return SuffixedNumber(value, suffix[1]) if signed_and_float and suffix else value
     if token.kind == "raw":
         prefix = RAW.match(token.text)
         return token.text[prefix.end():-1 - len(prefix[1])]
@@ -488,6 +499,61 @@ def absolute_path(scope, name):
     return (*scope, *(name[1:] if name[:1] == ("self",) else name))
 
 
+def parameter_names(tokens):
+    for index, token in enumerate(tokens[:-2]):
+        if token.text != "fn" or tokens[index + 1].kind != "word":
+            continue
+        depth = 0
+        for part in tokens[index + 2:]:
+            if part.text == "<":
+                depth += 1
+            elif part.text == ">":
+                depth -= 1
+            elif depth == 0 and part.text == "(":
+                names = {}
+                for position, arg in enumerate(split(part.children, type_arguments=True)):
+                    pattern = arg[1:] if shape(arg[:1]) == ("mut",) else arg
+                    if len(pattern) >= 2 and pattern[0].kind == "word" and pattern[1].text == ":":
+                        names[position] = pattern[0].text.removeprefix("r#")
+                yield tokens[index + 1].text, names
+                break
+            elif depth == 0 and part.text in {"{", ";", "="}:
+                break
+
+
+def file_parameters(tokens, scope=()):
+    for name, names in parameter_names(tokens):
+        yield (*scope, name), names
+    for index, token in enumerate(tokens):
+        if token.text != "{" or index < 2:
+            continue
+        kind, name = tokens[index - 2:index]
+        if name.kind == "word" and kind.text in {"mod", "impl"}:
+            yield from file_parameters(token.children, (*scope, name.text))
+
+
+def constructor(callee):
+    if callee[-1][:1].isupper():
+        return True
+    return len(callee) >= 3 and callee[-2:] == ("::", "new") and callee[-3][:1].isupper()
+
+
+def expected_constructors(tokens, *, expected=False):
+    right_side = False
+    for index, token in enumerate(tokens):
+        if token.text == "==":
+            right_side = True
+        elif token.text in {",", "&&", "||", ";"}:
+            right_side = False
+        elif token.kind == "group":
+            in_expected = expected or right_side
+            if in_expected and token.text == "(" and index and tokens[index - 1].kind == "word":
+                start = callee_start(tokens, index - 1)
+                if start is not None and constructor(shape(tokens[start:index])):
+                    yield id(token)
+            yield from expected_constructors(token.children, expected=in_expected)
+
+
 class FileIterables:
     def __init__(self, tokens):
         self.definitions = {}
@@ -585,7 +651,7 @@ def pattern_names(tokens):
 
 
 class Inspect:
-    def __init__(self, aliases, helpers, file_iterables, scope, mutated):
+    def __init__(self, aliases, helpers, file_iterables, scope, mutated, parameters, local_parameters):
         self.aliases = aliases
         self.helpers = helpers
         self.file_iterables = file_iterables
@@ -597,7 +663,10 @@ class Inspect:
         self.reads = set()
         self.increments = set()
         self.assumes = False
-        self.literal_issues = []
+        self.symmetric_calls = defaultdict(list)
+        self.parameters = parameters
+        self.local_parameters = local_parameters
+        self.expected = set()
         self.calls = defaultdict(list)
         self.check_arguments = []
 
@@ -676,19 +745,28 @@ class Inspect:
                 args = list(split(arguments.children))
                 if assertion(text):
                     self.check_arguments.append(arguments)
-                elif not macro and text not in {"if", "while", "for", "match", "return", "break", "move"}:
-                    start = callee_start(tokens, index)
-                    if start is not None:
-                        first = tokens[start]
-                        literals = {position: literal(arg, signed_and_float=True)
-                                    for position, arg in enumerate(args)}
-                        self.calls[shape(tokens[start:index + 1])].append(
-                            ((first.line, first.column), arguments, literals))
-                if starts_check(tokens, index, macro, self.helpers):
+                    if text in ASSERTIONS and text.endswith("_eq") and len(args) >= 2:
+                        self.expected.update(expected_constructors(args[1], expected=True))
+                    elif text in {"assert", "debug_assert", "prop_assert"} and args:
+                        self.expected.update(expected_constructors(args[0]))
+                checking = starts_check(tokens, index, macro, self.helpers)
+                if checking:
                     self.checks.append((token.line, text, args, guarded))
-                elif (not text[0].isupper() and not (macro and text == "vec")
-                      and symmetric_input(text, map(literal, args))):
-                    self.literal_issues.append((token.line, "nondistinguishing-literal"))
+
+                start = callee_start(tokens, index)
+                callee = shape(tokens[start:index + 1]) if start is not None else None
+                literals = {position: literal(arg, signed_and_float=True)
+                            for position, arg in enumerate(args)}
+                if callee and not (macro or assertion(text)
+                                   or text in {"if", "while", "for", "match", "return", "break", "move"}):
+                    first = tokens[start]
+                    self.calls[callee].append(((first.line, first.column), arguments, literals))
+
+                if not checking and not text[0].isupper() and not (macro and text == "vec"):
+                    key = (*callee, "!") if callee and macro else callee
+                    legacy = dict(enumerate(map(literal, args)))
+                    shapes = {position: shape(arg) for position, arg in enumerate(args)}
+                    self.symmetric_calls[key].append((text, token.line, arguments, legacy, literals, shapes))
             if token.kind == "group":
                 in_block = locals_here
                 if index in block_locals:
@@ -730,8 +808,66 @@ class Inspect:
             return False
         return True
 
-    def argument_calls(self):
-        checked = set()
+    def observed_calls(self, tokens, line, seen=frozenset()):
+        while tokens and tokens[0].text in {"!", "&", "mut", "*"}:
+            tokens = tokens[1:]
+        if not tokens:
+            return
+        head = tokens[0]
+        if id(head) in seen:
+            return
+        seen = seen | {id(head)}
+        if head.kind == "group" and head.text == "(":
+            yield from self.observed_calls(head.children, line, seen)
+            return
+        if head.text in self.bindings:
+            value = self.resolve((head,), line)
+            if value and value != (head,):
+                yield from self.observed_calls(value, min(line, value[0].line - 1), seen)
+        for index, token in enumerate(tokens):
+            invocation = invocation_at(tokens, index)
+            if invocation:
+                arguments, macro = invocation
+                if macro:
+                    return
+                start = callee_start(tokens, index)
+                if start is not None and (start == 0 or tokens[start - 1].text != "::"):
+                    yield arguments
+            elif token.kind != "word" and token.text not in {".", "::", "("}:
+                if token.text != "[":
+                    return
+
+    def argument_calls(self, test_name):
+        checked, observed, direct, fixtures = set(), set(), set(), set()
+        bound_checks = []
+        for line, name, args, _ in self.checks:
+            if name not in ASSERTIONS or not args:
+                continue
+            if name.endswith(("_eq", "_ne")) and len(args) >= 2:
+                predicates = [("==" if name.endswith("_eq") else "!=", *args[:2])]
+            else:
+                predicates = []
+                for disjunction in split(args[0], "||"):
+                    for clause in split(disjunction, "&&"):
+                        op, left, right = comparison(clause)
+                        predicates.append((op, left if op else clause, right))
+            for op, left, right in predicates:
+                for operand, other in ((left, right), (right, left)):
+                    for result in self.observed_calls(operand, line):
+                        observed.add(id(result))
+                        for arg in split(result.children):
+                            fixtures.update(id(fixture) for fixture in self.observed_calls(arg, line))
+                    value = self.resolve(operand, line)
+                    if len(value) > 1 and value[-1].text == "(" and shape(value[:-1]) in self.calls:
+                        first, arguments = value[0], value[-1]
+                        direct.add(id(arguments))
+                        inputs = {position: literal(arg, signed_and_float=True)
+                                  for position, arg in enumerate(split(arguments.children))}
+                        threshold = literal(other, signed_and_float=True)
+                        bounded = op in {">", ">=", "<", "<="} and type(threshold) in {int, float, SuffixedNumber}
+                        bound_checks.append((shape(value[:-1]), (first.line, first.column), inputs, bounded))
+
+
         for arguments in self.check_arguments:
             for token in check_arguments(arguments.children):
                 if token.kind == "group":
@@ -741,14 +877,42 @@ class Inspect:
                     if len(value) > 1 and value[-1].text == "(" and shape(value[:-1]) in self.calls:
                         checked.add(id(value[-1]))
 
+        unvaried, coverage = [], []
         for callee, calls in self.calls.items():
+            ignored = {position for position, name in self.parameters_for(callee).items() if name.startswith("_")}
+            nested = []
             for location, arguments, literals in calls:
-                yield callee, location, literals, id(arguments) in checked
+                if id(arguments) not in self.expected:
+                    inputs = {position: value for position, value in literals.items() if position not in ignored}
+                    unvaried.append((callee, location, inputs, id(arguments) in observed))
+                    coverage.append((callee, location, inputs, id(arguments) in observed, id(arguments) in fixtures))
+                    if id(arguments) in fixtures and id(arguments) not in observed:
+                        nested.append((location, inputs))
+            if fixed_boundary([inputs for _, inputs in nested]):
+                yield min(location for location, _ in nested)[0]
+        for group in self.symmetric_calls.values():
+            peers = [(shapes, values) for _, _, args, _, values, shapes in group
+                     if id(args) in checked and id(args) not in self.expected]
+            for name, line, args, legacy, _, shapes in group:
+                if symmetric_input(name, legacy, shapes, peers, observed=id(args) in direct):
+                    yield line
+        yield from unvaried_arguments(unvaried)
+        yield from named_arguments(test_name, coverage, self.parameters_for)
+        yield from loose_bounds(bound_checks)
 
-    def issues(self):
-        findings = self.literal_issues.copy()
-        findings.extend((line, "nondistinguishing-literal")
-                        for line in unvaried_arguments(self.argument_calls()))
+    def parameters_for(self, callee):
+        if "." in callee:
+            return {}
+        name = tuple(part for part in callee if part != "::")
+        if len(name) == 1 and name[0] in self.local_parameters:
+            return self.local_parameters[name[0]]
+        if name[0] in self.aliases:
+            name = (*self.aliases[name[0]], *name[1:])
+        return self.parameters.get(absolute_path(self.scope, name),
+                                   self.parameters.get(name, {}))
+
+    def issues(self, test_name):
+        findings = [(line, "nondistinguishing-literal") for line in self.argument_calls(test_name)]
         recorders = {
             name for name, bindings in self.bindings.items()
             if shape(bindings[0][1]) in {("Vec", "::", "new", "("), ("vec", "!", "[")}
@@ -820,6 +984,7 @@ def parse(source, path):
     test_bodies = {id(body) for _, _, _, _, body, _, _, _ in found}
     helpers = {}
     file_iterables = FileIterables(grouped)
+    parameters = dict(file_parameters(grouped))
     for token, name, identifier, start, body, panic, aliases, scope in found:
         if scope is not None and id(scope) not in helpers:
             helpers[id(scope)] = checking_helpers(scope, test_bodies)
@@ -829,9 +994,10 @@ def parse(source, path):
         test = Test(name, identifier, token.line, start, body.end, token.column)
         namespace = tuple(identifier.split("::")[:-1])
         inspector = Inspect(aliases, helpers.get(id(scope), frozenset()), file_iterables,
-                            namespace, set(mutated_names(body.children)))
+                            namespace, set(mutated_names(body.children)), parameters,
+                            dict(parameter_names(body.children)))
         inspector.visit(body.children)
-        test.issues, test.measured = inspector.issues()
+        test.issues, test.measured = inspector.issues(name)
         if not inspector.checks and not panic:
             test.issues.append((token.line, "no-assert"))
         test.guarded = bool(inspector.checks) and not panic and all(

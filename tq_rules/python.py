@@ -1,11 +1,12 @@
 import ast
 import builtins
-from collections import Counter, defaultdict
+from collections import ChainMap, Counter, defaultdict
 import io
 import sys
 import tokenize
 
-from .lint import UNKNOWN, assertion, helper, symmetric_input, unvaried_arguments
+from .lint import (UNKNOWN, assertion, fixed_boundary, helper, loose_bounds, named_arguments,
+                   symmetric_input, unvaried_arguments)
 from .source import Comment, Test
 
 
@@ -29,6 +30,45 @@ def literal(node):
         if type(value) in {int, float, complex}:
             return value if isinstance(node.op, ast.UAdd) else -value
     return UNKNOWN
+
+
+def call_arguments(call):
+    arguments = {}
+    for index, arg in enumerate(call.args):
+        if isinstance(arg, ast.Starred):
+            break
+        arguments[index] = arg
+    arguments.update((kw.arg, kw.value) for kw in call.keywords if kw.arg is not None)
+    return arguments
+
+
+def argument_literals(arguments):
+    return {position: {} if isinstance(arg, ast.Dict) and not arg.keys else literal(arg)
+            for position, arg in arguments.items()}
+
+
+def parameter_names(definition, *, bound=False):
+    args = definition.args
+    positional = [*args.posonlyargs, *args.args][int(bound):]
+    return {**{index: arg.arg for index, arg in enumerate(positional)},
+            **{arg.arg: arg.arg for arg in [*args.args, *args.kwonlyargs]}}
+
+
+def file_parameters(definitions):
+    qualified_parameters = {}
+    method_parameters = defaultdict(dict)
+    for (owner, name), definition in definitions.items():
+        if not owner:
+            qualified_parameters[name] = parameter_names(definition)
+            continue
+        decorators = {name_of(decorator) for decorator in definition.decorator_list}
+        qualified = ".".join((*owner, name))
+        qualified_parameters[qualified] = parameter_names(definition, bound="classmethod" in decorators)
+        bound = parameter_names(definition, bound="staticmethod" not in decorators)
+        method_parameters[owner][f"self.{name}"] = bound
+        if name == "__init__":
+            qualified_parameters[".".join(owner)] = bound
+    return qualified_parameters, method_parameters
 
 
 def nonempty_literal(node):
@@ -78,7 +118,9 @@ def predicate(call, method):
     args = call.args
     operators = {"assertEqual": ast.Eq, "assertNotEqual": ast.NotEq,
                  "assertIs": ast.Is, "assertIsNot": ast.IsNot,
-                 "assertListEqual": ast.Eq, "assertTupleEqual": ast.Eq}
+                 "assertListEqual": ast.Eq, "assertTupleEqual": ast.Eq,
+                 "assertGreater": ast.Gt, "assertGreaterEqual": ast.GtE,
+                 "assertLess": ast.Lt, "assertLessEqual": ast.LtE}
     if method in operators and len(args) >= 2:
         return ast.Compare(left=args[0], ops=[operators[method]()], comparators=[args[1]])
     if method in {"assertTrue", "assertFalse"} and args:
@@ -92,14 +134,16 @@ OBSERVERS = {"len", "set", "list", "sorted", "tuple", "str", "bool", "int", "byt
 
 
 class Inspect(ast.NodeVisitor):
-    def __init__(self, imports, checking_helpers, local_helpers, iterables):
+    def __init__(self, imports, checking_helpers, local_helpers, iterables, parameters):
         self.imports = imports
         self.checking_helpers = checking_helpers
         self.local_helpers = local_helpers
         self.iterables = iterables
+        self.parameters = parameters
         self.checks = []
         self.calls = []
         self.check_arguments = []
+        self.expected_arguments = []
         self.bindings = defaultdict(list)
         self.writes = {}
         self.reads = set()
@@ -206,6 +250,9 @@ class Inspect(ast.NodeVisitor):
         method = name.rsplit(".", 1)[-1]
         if helper(method) or name in self.checking_helpers:
             self.record_check(node.lineno, predicate(node, method))
+        if method == "assertEqual":
+            self.expected_arguments.extend(node.args[1:2])
+            self.expected_arguments.extend(keyword.value for keyword in node.keywords if keyword.arg == "second")
         if assertion(method):
             self.check_arguments.extend(node.args)
             self.check_arguments.extend(keyword.value for keyword in node.keywords)
@@ -283,9 +330,55 @@ class Inspect(ast.NodeVisitor):
             return name_of(node.args[0])
         return None
 
-    def argument_calls(self):
-        checked = set()
+    def observed_calls(self, node, line, *, follow_receivers=True):
+        node = self.resolve(node, line)
+        if isinstance(node, ast.Call):
+            yield node
+            if follow_receivers:
+                if isinstance(node.func, ast.Attribute):
+                    yield from self.observed_calls(node.func.value, line)
+                elif name_of(node.func) in OBSERVERS and len(node.args) == 1:
+                    yield from self.observed_calls(node.args[0], line)
+        elif isinstance(node, (ast.Attribute, ast.Subscript, ast.Await)):
+            yield from self.observed_calls(node.value, line, follow_receivers=follow_receivers)
+        elif isinstance(node, ast.UnaryOp):
+            yield from self.observed_calls(node.operand, line, follow_receivers=follow_receivers)
+        elif isinstance(node, (ast.Compare, ast.BoolOp)):
+            operands = [node.left, *node.comparators] if isinstance(node, ast.Compare) else node.values
+            for operand in operands:
+                yield from self.observed_calls(operand, line, follow_receivers=follow_receivers)
+
+    def zero_origin(self, actual, expected, line):
+        if not isinstance(actual, ast.Call) or not isinstance(expected, (ast.List, ast.Tuple)):
+            return False
+
+        def times(sequence):
+            if not isinstance(sequence, (ast.List, ast.Tuple)):
+                return ()
+            calls = sequence.elts
+            if not all(isinstance(call, ast.Call) and call.args for call in calls):
+                return ()
+            return tuple(literal(call.args[0]) for call in calls)
+
+        outputs = times(expected)
+        if (len(outputs) < 2 or not all(type(value) in {int, float} and value > 0 for value in outputs)
+                or not all(len(call.args) > 1 and literal(call.args[1]) == value
+                           for call, value in zip(expected.elts, outputs))):
+            return False
+        return any(times(self.resolve(arg, line)) == (0, *outputs) for arg in actual.args)
+
+    def literal_issues(self, test_name):
+        checked, observed, direct, fixtures = set(), set(), set(), set()
+        expected = {call for value in self.expected_arguments for call in self.constructor_calls(value)}
         for argument in self.check_arguments:
+            line = argument.lineno
+            direct.update(id(call) for call in self.observed_calls(argument, line, follow_receivers=False))
+            for call in self.observed_calls(argument, line):
+                observed.add(id(call))
+                for value in call_arguments(call).values():
+                    resolved = self.resolve(value, line)
+                    if isinstance(resolved, ast.Call):
+                        fixtures.add(id(resolved))
             for node in body_nodes((argument,)):
                 if isinstance(node, ast.Call):
                     checked.add(id(node))
@@ -295,20 +388,74 @@ class Inspect(ast.NodeVisitor):
                         resolved = resolved.value
                     if isinstance(resolved, ast.Call):
                         checked.add(id(resolved))
+                elif isinstance(node, ast.Compare):
+                    for operator, right in zip(node.ops, node.comparators):
+                        if isinstance(operator, ast.Eq):
+                            expected.update(self.constructor_calls(right))
 
+        calls = defaultdict(list)
+        unvaried, coverage = [], []
         for call in self.calls:
-            method = name_of(call.func).rsplit(".", 1)[-1]
-            if assertion(method):
-                continue
-            literals = {}
-            for index, arg in enumerate(call.args):
-                if isinstance(arg, ast.Starred):
-                    break
-                literals[index] = literal(arg)
-            literals.update((kw.arg, literal(kw.value)) for kw in call.keywords if kw.arg is not None)
-            yield ast.unparse(call.func), (call.lineno, call.col_offset), literals, id(call) in checked
+            qualified = name_of(call.func)
+            method = qualified.rsplit(".", 1)[-1]
+            callee = ast.unparse(call.func)
+            arguments = call_arguments(call)
+            literals = argument_literals(arguments)
+            calls[callee].append((call, literals, {key: ast.dump(arg) for key, arg in arguments.items()}))
+            if not assertion(method) and id(call) not in expected:
+                names = self.parameters.get(callee, {})
+                inputs = {position: value for position, value in literals.items()
+                          if not names.get(position, "").startswith("_")}
+                location = (call.lineno, call.col_offset)
+                unvaried.append((callee, location, inputs, id(call) in observed))
+                coverage.append((callee, location, inputs, id(call) in observed, id(call) in fixtures))
 
-    def issues(self):
+        for callee, group in calls.items():
+            peers = [(arguments, literals) for call, literals, arguments in group
+                     if id(call) in checked and id(call) not in expected]
+            nested = [(call, literals) for call, literals, _ in group
+                      if id(call) in fixtures and id(call) not in expected]
+            if fixed_boundary([literals for _, literals in nested]):
+                yield min(call.lineno for call, _ in nested)
+            for call, literals, arguments in group:
+                qualified = name_of(call.func)
+                root, _, name = qualified.rpartition(".")
+                module = self.imports.get(root.split(".")[0], root).split(".")[0]
+                if (not name or name[0].isupper() or helper(name) or qualified in self.checking_helpers
+                        or module in {"self", "tests"} or module in sys.stdlib_module_names
+                        or (not root and (name in self.local_helpers or hasattr(builtins, name)))):
+                    continue
+                if symmetric_input(name, literals, arguments, peers, observed=id(call) in direct):
+                    yield call.lineno
+        yield from unvaried_arguments(unvaried)
+        yield from named_arguments(test_name, coverage, lambda callee: self.parameters.get(callee, {}))
+        yield from loose_bounds(self.bound_checks())
+
+    def bound_checks(self):
+        for line, predicate, _ in self.checks:
+            if predicate is None:
+                continue
+            for node in body_nodes((predicate,)):
+                if not isinstance(node, ast.Compare):
+                    continue
+                for left, operator, right in zip(
+                        (node.left, *node.comparators), node.ops, node.comparators):
+                    for operand, other in ((left, right), (right, left)):
+                        call = self.resolve(operand, line)
+                        if not isinstance(call, ast.Call):
+                            continue
+                        bounded = (isinstance(operator, (ast.Gt, ast.GtE, ast.Lt, ast.LtE))
+                                   and type(literal(other)) in {int, float})
+                        yield (ast.unparse(call.func), (call.lineno, call.col_offset),
+                               argument_literals(call_arguments(call)), bounded)
+
+    @staticmethod
+    def constructor_calls(value):
+        for node in body_nodes((value,)):
+            if isinstance(node, ast.Call) and name_of(node.func).rsplit(".", 1)[-1][:1].isupper():
+                yield id(node)
+
+    def issues(self, test_name):
         findings = []
         recorders = {name for name, bindings in self.bindings.items()
                      if isinstance(bindings[0][1], ast.List) and not bindings[0][1].elts}
@@ -324,6 +471,8 @@ class Inspect(ast.NodeVisitor):
                 findings.append((line, "self-compare"))
             if operator is ast.Eq and self.coupled(left, right, line):
                 findings.append((line, "self-derived-expected"))
+            if operator is ast.Eq and self.zero_origin(self.resolve(left, line), right, line):
+                findings.append((line, "nondistinguishing-literal"))
 
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
                 recorder = self.recorder(node.operand, recorders)
@@ -353,20 +502,7 @@ class Inspect(ast.NodeVisitor):
                 findings.extend((line, "absence-no-control") for line in negative[name])
             elif name in self.writes and name not in self.reads:
                 findings.append((self.writes[name], "absence-no-control"))
-        for call in self.calls:
-            qualified = name_of(call.func)
-            root, _, name = qualified.rpartition(".")
-            module = self.imports.get(root.split(".")[0], root).split(".")[0]
-            if (not name or name[0].isupper() or helper(name) or qualified in self.checking_helpers
-                    or module in {"self", "tests"} or module in sys.stdlib_module_names
-                    or (not root and (name in self.local_helpers or hasattr(builtins, name)))):
-                continue
-            args = [*call.args, *(kw.value for kw in call.keywords)]
-            if symmetric_input(name, map(literal, args),
-                               [False] * len(call.args) + [True] * len(call.keywords)):
-                findings.append((call.lineno, "nondistinguishing-literal"))
-        findings.extend((line, "nondistinguishing-literal")
-                        for line in unvaried_arguments(self.argument_calls()))
+        findings.extend((line, "nondistinguishing-literal") for line in self.literal_issues(test_name))
         return findings
 
 
@@ -539,8 +675,7 @@ def checking_helpers(tree):
     def index(nodes, scope):
         for node in nodes:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if not node.name.startswith("test"):
-                    definitions[scope, node.name] = node
+                definitions[scope, node.name] = node
             elif isinstance(node, ast.ClassDef):
                 child = (*scope, node.name)
                 parents[child] = [(*scope, name_of(base)) for base in node.bases]
@@ -561,7 +696,8 @@ def checking_helpers(tree):
             f"self.{name}" for owner, name in checked if owner and owner in scopes
         }
 
-    nodes = {key: list(body_nodes(fn.body)) for key, fn in definitions.items()}
+    nodes = {key: list(body_nodes(fn.body)) for key, fn in definitions.items()
+             if not fn.name.startswith("test")}
     while True:
         found = set()
         for key, inside in nodes.items():
@@ -574,7 +710,7 @@ def checking_helpers(tree):
                    for node in inside):
                 found.add(key)
         if not found:
-            return available
+            return available, definitions
         checked.update(found)
 
 
@@ -596,7 +732,8 @@ def parse(source, path):
             for alias in node.names:
                 imports[alias.asname or alias.name] = module + "." + alias.name
 
-    checks_in = checking_helpers(tree)
+    checks_in, definitions = checking_helpers(tree)
+    parameters, methods = file_parameters(definitions)
     local_helpers = {node.name for node in tree.body
                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                      and not node.name.startswith("test")}
@@ -605,7 +742,10 @@ def parse(source, path):
     tests = []
     for node, parents in test_functions(tree.body):
         iterables = Iterables(node, parents, tables, module_names)
-        inspector = Inspect(imports, checks_in(parents), local_helpers, iterables)
+        local_parameters = {local.name: parameter_names(local) for local in node.body
+                          if isinstance(local, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        test_parameters = ChainMap(local_parameters, methods.get(parents, {}), parameters)
+        inspector = Inspect(imports, checks_in(parents), local_helpers, iterables, test_parameters)
         for statement in node.body:
             inspector.record_uses(statement)
             inspector.visit(statement)
@@ -624,7 +764,7 @@ def parse(source, path):
             end += 1
         identifier = ".".join((*path.with_suffix("").parts, *parents, node.name))
         test = Test(node.name, identifier, node.lineno, start, end, node.col_offset)
-        test.issues = inspector.issues()
+        test.issues = inspector.issues(node.name)
         if not inspector.checks:
             test.issues.append((test.line, "no-assert"))
         test.guarded = bool(inspector.checks) and all(guards for _, _, guards in inspector.checks)
