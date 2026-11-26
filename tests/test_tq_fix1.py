@@ -7,8 +7,8 @@ import test_tq as contract
 
 class ParseErrors(contract.TqCase):
     def test_literal_suffix_and_unparsable_files_do_not_stop_the_run(self):
-        # WHY: one bad file must not hide the real finding beside it, and Rust suffixes with an underscore are valid.
-        # catches: int() on "1_" aborting the run, or a per-file parse error ending the whole scan with exit 2.
+        # WHY: scanning must keep findings from both unreadable and readable files, and mark parse errors as gating.
+        # catches: rejecting "1_" suffix syntax, stopping at a parse error, or reporting parse errors as advisory.
         self.write("a_good.rs", """
             #[test]
             fn suffixes() {
@@ -32,6 +32,7 @@ class ParseErrors(contract.TqCase):
         for row in rows:
             if row["rule"] == "parse-error":
                 self.assertTrue(row["message"].strip(), row)
+                self.assertEqual(row["level"], "error", row)
 
 
 class RustTestShapes(contract.TqCase):
@@ -94,6 +95,83 @@ class RustTestShapes(contract.TqCase):
             fn delegates_to_nothing() { lazy(3); }
             """)
         self.assertEqual(found, ["fn delegates_to_nothing() { lazy(3); }"])
+
+
+    def test_production_functions_outside_the_test_module_do_not_count(self):
+        # WHY: calling production code alone does not verify its result.
+        # catches: indexing production functions above a test module or methods inside an impl.
+        found = self.no_assert_names("""
+            pub fn open() { Some(9).expect("fixture"); }
+            pub fn decode(value: u8) { assert!(value < 10); }
+
+            mod tests {
+                struct Connection;
+                impl Connection {
+                    fn close(value: u8) { assert!(value > 1); }
+                }
+
+                #[test]
+                fn opens() { super::open(); }
+                #[test]
+                fn decodes() { super::decode(3); }
+                #[test]
+                fn closes() { Connection::close(3); }
+            }
+            """)
+        self.assertEqual(found, [
+            "fn opens() { super::open(); }",
+            "fn decodes() { super::decode(3); }",
+            "fn closes() { Connection::close(3); }",
+        ])
+
+    def test_setup_guards_do_not_make_a_checking_helper(self):
+        # WHY: setup can abort or check debug invariants without verifying the behavior under test.
+        # catches: letting expect methods, failure macros or debug assertions certify a helper.
+        found = self.no_assert_names("""
+            fn open() { Some(9).expect("fixture"); }
+            fn read() { Err::<(), _>(3).expect_err("fixture"); }
+            fn prepare(value: u8) { debug_assert!(value > 1); }
+            fn reject(value: u8) { if value > 9 { panic!("fixture"); } }
+            fn select(value: u8) { if value > 9 { unreachable!(); } }
+            fn reserve(value: u8) { if value > 9 { todo!(); } }
+
+            #[test]
+            fn opens() { open(); }
+            #[test]
+            fn reads() { read(); }
+            #[test]
+            fn prepares() { prepare(3); }
+            #[test]
+            fn rejects() { reject(3); }
+            #[test]
+            fn selects() { select(3); }
+            #[test]
+            fn reserves() { reserve(3); }
+            #[test]
+            fn checks_directly() { debug_assert_eq!(open_value(), 9); }
+            """)
+        self.assertEqual(found, [
+            "fn opens() { open(); }",
+            "fn reads() { read(); }",
+            "fn prepares() { prepare(3); }",
+            "fn rejects() { reject(3); }",
+            "fn selects() { select(3); }",
+            "fn reserves() { reserve(3); }",
+        ])
+
+    def test_check_named_macro_counts_inside_a_helper(self):
+        # WHY: a project's checking macro still observes failures when called through a local helper.
+        # catches: recognizing check_eq! in a test body but requiring a built-in assertion in helpers.
+        found = self.no_assert_names("""
+            fn round_trip(value: u8) { demo::check_eq!("round trip", decode(encode(value)), value); }
+            fn encode_only(value: u8) { encode(value); }
+
+            #[test]
+            fn observes_round_trip() { round_trip(7); }
+            #[test]
+            fn only_encodes() { encode_only(7); }
+            """)
+        self.assertEqual(found, ["fn only_encodes() { encode_only(7); }"])
 
 
 class AdvisoryRules(contract.TqCase):

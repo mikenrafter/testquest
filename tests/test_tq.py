@@ -18,8 +18,11 @@ RULES = {
     "absence-no-control",
     "const-truth",
     "guarded-assert",
+    "invalid-suppression",
+    "missing-witness",
     "no-assert",
     "nondistinguishing-literal",
+    "parse-error",
     "self-compare",
     "self-derived-expected",
 }
