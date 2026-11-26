@@ -177,17 +177,17 @@ class RustTestShapes(contract.TqCase):
 class AdvisoryRules(contract.TqCase):
     ADVISORY = {"nondistinguishing-literal", "self-derived-expected"}
 
-    def test_equal_falsy_positionals_fire_but_keyword_pairs_do_not(self):
-        # WHY: equal zeros hide a swap of interchangeable parameters; named arguments fix which is which.
-        # catches: skipping every falsy duplicate, or still flagging duplicate keyword arguments.
+    def test_equal_positionals_fire_but_keyword_pairs_do_not(self):
+        # WHY: equal positional values hide a swap of parameters; named arguments fix which is which.
+        # catches: skipping equal positionals or still flagging duplicate keyword arguments.
         self.check_lint("""
             from m import f, g
 
             def test_positional():
-                assert f(0, 0) == 3  # positional pair
+                assert f(2, 2) == 3  # positional pair
 
             def test_keywords():
-                assert g(keep=(), no_defer=()) == 3
+                assert g(keep=(2,), no_defer=(2,)) == 3
             """, "nondistinguishing-literal", ("# positional pair",))
 
     def test_rules_list_the_advisory_level(self):
@@ -207,7 +207,7 @@ class AdvisoryRules(contract.TqCase):
             from m import f
 
             def test_advice():
-                assert f(0, 0) == 3
+                assert f(2, 2) == 3
             """)
         output = self.tq("lint", "advice_test.py")
         self.assertIn("nondistinguishing-literal", output)
@@ -219,7 +219,7 @@ class AdvisoryRules(contract.TqCase):
             from m import f
 
             def test_advice():
-                assert f(0, 0) == 3
+                assert f(2, 2) == 3
                 assert True
             """)
         rows = json.loads(self.tq("lint", "advice_test.py", "--json", code=(1,)))

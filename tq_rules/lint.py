@@ -29,8 +29,8 @@ RULES = {
         "The test checks repeatability, a before-and-after observation, or a declared relation between different inputs or entry points.",
     ),
     "nondistinguishing-literal": (
-        "Symmetric input can hide an ordering or argument mix-up.",
-        "The test's WHY explains the symmetry. Examples include equal weights or durations, a zero-write case, or a rule that specifically rejects equal values.",
+        "Symmetric inputs or an unvaried argument can hide an argument handling error.",
+        "The test's WHY explains the symmetric or fixed input. Examples include equal weights, a zero-write case, or a test that isolates another parameter.",
     ),
 }
 ADVISORY = {"nondistinguishing-literal", "self-derived-expected"}
@@ -45,7 +45,8 @@ def symmetric_input(name, literals, keywords=()):
     for value, keyword in zip(literals, keywords):
         if value is UNKNOWN:
             continue
-        if value is not None and type(value) is not bool and not (
+        identity = (type(value) in {int, float} and value == 0) or value in ("", b"", (), [])
+        if not identity and value is not None and type(value) is not bool and not (
                 isinstance(value, str) and value.startswith("--")):
             key = (type(value), value)
             if any(key == earlier and not (keyword and earlier_keyword)
@@ -59,6 +60,36 @@ def symmetric_input(name, literals, keywords=()):
                 and ORDERED_NAME.search(name) and value == value[::-1]):
             return True
     return False
+
+
+def unvaried_arguments(calls):
+    """Yield a first call line when checked calls vary a literal and all calls share another."""
+    by_callee = {}
+    for callee, location, literals, checked in calls:
+        by_callee.setdefault(callee, []).append((location, literals, checked))
+    for group in by_callee.values():
+        checked = [literals for _, literals, checked in group if checked]
+        if len(checked) < 2:
+            continue
+
+        varies = False
+        fixed = False
+        for position in {position for literals in checked for position in literals}:
+            samples = [literals.get(position, UNKNOWN) for literals in checked]
+            known = [(type(value), value) for value in samples
+                     if value is not UNKNOWN and value is not None and type(value) is not bool]
+            if not known:
+                continue
+            first = known[0]
+            varies |= any(sample != first for sample in known[1:])
+            all_samples = [literals.get(position, UNKNOWN) for _, literals, _ in group]
+            fixed |= all((type(value), value) == first for value in all_samples)
+        if varies and fixed:
+            yield min(location for location, _, _ in group)[0]
+
+
+def assertion(name):
+    return name.startswith(("assert", "prop_assert", "debug_assert"))
 
 
 def helper(name):

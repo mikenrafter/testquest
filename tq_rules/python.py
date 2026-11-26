@@ -5,7 +5,7 @@ import io
 import sys
 import tokenize
 
-from .lint import UNKNOWN, helper, symmetric_input
+from .lint import UNKNOWN, assertion, helper, symmetric_input, unvaried_arguments
 from .source import Comment, Test
 
 
@@ -107,6 +107,7 @@ class Inspect(ast.NodeVisitor):
         self.local_helpers = local_helpers
         self.checks = []
         self.calls = []
+        self.check_arguments = []
         self.bindings = defaultdict(list)
         self.writes = {}
         self.reads = set()
@@ -198,6 +199,7 @@ class Inspect(ast.NodeVisitor):
 
     def visit_Assert(self, node):
         self.record_check(node.lineno, node.test)
+        self.check_arguments.append(node.test)
         self.visit(node.test)
 
     def visit_Raise(self, node):
@@ -211,6 +213,9 @@ class Inspect(ast.NodeVisitor):
         method = name.rsplit(".", 1)[-1]
         if helper(method) or name in self.checking_helpers:
             self.record_check(node.lineno, predicate(node, method))
+        if assertion(method):
+            self.check_arguments.extend(node.args)
+            self.check_arguments.extend(keyword.value for keyword in node.keywords)
         if method in {"assume", "filter"}:
             self.constraints.add(method)
         if method in {"event", "target"}:
@@ -285,6 +290,31 @@ class Inspect(ast.NodeVisitor):
             return name_of(node.args[0])
         return None
 
+    def argument_calls(self):
+        checked = set()
+        for argument in self.check_arguments:
+            for node in body_nodes((argument,)):
+                if isinstance(node, ast.Call):
+                    checked.add(id(node))
+                elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    resolved = self.resolve(node, node.lineno)
+                    if isinstance(resolved, ast.Await):
+                        resolved = resolved.value
+                    if isinstance(resolved, ast.Call):
+                        checked.add(id(resolved))
+
+        for call in self.calls:
+            method = name_of(call.func).rsplit(".", 1)[-1]
+            if assertion(method):
+                continue
+            literals = {}
+            for index, arg in enumerate(call.args):
+                if isinstance(arg, ast.Starred):
+                    break
+                literals[index] = literal(arg)
+            literals.update((kw.arg, literal(kw.value)) for kw in call.keywords if kw.arg is not None)
+            yield ast.unparse(call.func), (call.lineno, call.col_offset), literals, id(call) in checked
+
     def issues(self):
         findings = []
         recorders = {name for name, bindings in self.bindings.items()
@@ -342,6 +372,8 @@ class Inspect(ast.NodeVisitor):
             if symmetric_input(name, map(literal, args),
                                [False] * len(call.args) + [True] * len(call.keywords)):
                 findings.append((call.lineno, "nondistinguishing-literal"))
+        findings.extend((line, "nondistinguishing-literal")
+                        for line in unvaried_arguments(self.argument_calls()))
         return findings
 
 

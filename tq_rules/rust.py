@@ -1,7 +1,8 @@
+from collections import defaultdict
 from dataclasses import dataclass
 import re
 
-from .lint import UNKNOWN, helper, symmetric_input
+from .lint import UNKNOWN, assertion, helper, symmetric_input, unvaried_arguments
 from .source import Comment, Test
 
 
@@ -9,6 +10,10 @@ RAW = re.compile(r'(?:br|cr|r)(#*)"')
 QUOTED = re.compile(r'(?:[bc])?"(?:[^"\\]|\\[\s\S])*"')
 CHAR = re.compile(r"(?:b)?'(?:[^'\\\n]|\\(?:x[\da-fA-F]{2}|u\{[\da-fA-F_]+\}|[^\n]))'")
 WORD = re.compile(r"(?:r#)?(?:[^\W\d]|_)\w*")
+DECIMAL = r"[0-9][0-9_]*"
+EXPONENT = rf"[eE][+-]?_*{DECIMAL}"
+FLOAT = re.compile(rf"(?:{DECIMAL}(?:\.{DECIMAL}(?:{EXPONENT})?|{EXPONENT})(?:f32|f64)?"
+                   rf"|{DECIMAL}(?:f32|f64|\.(?![.\w])))")
 NUMBER = re.compile(r"(?:0[xob][0-9a-fA-F_]+|[0-9][0-9_]*)(?:[ui](?:8|16|32|64|128|size))?")
 SYMBOL = re.compile(r"::|=>|->|==|!=|<=|>=|&&|\|\||\+=|[^\s]")
 CLOSE = {"(": ")", "[": "]", "{": "}"}
@@ -60,7 +65,8 @@ def tokenize(source):
                 offset = len(source) if end == -1 else end + len(delimiter)
                 kind = "raw"
             else:
-                for kind, pattern in (("quoted", QUOTED), ("char", CHAR), ("number", NUMBER),
+                for kind, pattern in (("quoted", QUOTED), ("char", CHAR), ("float", FLOAT),
+                                      ("number", NUMBER),
                                       ("word", WORD), ("symbol", SYMBOL)):
                     match = pattern.match(source, offset)
                     if match:
@@ -108,19 +114,24 @@ def split(tokens, delimiter=","):
         yield tokens[start:]
 
 
-def literal(tokens):
+def literal(tokens, *, signed_and_float=False):
+    if (signed_and_float and len(tokens) == 2 and tokens[0].text == "-"
+            and tokens[1].kind in {"number", "float"}):
+        return -literal(tokens[1:], signed_and_float=True)
     if len(tokens) == 3 and shape(tokens[:2]) == ("vec", "!") and tokens[2].kind == "group":
         tokens = tokens[2:]
     if len(tokens) != 1:
         return UNKNOWN
     token = tokens[0]
     if token.kind == "group" and token.text in {"[", "("}:
-        values = [literal(part) for part in split(token.children)]
+        values = [literal(part, signed_and_float=signed_and_float) for part in split(token.children)]
         if UNKNOWN in values:
             return UNKNOWN
         return tuple(values) if token.text == "(" else values
     if token.text in {"true", "false"}:
         return token.text == "true"
+    if signed_and_float and token.kind == "float":
+        return float(re.sub(r"_?f(?:32|64)$", "", token.text).replace("_", ""))
     if token.kind == "number":
         number = re.sub(r"_?[ui](?:8|16|32|64|128|size)$", "", token.text).replace("_", "")
         return int(number, 0) if number.startswith(("0x", "0o", "0b")) else int(number)
@@ -366,6 +377,26 @@ def invocation_at(tokens, index):
     return None
 
 
+def callee_start(tokens, index):
+    while index >= 2 and tokens[index - 1].text in {".", "::"} and tokens[index - 2].kind == "word":
+        index -= 2
+    if index and tokens[index - 1].text == "::":
+        return index - 1
+    if index and tokens[index - 1].text in {".", "fn"}:
+        return None
+    return index
+
+
+def check_arguments(tokens):
+    for index, token in enumerate(tokens):
+        if token.kind == "group":
+            yield token
+            yield from check_arguments(token.children)
+        elif (token.kind == "word" and (not index or tokens[index - 1].text not in {".", "::"})
+              and (index + 1 == len(tokens) or tokens[index + 1].text not in {"::", ":"})):
+            yield token
+
+
 def starts_check(tokens, index, macro, known, *, in_helper=False):
     name = tokens[index].text
     if in_helper:
@@ -411,6 +442,8 @@ class Inspect:
         self.increments = set()
         self.assumes = False
         self.literal_issues = []
+        self.calls = defaultdict(list)
+        self.check_arguments = []
 
     def visit(self, tokens, guarded=False):
         guarded_blocks = conditional_blocks(tokens)
@@ -443,6 +476,16 @@ class Inspect:
             if invocation:
                 arguments, macro = invocation
                 args = list(split(arguments.children))
+                if assertion(text):
+                    self.check_arguments.append(arguments)
+                elif not macro and text not in {"if", "while", "for", "match", "return", "break", "move"}:
+                    start = callee_start(tokens, index)
+                    if start is not None:
+                        first = tokens[start]
+                        literals = {position: literal(arg, signed_and_float=True)
+                                    for position, arg in enumerate(args)}
+                        self.calls[shape(tokens[start:index + 1])].append(
+                            ((first.line, first.column), arguments, literals))
                 if starts_check(tokens, index, macro, self.helpers):
                     self.checks.append((token.line, text, args, guarded))
                 elif (not text[0].isupper() and not (macro and text == "vec")
@@ -486,8 +529,25 @@ class Inspect:
             return False
         return True
 
+    def argument_calls(self):
+        checked = set()
+        for arguments in self.check_arguments:
+            for token in check_arguments(arguments.children):
+                if token.kind == "group":
+                    checked.add(id(token))
+                elif token.text in self.bindings:
+                    value = self.resolve((token,), token.line)
+                    if len(value) > 1 and value[-1].text == "(" and shape(value[:-1]) in self.calls:
+                        checked.add(id(value[-1]))
+
+        for callee, calls in self.calls.items():
+            for location, arguments, literals in calls:
+                yield callee, location, literals, id(arguments) in checked
+
     def issues(self):
         findings = self.literal_issues.copy()
+        findings.extend((line, "nondistinguishing-literal")
+                        for line in unvaried_arguments(self.argument_calls()))
         recorders = {
             name for name, bindings in self.bindings.items()
             if shape(bindings[0][1]) in {("Vec", "::", "new", "("), ("vec", "!", "[")}
