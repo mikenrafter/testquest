@@ -76,9 +76,10 @@ OBSERVERS = {"len", "set", "list", "sorted", "tuple", "str", "bool", "int", "byt
 
 
 class Inspect(ast.NodeVisitor):
-    def __init__(self, imports, checking_helpers):
+    def __init__(self, imports, checking_helpers, local_helpers):
         self.imports = imports
         self.checking_helpers = checking_helpers
+        self.local_helpers = local_helpers
         self.checks = []
         self.calls = []
         self.bindings = defaultdict(list)
@@ -258,8 +259,8 @@ class Inspect(ast.NodeVisitor):
             root, _, name = qualified.rpartition(".")
             module = self.imports.get(root.split(".")[0], root).split(".")[0]
             if (not name or name[0].isupper() or helper(name) or qualified in self.checking_helpers
-                    or module == "self" or module in sys.stdlib_module_names
-                    or (not root and hasattr(builtins, name))):
+                    or module in {"self", "tests"} or module in sys.stdlib_module_names
+                    or (not root and (name in self.local_helpers or hasattr(builtins, name)))):
                 continue
             args = [*call.args, *(kw.value for kw in call.keywords)]
             if symmetric_input(name, map(literal, args)):
@@ -348,9 +349,12 @@ def parse(source, path):
                 imports[alias.asname or alias.name] = module + "." + alias.name
 
     checks_in = checking_helpers(tree)
+    local_helpers = {node.name for node in tree.body
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     and not node.name.startswith("test")}
     tests = []
     for node, parents in test_functions(tree.body):
-        inspector = Inspect(imports, checks_in(parents))
+        inspector = Inspect(imports, checks_in(parents), local_helpers)
         for statement in node.body:
             inspector.record_uses(statement)
             inspector.visit(statement)

@@ -1,8 +1,10 @@
 from contextlib import chdir
 import io
+import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tarfile
 import tempfile
@@ -25,8 +27,8 @@ def snapshot(repository, destination, worktree):
 
     for relative in repo.tracked(repository):
         source = repository / relative
-        if not source.parent.resolve().is_relative_to(repository):
-            raise ValueError(f"Tracked path has a parent outside the repository: {relative}")
+        if source.parent.resolve() != source.parent:
+            raise ValueError(f"Tracked file has a symlinked parent directory: {relative}")
         output = destination / relative
         if source.is_symlink():
             target = source.readlink()
@@ -41,8 +43,19 @@ def snapshot(repository, destination, worktree):
 
 def invoke(command, directory, environment):
     try:
-        return subprocess.run(command, cwd=directory, env=environment, capture_output=True,
-                              text=True, errors="replace", timeout=TIMEOUT), ""
+        with subprocess.Popen(command, cwd=directory, env=environment, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, errors="replace",
+                              start_new_session=True) as process:
+            try:
+                out, err = process.communicate(timeout=TIMEOUT)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+                raise
+            return subprocess.CompletedProcess(command, process.returncode, out, err), ""
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, str(error)
 
@@ -93,6 +106,7 @@ def run(repository, worktree, command):
     rows = []
     with tempfile.TemporaryDirectory(prefix="tq-catches-") as temp:
         base = Path(temp).resolve() / "source"
+        environment["GIT_CEILING_DIRECTORIES"] = str(base.parent)
         base.mkdir()
         snapshot(repository, base, worktree)
         with chdir(base):

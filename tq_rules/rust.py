@@ -300,7 +300,7 @@ class Inspect:
                     args = list(split(arguments.children))
                     if (macro and text in ASSERTIONS | FAILURES) or helper(text):
                         self.checks.append((token.line, text, args, guarded))
-                    elif (not text[0].isupper() and not text.startswith(("assert_", "check_"))
+                    elif (not text[0].isupper() and not (macro and text == "vec")
                           and symmetric_input(text, map(literal, args))):
                         self.literal_issues.append((token.line, "nondistinguishing-literal"))
             if token.kind == "group":

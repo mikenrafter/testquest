@@ -10,15 +10,15 @@ RULES = {
     ),
     "self-compare": (
         "Assertion compares the same expression on both sides.",
-        "Reflexivity or repeated-call behavior is the stated property.",
+        "The stated property is reflexivity or repeatability, and both operands are independently evaluated.",
     ),
     "no-assert": (
         "Test has no assertion, expected exception, or recognized checking helper.",
-        "Successful execution is the explicit smoke-test contract, or a helper enforces the outcome.",
+        "The stated check is successful execution, such as passing output through a strict parser.",
     ),
     "guarded-assert": (
         "Every check is conditional and the test can skip them all.",
-        "The test or a named witness independently proves that the checked branch is reached.",
+        "The branch is exercised by a named witness, or zero matching items is explicitly a valid case.",
     ),
     "absence-no-control": (
         "Recorder has no positive check showing it can observe an action.",
@@ -26,11 +26,11 @@ RULES = {
     ),
     "self-derived-expected": (
         "Actual and expected values come from the same function or module.",
-        "The test checks repeatability, a before-and-after observation, or a relation anchored by an independent oracle.",
+        "The test checks repeatability, a before-and-after observation, or a declared relation between different inputs or entry points.",
     ),
     "nondistinguishing-literal": (
         "Symmetric input can hide an ordering or argument mix-up.",
-        "The test's WHY explains the symmetry, such as an equal-input boundary, independent flags, or an intentional repeated option.",
+        "The test's WHY explains the symmetry. Examples include equal weights or durations, a zero-write case, or a rule that specifically rejects equal values.",
     ),
 }
 ORDERED_NAME = re.compile(r"reverse|order|swap|endian|rotate|crc|encode", re.I)

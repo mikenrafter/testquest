@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import tokenize
 
 
 @dataclass(frozen=True)
@@ -38,14 +40,21 @@ def scan_paths(inputs):
         path = Path(item)
         if not path.exists():
             raise FileNotFoundError(path)
-        candidates = path.rglob("*") if path.is_dir() else [path]
-        for candidate in candidates:
-            if (candidate.suffix in {".py", ".rs"} and not candidate.is_symlink()
-                    and candidate.is_file() and not IGNORED.intersection(candidate.parts)):
-                paths.add(candidate)
+        if path.is_dir():
+            for directory, children, files in os.walk(path):
+                children[:] = [child for child in children if child not in IGNORED]
+                paths.update(candidate for name in files if (candidate := Path(directory, name)).suffix in {".py", ".rs"}
+                             and not candidate.is_symlink())
+        elif path.suffix in {".py", ".rs"} and not path.is_symlink():
+            paths.add(path)
     for path in sorted(paths, key=str):
-        adapter = python if path.suffix == ".py" else rust
-        yield path, *adapter.parse(path.read_text(encoding="utf-8"), path)
+        if not path.is_file():
+            continue
+        if path.suffix == ".py":
+            with tokenize.open(path) as stream:
+                yield path, *python.parse(stream.read(), path)
+        else:
+            yield path, *rust.parse(path.read_text(encoding="utf-8"), path)
 
 
 def finding(path, line, rule, message):
