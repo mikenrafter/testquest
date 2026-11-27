@@ -1,6 +1,6 @@
 """JVM assertion operands, literal proofs and recorder observations."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import lint
 from .ast_grep import children, line, query, shape, unwrap
@@ -183,6 +183,9 @@ class Check:
     snapshot_subject: object = None
     fragment_needle: object = None
     fragment_negative: bool = False
+    controls: dict = field(default_factory=dict)
+    disabled: frozenset = frozenset()
+    sizes: tuple = ()
 
     def constant(self, syntax):
         if self.predicate is not None:
@@ -237,7 +240,7 @@ def kotest_matcher(method):
     return method in KOTEST_EXACT or method.startswith(KOTEST_PREFIXES)
 
 
-def fluent_origin(file, node):
+def fluent_origin(file, node, *, preserves_size=False):
     transformed = False
     while (call := call_of(node)) is not None:
         method = file.resolve_name(call.method)
@@ -250,7 +253,7 @@ def fluent_origin(file, node):
             sender = call_of(call.receiver)
             if sender is not None and sender.method in {"assertWithMessage", "withMessage", "assert_"}:
                 return True, None if transformed else call.args[0]
-        transformed |= method in FLUENT_TRANSFORMS
+        transformed |= method in FLUENT_TRANSFORMS and not (preserves_size and method in {"extracting", "map"})
         if method not in FLUENT_OPTIONS | FLUENT_TRANSFORMS and not method.startswith(FLUENT_TERMINALS):
             break
         node = call.receiver
@@ -278,7 +281,7 @@ def junit_args(file, call, method):
         trailing_message = qualified.startswith(("org.junit.jupiter.", "kotlin.test.")) or (
             owner == "Assertions" or "org.junit.jupiter.api.Assertions" in file.wildcard_imports)
         can_have_leading_message = slots == 1 or method != "assertEquals" or len(args) > 3 or (
-            file.syntax.language == "java" and args[0].kind() == "string_literal")
+            args[0].kind() == "string_literal")
         if leading_message and can_have_leading_message or (
                 file.syntax.language == "java" and not trailing_message and args[0].kind() == "string_literal"):
             return args[1:]
@@ -301,22 +304,33 @@ def check_call(file, node, call):
         if method == "assertThatThrownBy":
             return Check(node)
         if method in VERIFICATIONS and call.callbacks():
-            return Check(node, observations=mockk_observations(file, call))
+            from .ast_grep_jvm_controls import disabled_verifications
+
+            check = mockk_observations(file, Check(node), call)
+            if check.controls:
+                check.disabled = frozenset(disabled_verifications(file, call))
+            return check
         return None
     if method in {"assertGolden", "assertSnapshot", "assertMatchesGolden", "assertMatchesSnapshot",
                   "verifySnapshot"} and first is not None:
         return Check(node, snapshot_subject=call.named.get("actual", first))
     if method in NO_INTERACTIONS:
-        observations = tuple((("calls", target), False) for arg in call.args
-                             if (target := file.recorder(arg)) is not None)
-        return Check(node, observations=observations)
+        from .ast_grep_jvm_controls import verified_call
+
+        check = Check(node)
+        for arg in call.args:
+            record_observation(check, (key for key in verified_call(file, arg, "")
+                                       if key[0] in {"calls", "mock-type"}), False)
+        return check
     if call.receiver is not None:
         if (verified := call_of(call.receiver)) is not None and file.resolve_name(verified.method) == "verify":
-            return Check(node, observations=mockito_observations(file, verified))
+            return mockito_observations(file, Check(node), verified, call.method)
         found, subject = fluent_origin(file, call.receiver)
         if found and method not in FLUENT_OPTIONS | FLUENT_TRANSFORMS and method.startswith(FLUENT_TERMINALS):
             check = (predicate(node, subject, method in {"isFalse", "shouldBeFalse"})
                      if method in BOOLEANS else equality(node, method, subject, first))
+            if subject is None and method in {"hasSize", "containsExactly", "containsOnly", "contains", "isNotEmpty"}:
+                _, subject = fluent_origin(file, call.receiver, preserves_size=True)
             return collect_observations(file, check, method, subject, first)
         if method == "check" and first is not None and call_of(first) is not None and (
                 call_of(first).method in {"matches", "doesNotExist", "selectedDescendantsMatch"}):
@@ -373,7 +387,7 @@ def infix_check(file, node):
     return None
 
 
-def mockk_observations(file, call):
+def mockk_observations(file, check, call):
     exact, least, most = (literal(file.syntax, call.named.get(key)) for key in ("exactly", "atLeast", "atMost"))
     if exact == 0 or most == 0:
         present = False
@@ -381,31 +395,55 @@ def mockk_observations(file, call):
           or all(key not in call.named for key in ("exactly", "atLeast", "atMost"))):
         present = True
     else:
-        return ()
-    return tuple((("calls", key), present) for callback in call.callbacks()
-                 for statements in children(callback) if statements.kind() == "statements"
-                 for entry in children(statements)
-                 if (recorded := call_of(entry)) is not None and (key := file.recorder(recorded.receiver)) is not None)
+        return check
+    from .ast_grep_jvm_controls import verified_call
+
+    for callback in call.callbacks():
+        statements = child(callback, "statements")
+        if statements is None:
+            continue
+        for entry in children(statements):
+            recorded = call_of(entry)
+            if recorded is None:
+                continue
+            keys = verified_call(file, recorded.receiver, recorded.method)
+            record_observation(check, (key for key in keys if not present or key[0] != "captured-mock"), present)
+    return check
 
 
-def mockito_observations(file, call):
-    if not call.args or (target := file.recorder(call.args[0])) is None:
-        return ()
+def record_observation(check, keys, present):
+    keys = tuple(keys)
+    if not keys:
+        return
+    if present:
+        check.observations += tuple((key, True) for key in keys)
+    else:
+        check.observations += ((keys[0], False),)
+        check.controls[keys[0]] = check.controls.get(keys[0], frozenset()) | frozenset(keys)
+
+
+def mockito_observations(file, check, call, method):
+    from .ast_grep_jvm_controls import verified_call
+
+    if not call.args:
+        return check
     if len(call.args) == 1:
-        return ((("calls", target), True),)
-    mode = call_of(call.args[1])
-    if mode is not None:
-        if mode.method == "never":
-            return ((("calls", target), False),)
-        if mode.method == "atLeastOnce":
-            return ((("calls", target), True),)
-        if mode.args and mode.method in {"times", "atLeast", "atMost"}:
+        present = True
+    elif (mode := call_of(call.args[1])) is not None:
+        if mode.method in {"never", "atLeastOnce"}:
+            present = mode.method == "atLeastOnce"
+        elif mode.args and mode.method in {"times", "atLeast", "atMost"}:
             count = literal(file.syntax, mode.args[0])
-            if count == 0 and mode.method != "atLeast":
-                return ((("calls", target), False),)
-            if type(count) is int and count > 0 and mode.method != "atMost":
-                return ((("calls", target), True),)
-    return ()
+            if type(count) is not int or count < 0 or mode.method == ("atMost" if count else "atLeast"):
+                return check
+            present = count > 0
+        else:
+            return check
+    else:
+        return check
+    keys = verified_call(file, call.args[0], method)
+    record_observation(check, (key for key in keys if present or key[0] != "mock-type"), present)
+    return check
 
 
 def string_needle(node):
@@ -421,9 +459,10 @@ def collect_observations(file, check, method="", subject=None, expected=None):
         check.fragment_needle = expected
         check.fragment_negative |= check.negated or method in {"doesNotContain", "shouldNotContain"}
 
+    from .ast_grep_jvm_controls import captured_slot, collection_controls_for, sized_source
+
     def observe(receiver, present):
-        if (target := file.collection_recorder(receiver)) is not None:
-            check.observations = ((("size", target), present),)
+        record_observation(check, collection_controls_for(file, receiver, present), present)
         return check
 
     def observed_item(node):
@@ -435,8 +474,18 @@ def collect_observations(file, check, method="", subject=None, expected=None):
             return call.receiver
         return None
 
+    for operand in (subject, check.left, check.right, check.predicate):
+        if (slot := captured_slot(file, operand)) is not None:
+            record_observation(check, (("capture-slot", slot),), True)
     tested = unwrap(check.predicate)
     if tested is not None:
+        operator, left, right = split(tested)
+        if operator == ("||" if check.negated else "&&"):
+            for operand in (left, right):
+                asserted = collect_observations(file, predicate(check.node, operand, check.negated))
+                check.observations += asserted.observations
+                check.controls.update(asserted.controls)
+                check.sizes += asserted.sizes
         opposite = negate(tested)
         if (call := call_of(opposite or tested)) is not None and call.receiver is not None:
             if call.method == "contains" and len(call.args) == 1 and string_needle(call.args[0]):
@@ -452,7 +501,7 @@ def collect_observations(file, check, method="", subject=None, expected=None):
         return observe(subject, method in {"isNotEmpty", "shouldNotBeEmpty"})
     if method in {"assertNotNull", "isNotNull"} and (receiver := observed_item(subject)) is not None:
         return observe(receiver, True)
-    if method in {"contains", "containsAnyOf", "containsExactly", "containsExactlyElementsIn",
+    if method in {"contains", "containsOnly", "containsAnyOf", "containsExactly", "containsExactlyElementsIn",
                   "containsAtLeast", "shouldContain", "hasSizeGreaterThan", "hasSizeLessThan", "hasSize",
                   "shouldHaveSize"}:
         length = literal(file.syntax, expected)
@@ -461,6 +510,8 @@ def collect_observations(file, check, method="", subject=None, expected=None):
                 if method == "hasSizeLessThan" and length == 1:
                     return observe(subject, False)
                 if method != "hasSizeLessThan":
+                    if method in {"hasSize", "shouldHaveSize"} and (key := sized_source(file, subject)) is not None:
+                        check.sizes += ((key, length),)
                     return observe(subject, length > 0 or method == "hasSizeGreaterThan")
         elif method == "containsExactlyElementsIn":
             known = iterable_size(file.syntax, expected)
@@ -474,19 +525,28 @@ def collect_observations(file, check, method="", subject=None, expected=None):
                                              (check.right, check.left, reverse.get(check.operator, check.operator))):
             if relation == "==" and (receiver := observed_item(operand)) is not None:
                 value = literal(file.syntax, expected)
-                if value is not UNKNOWN and value is not None:
+                item = file.immutable_value(unwrap(operand)) or unwrap(operand)
+                while (base := member(item)[0]) is not None:
+                    item = base
+                read = call_of(item)
+                if (value is not UNKNOWN and value is not None
+                        or read is not None and read.method in {"single", "first", "getFirst"}
+                        or (size := iterable_size(file.syntax, expected)) is not None and size > 0):
                     return observe(receiver, True)
             if relation == "==" and call_of(expected) is not None and (size := iterable_size(
                     file.syntax, expected)) is not None and size > 0:
                 if file.collection_recorder(operand) is not None:
                     return observe(operand, True)
+            operand = file.immutable_value(unwrap(operand)) or unwrap(operand)
             receiver, property_name = member(operand)
             measurement = call_of(operand)
-            if measurement is not None and not measurement.args:
+            if measurement is not None and (not measurement.args or measurement.method == "count"):
                 receiver, property_name = measurement.receiver, measurement.method
             count = literal(file.syntax, expected)
             if property_name not in {"size", "length", "count"} or type(count) is not int or count < 0:
                 continue
+            if relation == "==" and (key := sized_source(file, receiver)) is not None:
+                check.sizes += ((key, count),)
             if relation == "==" or count == 0 and relation in {"!=", ">", "<="} or count == 1 and relation == "<":
                 return observe(receiver, (count > 0) if relation == "==" else relation in {"!=", ">"})
             if relation in {">", ">="} and count > 0:

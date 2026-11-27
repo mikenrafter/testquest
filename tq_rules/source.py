@@ -61,6 +61,8 @@ class CollectionControls:
     def __init__(self):
         self.witnesses = defaultdict(set)
         self.pending = []
+        self.deferred = []
+        self.context = {}
 
     def record(self, path, scan_root, fingerprint, test=None, line=None):
         markers = ({"Cargo.toml", ".git"} if path.suffix == ".rs"
@@ -76,8 +78,12 @@ class CollectionControls:
         for key, paths in other.witnesses.items():
             self.witnesses[key].update(paths)
         self.pending.extend(other.pending)
+        self.deferred.extend(other.deferred)
+        self.context.update(other.context)
 
     def finish(self):
+        for resolve in self.deferred:
+            resolve(self.context)
         for key, path, test, line in self.pending:
             if not self.witnesses.get(key, set()) - {path}:
                 test.issues.append((line, "absence-no-control"))

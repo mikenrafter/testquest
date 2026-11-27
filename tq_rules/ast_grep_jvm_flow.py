@@ -9,6 +9,8 @@ from .ast_grep_jvm import (
     CALLS, CLASSES, FUNCTIONS, LAMBDAS, bind_arguments, body_of, call_of, child, has_safe_navigation,
     member, name, node_key,
 )
+from .ast_grep_jvm_controls import declared_value, sized_source
+from .ast_grep_jvm_fixtures import counted_list_builder, fixture_truth, java_list_fixture
 from .ast_grep_jvm_checks import (
     ITERATING, SYNCHRONOUS, Check, check_call, collect_observations, compare, infix_check, iterable_size,
     literal, negate, predicate, split, truth,
@@ -19,12 +21,15 @@ from .ast_grep_jvm_checks import (
 class Evidence:
     checked: bool = False
     witnesses: frozenset = frozenset()
+    sizes: frozenset = frozenset()
 
     def then(self, next_evidence):
-        return Evidence(self.checked or next_evidence.checked, self.witnesses | next_evidence.witnesses)
+        return Evidence(self.checked or next_evidence.checked, self.witnesses | next_evidence.witnesses,
+                        self.sizes | next_evidence.sizes)
 
     def either(self, alternative):
-        return Evidence(self.checked and alternative.checked, self.witnesses & alternative.witnesses)
+        return Evidence(self.checked and alternative.checked, self.witnesses & alternative.witnesses,
+                        self.sizes & alternative.sizes)
 
 
 def merge(evidence):
@@ -69,6 +74,8 @@ def failure_statement(node):
     node = unwrap(node)
     if node is None:
         return False
+    if node.kind() == "expression_statement":
+        node = children(node)[0]
     call = call_of(node)
     return (call is not None and call.method == "fail"
             or node.kind() in {"jump_expression", "throw_statement"} and throws_assertion_error(node))
@@ -136,8 +143,10 @@ def deadline_poll(loop):
 
 
 class Flow:
-    def __init__(self, file):
+    def __init__(self, file, sizes=None):
         self.file = file
+        self.sizes = sizes or {}
+        self.fixture_item = None
         self.checks = {}
         self.active = set()
         self.invocation = None
@@ -156,7 +165,7 @@ class Flow:
     def record(self, check):
         site = self.invocation if self.invocation is not None else check.node
         self.checks[node_key(site), (*node_key(check.node), str(self.file.path))] = replace(check, node=site)
-        return {"next": Evidence(True, frozenset(key for key, present in check.observations if present))}
+        return {"next": Evidence(True, frozenset(key for key, present in check.observations if present), frozenset(check.sizes))}
 
     def visit(self, node):
         node = unwrap(node)
@@ -313,15 +322,39 @@ class Flow:
             return executed
         if method in ITERATING:
             iterable = (self.known_literal(call.args[0]) if method == "repeat" and call.args
-                        else self.iterable_size(call.receiver))
+                        else self.iterable_size(self.loop_receiver(call.receiver)))
+            source = self.loop_receiver(call.receiver)
+            split_call = call_of(source)
+            if method in {"forEach", "forEachIndexed"} and self.file.syntax.language == "kotlin" and (
+                    split_call is not None and split_call.receiver is not None and split_call.method == "split"
+                    and len(split_call.args) == 1 and literal(self.file.syntax, split_call.args[0]) is not lint.UNKNOWN):
+                return executed
             if type(iterable) is int and iterable > 0:
                 origin = call_of(self.file.immutable_value(call.receiver) or call.receiver)
                 if method in {"repeat", "forEach", "forEachIndexed"} or (
                         origin is not None and origin.method != "sequenceOf"):
                     return executed
-            source = call.args[0] if method == "repeat" and call.args else call.receiver
+            source = call.args[0] if method == "repeat" and call.args else source
             self.remember_loop(previous_checks, source)
         return alternatives(NORMAL, finish(executed, "throw", "assertion-failure", "return", "break", "continue"))
+
+    def loop_receiver(self, receiver):
+        node = unwrap(receiver)
+        if self.file.syntax.language != "kotlin" or node is None or node.kind() != "call_expression":
+            return receiver
+        parts = children(node)
+        if len(parts) != 2 or parts[0].kind() != "call_expression" or parts[-1].kind() != "call_suffix" or (
+                parts[0].range().end.line >= parts[1].range().start.line):
+            return receiver
+        declaration = next((entry for entry in node.ancestors() if entry.kind() == "property_declaration"), None)
+        if declaration is None or declaration.range().start.column != parts[1].range().start.column:
+            return receiver
+        arguments = child(parts[-1], "value_arguments")
+        if arguments is not None and len(children(arguments)) == 1:
+            value = child(children(arguments)[0], "range_expression")
+            if value is not None:
+                return value
+        return receiver
 
     def has_callback_check(self, callback, call_kind):
         if any(check_call(self.file, entry, inner) is not None
@@ -338,17 +371,23 @@ class Flow:
                     continue
                 self.loop_checks.setdefault(key, source)
 
-    def known_literal(self, node, file=None, bindings=None):
+    def known_literal(self, node, file=None, bindings=None, active=frozenset()):
         file = file or self.file
         node = unwrap(node)
         if node is not None and (identifier := name(node)):
-            _, binding = file.visible_binding(node, identifier)
+            scope, binding = file.visible_binding(node, identifier)
             if binding is not None:
-                key = file.path, node_key(binding)
-                if bindings and key in bindings:
-                    origin, argument = bindings[key]
+                if (bound := self.bound_value(node, file, bindings)) is not None:
+                    origin, argument = bound
                     return literal(origin.syntax, origin.immutable_value(unwrap(argument)) or argument)
-                node = file.initializer(binding, immutable=True) or node
+                node = file.stable_initializer(node, scope, binding) or node
+        receiver, measurement = member(node)
+        called = call_of(node)
+        if called is not None and not called.args:
+            receiver, measurement = called.receiver, called.method
+        if measurement in {"size", "length", "count"} and receiver is not None:
+            if (size := self.iterable_size(receiver, file, bindings, active)) is not None:
+                return size
         return literal(file.syntax, node)
 
     def iterable_size(self, node, file=None, bindings=None, active=frozenset()):
@@ -363,6 +402,8 @@ class Flow:
         if (bound := self.bound_value(node, file, bindings)) is not None:
             defining_file, value = bound
             return self.iterable_size(value, defining_file, bindings, active)
+        if self.sizes and (source := sized_source(file, node)) in self.sizes:
+            return self.sizes[source]
         value = file.immutable_value(node) or file.local_array(node)
         if value is not None:
             origin = call_of(value)
@@ -376,6 +417,10 @@ class Flow:
             if target is not None and (body := child(target[1], "enum_class_body", "enum_body")) is not None:
                 return sum(entry.kind() in {"enum_entry", "enum_constant"} for entry in children(body))
         if call is None and receiver is not None:
+            if component in {"values", "keys", "entries"}:
+                size = self.iterable_size(receiver, file, bindings, active)
+                if size is not None:
+                    return size
             if (property_value := file.object_property(receiver, component)) is not None:
                 defining_file, value = property_value
                 return self.iterable_size(value, defining_file, bindings, active)
@@ -395,6 +440,8 @@ class Flow:
                 steps = children(body) if body is not None else []
                 if len(steps) == 1:
                     return self.iterable_size(steps[0], file, bindings, active)
+            if call.named and (count := counted_list_builder(file, call)) is not None:
+                return count
             if (local := file.helper(node, call)) is not None:
                 defining_file, declaration = local
                 key = defining_file.path, node_key(declaration)
@@ -414,7 +461,33 @@ class Flow:
                     slots.update({(defining_file.path, node_key(parameter)): (file if supplied else defining_file, value)
                                   for parameter, value, supplied in bind_arguments(declaration, call)})
                     return self.iterable_size(steps[0], defining_file, slots, active | {key})
+        if node.kind() in {"range_expression", "infix_expression"}:
+            entries = children(node)
+            if len(entries) in {2, 3}:
+                operator = (name(entries[1]) if len(entries) == 3 else
+                            next((token.kind() for token in node.children() if token.kind() in {"..", "..<"}), ""))
+                first, last = (self.known_literal(entry, file, bindings, active)
+                               for entry in (entries[0], entries[-1]))
+                if type(first) is type(last) is int:
+                    if operator in {"..", "..<", "until"}:
+                        return len(range(first, last + int(operator == ".."))) if abs(first - last) < 2**63 - 1 else None
+                    if operator == "downTo":
+                        return len(range(first, last - 1, -1)) if abs(first - last) < 2**63 - 1 else None
         return iterable_size(file.syntax, node)
+
+    def filtered_source(self, source):
+        seen = set()
+        while source is not None and node_key(source) not in seen:
+            seen.add(node_key(source))
+            called = call_of(source)
+            if called is not None:
+                if called.method in {"filter", "filterNot", "filterNotNull", "mapNotNull", "mapIndexedNotNull"}:
+                    return True
+                source = called.receiver
+            else:
+                receiver, _ = member(source)
+                source = receiver or declared_value(self.file, source)[2]
+        return False
 
     def bound_value(self, node, file, bindings):
         if not (identifier := name(node)):
@@ -441,7 +514,8 @@ class Flow:
         evaluated = self.visit(condition)
         if "next" not in evaluated:
             return evaluated
-        known = truth(self.file.syntax, condition)
+        known = (fixture_truth(self.file, condition, *self.fixture_item) if self.fixture_item is not None
+                 else truth(self.file.syntax, condition))
         branches = []
         if known is not False:
             branches.append(self.visit(positive))
@@ -486,7 +560,11 @@ class Flow:
         if kind == "enhanced_for_statement":
             iterable = node.field("value")
             size = self.iterable_size(iterable)
-            return self.iterate(node, self.visit(iterable), node.field("body"), size is not None and size > 0, iterable)
+            before = self.visit(iterable)
+            body = node.field("body")
+            if "next" in before and (fixtures := java_list_fixture(self.file, iterable)):
+                return followed_by(before, self.fixture_loop(node, body, fixtures))
+            return self.iterate(node, before, body, size is not None and size > 0, iterable)
         if self.file.syntax.language == "kotlin":
             condition, body = (elements + [None, None])[:2]
             if kind == "do_while_statement":
@@ -506,6 +584,22 @@ class Flow:
         if kind == "for_statement" and self.file.syntax.language == "java":
             definite |= condition is None or self.first_iteration(init, condition)
         return self.iterate(node, before, body, definite, condition if kind == "for_statement" else None)
+
+    def fixture_loop(self, loop, body, fixtures):
+        previous = self.fixture_item
+        exits = NORMAL
+        try:
+            for item in fixtures:
+                if "next" not in exits:
+                    break
+                self.fixture_item = loop, item
+                exits = followed_by(exits, finish(self.visit(body), "continue"))
+                active = exits.get("next")
+                if active is not None and active.checked:
+                    break
+        finally:
+            self.fixture_item = previous
+        return finish(exits, "break")
 
     def first_iteration(self, init, condition):
         operator, left, right = split(condition)
@@ -552,7 +646,8 @@ class Flow:
         tried = self.visit(body)
         catches = [entry for entry in entries if entry.kind() in {"catch_block", "catch_clause"}]
         if catches:
-            tried = alternatives(tried, *(self.visit(body_of(catch)) for catch in catches))
+            expected = self.expected_failure(body, catches)
+            tried = alternatives(tried, *(followed_by(expected, self.visit(body_of(catch))) for catch in catches))
         cleanup = child(node, "finally_block", "finally_clause")
         if cleanup is None:
             return tried
@@ -560,3 +655,14 @@ class Flow:
         return alternatives(*(
             {reason if exit_kind == "next" else exit_kind: evidence.then(final)} for reason, evidence in tried.items() for exit_kind, final in completed.items()
         ))
+
+    def expected_failure(self, body, catches):
+        steps = children(body) if body is not None else []
+        if len(steps) < 2 or not failure_statement(steps[-1]):
+            return NORMAL
+        for catch in catches:
+            caught = child(catch, "user_type") or child(child(catch, "catch_formal_parameter"), "catch_type")
+            if caught is None or any(entry.text().rsplit(".", 1)[-1] in {"Error", "Throwable", "AssertionError"}
+                                     for entry in children(caught)):
+                return NORMAL
+        return {"next": Evidence(checked=True)}

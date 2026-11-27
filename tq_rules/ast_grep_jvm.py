@@ -239,6 +239,7 @@ class File:
         self.registrations = {}
         self.packages = {}
         self.resolved_types = {}
+        self.callback_origins = None
         kotlin = syntax.language == "kotlin"
         type_kinds = ("class_declaration", "object_declaration") if kotlin else (
             "class_declaration", "record_declaration", "enum_declaration")
@@ -246,7 +247,7 @@ class File:
         for entry in query(syntax.root, "import_header" if kotlin else "import_declaration"):
             qualified = child(entry, "identifier", "scoped_identifier")
             if qualified is not None:
-                if any(token.kind() in {"*", "asterisk"} for token in entry.children()):
+                if any(token.kind() in {"*", "asterisk", "wildcard_import"} for token in entry.children()):
                     self.wildcard_imports.add(qualified.text())
                     continue
                 alias = child(child(entry, "import_alias"), *IDENTIFIERS)
@@ -657,8 +658,7 @@ def comments(syntax):
 
 def parse(source, path, language, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
     from .ast_grep_jvm_checks import compares_itself
-    from .ast_grep_jvm_flow import Flow, merge
-
+    from .ast_grep_jvm_controls import analyze, capture_controls, shared_keys, sibling_controls
     from .ast_grep_jvm_micro import micro_snapshot
 
     syntax = parse_syntax(source, language)
@@ -667,22 +667,26 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
     notes = list(comments(syntax))
     line_comments = {comment.line: comment.text for comment in notes}
     tests = []
-    shared_controls = set()
-    absences = []
+    analyses = []
+    fixed_sizes = defaultdict(set)
     for test, body, ignored, expected_exception in file.inventory():
         tests.append(test)
         if inventory:
             test.body_hash = hashlib.sha256(repr(shape(body)).encode()).hexdigest()
-        if ignored:
-            continue
-        flow = Flow(file)
-        exits = flow.visit(body_of(body) if body.kind() in LAMBDAS else body)
-        passing_exits = [evidence for reason, evidence in exits.items()
-                         if reason not in {"throw", "assertion-failure"}]
-        evidence = merge(passing_exits or exits.values())
-        for channel, recorder in evidence.witnesses:
-            if recorder.shared is not None:
-                shared_controls.add((channel, recorder.shared))
+        if not ignored:
+            flow, evidence = analyze(file, body)
+            analyses.append((test, body, expected_exception, flow, evidence))
+            for key, size in evidence.sizes:
+                fixed_sizes[key].add(size)
+
+    sizes = {key: next(iter(counts)) for key, counts in fixed_sizes.items() if len(counts) == 1}
+    controls_by_test = []
+    absences = []
+    for index, (test, body, expected_exception, flow, evidence) in enumerate(analyses):
+        if sizes and flow.loop_checks and not evidence.checked:
+            flow, evidence = analyze(file, body, sizes)
+        witnesses = evidence.witnesses | capture_controls(file, body, evidence.witnesses)
+        controls_by_test.append(shared_keys(witnesses))
         checks = list(flow.checks.values())
         micro_snapshot(file, test, flow.checks)
         test.checks = len(checks) + int(expected_exception)
@@ -692,9 +696,12 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
         if test.guarded and flow.loop_checks.keys() == flow.checks.keys():
             source = next(iter(flow.loop_checks.values()))
             expression = " ".join(source.text().split())
+            filtered = flow.filtered_source(source)
             if test.issue_messages is None:
                 test.issue_messages = {}
             test.issue_messages[test.line, "guarded-assert"] = (
+                f"The checks can all be skipped when filtering the result in `{expression}` leaves no items."
+                if filtered else
                 f"The checks can all be skipped when the loop over `{expression}` runs zero times.")
         for check in checks:
             site = line(check.node)
@@ -702,21 +709,41 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
                 test.issues.append((site, "const-truth"))
             if compares_itself(syntax, check, test.name, line_comments, checks):
                 test.issues.append((site, "self-compare"))
+            if check.disabled:
+                issue = site, "absence-no-control"
+                test.issues.append(issue)
+                if test.issue_messages is None:
+                    test.issue_messages = {}
+                test.issue_messages[issue] = (
+                    "The fixture disables the collaborator whose absence is asserted. "
+                    "Enable the collaborator to exercise the path checked here.")
+
             for key, present in check.observations:
-                if not present and key not in evidence.witnesses:
-                    channel, recorder = key
-                    absences.append((test, site, channel, recorder))
-    if collection_controls is not None:
-        for channel, shared in shared_controls:
-            collection_controls.record(path, file.module, ("jvm", channel, shared))
-    for test, site, channel, recorder in absences:
-        if recorder.shared is None:
+                if present or key[1] in check.disabled:
+                    continue
+                related = check.controls.get(key, frozenset({key}))
+                if not related & witnesses:
+                    absences.append((index, test, site, shared_keys(related)))
+
+    pending = []
+    for index, test, site, shared in absences:
+        if any(shared & controls for sibling, controls in enumerate(controls_by_test)
+               if index != sibling or not any(key[0] in {"mock-method", "mock-type", "captured-mock", "spy-type"} for key in shared)):
+            continue
+        if shared and collection_controls is not None:
+            pending.append((test, site, shared))
+        else:
             test.issues.append((site, "absence-no-control"))
-        elif (channel, recorder.shared) not in shared_controls:
-            if collection_controls is None:
-                test.issues.append((site, "absence-no-control"))
-            else:
-                collection_controls.record(path, file.module, ("jvm", channel, recorder.shared), test, site)
+    if collection_controls is not None and any(controls_by_test):
+        collection_controls.context["jvm", file.module, file.path] = set.union(*controls_by_test)
+    if pending:
+        def resolve(cache):
+            wanted = set.union(*(shared for _, _, shared in pending))
+            known = sibling_controls(file, wanted, cache)
+            for test, site, shared in pending:
+                if not shared & known:
+                    test.issues.append((site, "absence-no-control"))
+        collection_controls.deferred.append(resolve)
     if observe is not None:
         observe(path, tests, syntax_errors(syntax.root, missing=True), [])
     return tests, notes
