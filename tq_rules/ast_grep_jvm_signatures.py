@@ -26,6 +26,7 @@ OWNERS = {
     "org.mockito.Mockito": "mockito", "org.mockito.BDDMockito": "mockito",
     "org.mockito.InOrder": "mockito",
     "io.mockk": "mockk",
+    "io.mockk.bdd": "mockk",
     "assertk": "assertk", "assertk.assertions": "assertk",
     "reactor.test.StepVerifier": "stepverifier",
 }
@@ -101,8 +102,13 @@ def accepts(owner, method):
         return method in COMMON_ASSERTIONS | JUNIT_METHODS[owner]
     if owner == "hamcrest":
         return method == "assertThat"
-    if owner in {"mockk", "mockito"}:
+    if owner == "mockito":
         return method.startswith(("verify", "coVerify")) or method == "confirmVerified"
+    if owner == "mockk":
+        return (method.startswith(("verify", "coVerify"))
+                or method in {"confirmVerified", "checkUnnecessaryStub", "checkUnnecessaryStubs",
+                              "then", "coThen", "thenAll", "coThenAll", "thenOrder", "coThenOrder",
+                              "thenSequence", "coThenSequence", "thenAny", "coThenAny"})
     if owner in {"assertj", "soft-assertj", "truth"}:
         return (method.startswith("assertThat")
                 or method == "then"

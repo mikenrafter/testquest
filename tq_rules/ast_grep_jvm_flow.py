@@ -8,10 +8,12 @@ import re
 from . import lint
 from .ast_grep import children, offset, query, shape, unwrap
 from .ast_grep_jvm import (
-    CALLS, CLASSES, FUNCTIONS, LAMBDAS, _seeded_then_drained, bind_arguments, body_of, call_of, child,
-    has_safe_navigation, member, name, node_key,
+    CALLS, CLASSES, FUNCTIONS, LAMBDAS, MODULE_MARKERS, _repo_package_directories, _seeded_then_drained,
+    bind_arguments, body_of, call_of, child, declaration_name, has_safe_navigation, member, name, node_key,
+    read_file,
 )
 from .ast_grep_jvm_signatures import aggregate, executable_callbacks, signature
+from .source import project_root
 from .ast_grep_micro import branch_path, statement
 from .ast_grep_jvm_controls import declared_value, sized_source
 from .ast_grep_jvm_fixtures import counted_list_builder, fixture_truth, java_list_fixture
@@ -166,7 +168,7 @@ def throws_assertion_error(node):
     return False
 
 
-def failure_statement(node):
+def failure_statement(node, *, allow_error=False):
     node = unwrap(node)
     if node is None:
         return False
@@ -175,7 +177,8 @@ def failure_statement(node):
     call = call_of(node)
     return (call is not None and (
                 call.method in {"fail", "failBecauseExceptionWasNotThrown", "failWithMessage", "expectUnreached"}
-                or call.method.startswith(("expectAssertion", "shouldHaveThrown", "shouldHaveFailed")))
+                or call.method.startswith(("expectAssertion", "shouldHaveThrown", "shouldHaveFailed"))
+                or allow_error and call.method == "error" and call.receiver is None and len(call.args) == 1)
             or node.kind() in {"jump_expression", "throw_statement"} and throws_assertion_error(node))
 
 
@@ -263,6 +266,34 @@ class Flow:
         self.throwing_fake_check = False
         self.loop_checks = {}
         self.last_branch_positive = None
+        self.unjoined_jobs = {}
+        self.last_returned_job = None
+        self.structured_scope = 0
+        self.structured_launches = []
+
+    def _early_return_guards(self, loop_node):
+        guards = set()
+        for entry in query(loop_node, "if_expression"):
+            parts = children(entry)
+            if len(parts) < 2:
+                continue
+            body = body_of(parts[1]) or parts[1]
+            steps = children(body) if body.kind() in {"statements", "control_structure_body", "block"} else [body]
+            if any(s.kind() == "jump_expression" and s.children()[0].kind() == "return" for s in steps):
+                for ident in query(parts[0], "simple_identifier"):
+                    guards.add(ident.text())
+        return guards
+
+    def _tail_asserts_subject(self, file, tail, subjects):
+        if not subjects:
+            return False
+        for stmt in tail:
+            for call_node in query(stmt, "call_expression"):
+                c = call_of(call_node)
+                if c is not None and check_call(file, call_node, c) is not None:
+                    if any(ident.text() in subjects for ident in query(call_node, "simple_identifier")):
+                        return True
+        return False
 
     def sequence(self, nodes):
         exits = NORMAL
@@ -276,11 +307,15 @@ class Flow:
                 os_kind = _platform_kind(self.file, node.field("condition"))
             self.last_branch_positive = None
             step = self.visit(node)
-            if (node is not None and node.kind() in {"for_statement", "enhanced_for_statement"}
-                    and "return" in step and not step["return"].checked
+            is_loop = node is not None and (
+                node.kind() in {"for_statement", "enhanced_for_statement"}
+                or self.file.syntax.language == "kotlin" and (c := call_of(node)) is not None and c.method == "repeat")
+            if (is_loop and "return" in step and not step["return"].checked
                     and "next" in step and not step["next"].checked):
                 tail = [n for n in node_list[index + 1:] if n is not None and n.kind() not in {"comment", "line_comment", "block_comment"}]
-                if tail and any(failure_statement(n) for n in tail):
+                if tail and (any(failure_statement(n) for n in tail)
+                             or self.file.syntax.language == "kotlin"
+                             and self._tail_asserts_subject(self.file, tail, self._early_return_guards(node))):
                     step["return"] = replace(step["return"], checked=True)
             if os_kind and step.get("next", Evidence()).checked is False:
                 pos_ev = self.last_branch_positive
@@ -288,13 +323,19 @@ class Flow:
                     platform_checked.add(os_kind)
                     if {"windows", "unix"} <= platform_checked and "next" in step:
                         step["next"] = replace(step["next"], checked=True)
+            if node is not None and node.kind() == "property_declaration":
+                decl = child(node, "variable_declaration")
+                init = self.file.initializer(decl) if decl is not None else None
+                if decl is not None and init is not None and node_key(init) in self.unjoined_jobs:
+                    self.unjoined_jobs[self.file.path, node_key(decl)] = self.unjoined_jobs[node_key(init)]
             exits = followed_by(exits, step)
         return exits
 
     def _filter_check_observations(self, check):
-        if not check.observations or self.file.syntax.language != "java":
+        if not check.observations or self.file.syntax.language not in {"java", "kotlin"}:
             return check
         drop = set()
+        rebound = {}
         owner_fn = next((parent for parent in check.node.ancestors() if parent.kind() in FUNCTIONS | LAMBDAS), None)
         owner_body = body_of(owner_fn) if owner_fn is not None else None
         for key, present in check.observations:
@@ -305,17 +346,36 @@ class Flow:
             if owner_body is not None and local_recs and _seeded_then_drained(self.file, owner_body, check.node, local_recs):
                 drop.add(key)
                 continue
-            if self.bound and any(
-                    rec.identity[0] == self.file.path and rec.identity[1][0] == "formal_parameter"
-                    and rec.identity[:2] in self.bound and self.bound[rec.identity[:2]][0] is not None
-                    and not isinstance(self.bound[rec.identity[:2]][1], tuple)
-                    and self.bound[rec.identity[:2]][0].collection_recorder(self.bound[rec.identity[:2]][1]) is None
-                    for ch, rec in related if ch == "size"):
-                drop.add(key)
-        if not drop:
+            if self.bound:
+                dropped = False
+                for ch, rec in related:
+                    if (ch == "size" and rec.identity[0] == self.file.path
+                            and rec.identity[1][0] in {"formal_parameter", "parameter"}
+                            and rec.identity[:2] in self.bound and self.bound[rec.identity[:2]][0] is not None):
+                        bfile, barg, _ = self.bound[rec.identity[:2]]
+                        arg_rec = None if isinstance(barg, tuple) else bfile.collection_recorder(barg)
+                        if arg_rec is None:
+                            drop.add(key)
+                            dropped = True
+                            break
+                        if arg_rec.shared is not None:
+                            rebound[key] = (ch, arg_rec)
+                if dropped:
+                    continue
+        if not drop and not rebound:
             return check
-        observations = tuple((k, p) for k, p in check.observations if k not in drop)
-        controls = {k: v for k, v in check.controls.items() if k not in drop}
+        observations = tuple(
+            (rebound[k], p) if k in rebound else (k, p)
+            for k, p in check.observations if k not in drop)
+        controls = {}
+        for k, v in check.controls.items():
+            if k in drop:
+                continue
+            if k in rebound:
+                new_k = rebound[k]
+                controls[new_k] = (v - {k}) | {new_k}
+            else:
+                controls[k] = v
         return replace(check, observations=observations, controls=controls)
 
     def record(self, check):
@@ -392,13 +452,32 @@ class Flow:
         method = self.file.resolve_name(call.method)
         callbacks = self.bound_callbacks(call)
         bound = self.bound_argument(call)
+        direct_check = None
+        local = None
         if bound is not None and bound[1].kind() in LAMBDAS:
             executed = self.invoke_callback(*bound)
-        elif (local := self.file.helper(node, call)) is not None:
+        elif bound is not None and bound[1].kind() in {"callable_reference", "method_reference"}:
+            executed = self.invoke_reference(node, call, *bound)
+        else:
+            direct_check = check_call(self.file, node, call)
+            if not (direct_check is not None and direct_check.owner == "turbine"):
+                candidate = self.file.helper(node, call)
+                if candidate is not None and callbacks and method in SYNCHRONOUS and candidate[0] is not self and not any(
+                        p in {"test", "tests", "commonTest", "jvmTest", "androidTest", "nonJvmTest", "nonWasmTest",
+                              "jsTest", "nativeTest", "test-utils", "testing"} or p.endswith(("Test", "Tests"))
+                        for p in candidate[0].path.parts[:-1]):
+                    candidate = None
+                local = candidate
+        if bound is not None and bound[1].kind() in LAMBDAS | {"callable_reference", "method_reference"}:
+            pass
+        elif local is not None:
             executed = self.helper(node, call, *local)
         else:
-            check = check_call(self.file, node, call)
+            check = direct_check
             executed = NORMAL
+            if (check is None and self.invocation is not None and self.file.syntax.language == "kotlin"
+                    and method == "require" and call.receiver is None and call.args):
+                check = collect_observations(self.file, predicate(node, call.args[0], False))
             if check is not None:
                 if check.soft_receiver is None:
                     executed = self.record(check)
@@ -421,6 +500,15 @@ class Flow:
             elif self.file.syntax.language == "java" and call.receiver is not None and self.receiver_throws_assertion_error(
                     call.receiver, call.method):
                 self.opaque_check = True
+            elif (self.file.syntax.language == "kotlin" and not call.args and call.method in {"join", "await"}
+                  and call.receiver is not None):
+                job_ev = self.unjoined_jobs.get(node_key(unwrap(call.receiver)))
+                if job_ev is None and (rname := name(unwrap(call.receiver))):
+                    _, rbind = self.file.visible_binding(call.receiver, rname)
+                    if rbind is not None:
+                        job_ev = self.unjoined_jobs.get((self.file.path, node_key(rbind)))
+                if job_ev is not None:
+                    executed = followed_by(executed, {"next": job_ev})
             if method == "fail" and check is not None:
                 executed = followed_by(executed, {"assertion-failure": Evidence()})
             elif self.file.syntax.language == "kotlin" and call.receiver is None and method == "error" and check is None:
@@ -486,9 +574,32 @@ class Flow:
             _, binding = self.file.visible_binding(call.callee, call.method)
             if binding is not None:
                 bound = self.bound.get((self.file.path, node_key(binding)))
-                if bound is not None and not isinstance(bound[1], tuple) and bound[1].kind() in LAMBDAS:
+                if bound is not None and not isinstance(bound[1], tuple) and (
+                        bound[1].kind() in LAMBDAS | {"callable_reference", "method_reference"}):
                     return bound
         return None
+
+    def invoke_reference(self, node, call, ref_file, ref_node, _invocation):
+        from .ast_grep_jvm import Call
+
+        parts = children(ref_node)
+        if not parts:
+            return NORMAL
+        recv_node, ref_method = (parts[0], name(parts[1])) if len(parts) == 2 else (None, name(parts[0]))
+        if not ref_method:
+            return NORMAL
+        synthetic = Call(ref_method, list(call.args), recv_node, dict(call.named))
+        check = check_call(ref_file, ref_node, synthetic)
+        if check is not None:
+            previous, caller = self.file, self.invocation
+            self.file = ref_file
+            try:
+                return self.record(replace(check, node=node))
+            finally:
+                self.file, self.invocation = previous, caller
+        if (local := ref_file.helper(ref_node, synthetic)) is not None:
+            return self.helper(node, synthetic, *local)
+        return NORMAL
 
     def argument_binding(self, file, node):
         _, binding = file.visible_binding(node, name(node))
@@ -500,9 +611,10 @@ class Flow:
         key = file.path, node_key(declaration)
         if key in self.active:
             return NORMAL
-        previous, caller = self.invocation, self.file
+        previous, caller, prev_returned = self.invocation, self.file, self.last_returned_job
         if previous is None:
             self.invocation = node
+        self.last_returned_job = None
         slots = {}
         for parameter, argument, supplied in bind_arguments(declaration, call):
             origin = caller if supplied else file
@@ -514,13 +626,23 @@ class Flow:
         try:
             if expects_failure(declaration):
                 return self.record(Check(node))
-            return finish(self.visit(body_of(declaration)), "return")
+            if (file is not caller and "fake" in str(file.path).lower()
+                    and call.method.startswith("check")
+                    and any("IllegalStateException" in t.text() or throws_assertion_error(t)
+                            for t in query(body_of(declaration),
+                                           "jump_expression" if file.syntax.language == "kotlin" else "throw_statement"))):
+                return self.record(Check(node))
+            exits = finish(self.visit(body_of(declaration)), "return")
+            if self.last_returned_job is not None:
+                self.unjoined_jobs[node_key(node)] = self.last_returned_job
+            return exits
         finally:
             self.active.remove(key)
             for slot in slots:
                 del self.bound[slot]
             self.file = caller
             self.invocation = previous
+            self.last_returned_job = prev_returned
 
     def invoke_callback(self, file, callback, invocation):
         previous, caller = self.invocation, self.file
@@ -555,13 +677,26 @@ class Flow:
             return NORMAL
         executed = NORMAL
         previous_checks = set(self.checks)
-        for cb_file, callback in callbacks:
-            if "next" not in executed:
-                break
-            callback_exits = self.invoke_callback(cb_file, callback, self.invocation)
-            if method == "withTimeout" and timeout_poll(callback):
-                callback_exits = followed_by(self.record(Check(node)), callback_exits)
-            executed = followed_by(executed, callback_exits)
+        structured = method in {"withContext", "coroutineScope", "supervisorScope"}
+        if structured:
+            self.structured_scope += 1
+            self.structured_launches.append([])
+        try:
+            for cb_file, callback in callbacks:
+                if "next" not in executed:
+                    break
+                callback_exits = self.invoke_callback(cb_file, callback, self.invocation)
+                if method == "withTimeout" and timeout_poll(callback):
+                    callback_exits = followed_by(self.record(Check(node)), callback_exits)
+                executed = followed_by(executed, callback_exits)
+        finally:
+            launched_inside = self.structured_launches.pop() if structured else ()
+            if structured:
+                self.structured_scope -= 1
+        if structured and launched_inside:
+            joined_ev = reduce(Evidence.then, launched_inside)
+            if "next" in executed:
+                executed = {**executed, "next": executed["next"].then(joined_ev)}
         if method == "assumingThat":
             known = self.known_truth(call.args[0])
             return executed if known is True else alternatives(NORMAL, executed)
@@ -592,6 +727,11 @@ class Flow:
                     return executed
             source = call.args[0] if method == "repeat" and call.args else source
             self.remember_loop(previous_checks, source)
+        if method in {"launch", "async"} and "next" in executed and executed["next"].checked:
+            self.unjoined_jobs[node_key(node)] = executed["next"]
+            if self.structured_scope > 0 and node.parent() is not None and node.parent().kind() in {
+                    "statements", "block", "function_body"}:
+                self.structured_launches[-1].append(executed["next"])
         return alternatives(NORMAL, finish(executed, "throw", "assertion-failure", "return", "break", "continue"))
 
     def loop_receiver(self, receiver):
@@ -671,16 +811,50 @@ class Flow:
             scope, binding = file.visible_binding(node, identifier)
             target_file = file
             if binding is None and file.syntax.language == "kotlin":
-                pkg = file.package
+                from .ast_grep_jvm_signatures import family
+
                 if (qualified := file.imports.get(identifier)) is not None:
-                    pkg = qualified.rpartition(".")[0]
-                for peer in file.package_files(pkg):
-                    for sc, entry in peer.bindings.get(identifier, ()):
-                        if node_key(sc) == node_key(peer.syntax.root):
-                            target_file, binding = peer, entry
+                    pkgs = [qualified.rpartition(".")[0]]
+                else:
+                    pkgs = [file.package, *(pkg for pkg in sorted(file.wildcard_imports) if family(pkg) == "foreign")]
+                for pkg in pkgs:
+                    for peer in file.package_files(pkg):
+                        for sc, entry in peer.bindings.get(identifier, ()):
+                            if node_key(sc) == node_key(peer.syntax.root) and peer.initializer(entry, immutable=True) is not None:
+                                target_file, binding = peer, entry
+                                break
+                        if binding is not None:
                             break
                     if binding is not None:
                         break
+                if binding is None:
+                    repo_root = project_root(file.path, None, {".git"})
+                    module_parent = file.module.parent if file.module is not None else None
+                    bases = [b for b in (file.module, repo_root) if b is not None]
+                    for pkg in pkgs:
+                        pkg_parts = tuple(pkg.split(".")) if pkg else ()
+                        for base in bases:
+                            for directory in _repo_package_directories(base, module_parent, pkg_parts):
+                                if not directory.is_dir():
+                                    continue
+                                for path in sorted(directory.iterdir()):
+                                    if path.suffix != ".kt" or path.is_symlink():
+                                        continue
+                                    peer = read_file(path, file.module)
+                                    if peer is None or peer.package != pkg:
+                                        continue
+                                    for sc, entry in peer.bindings.get(identifier, ()):
+                                        if node_key(sc) == node_key(peer.syntax.root) and peer.initializer(entry, immutable=True) is not None:
+                                            target_file, binding = peer, entry
+                                            break
+                                    if binding is not None:
+                                        break
+                                if binding is not None:
+                                    break
+                            if binding is not None:
+                                break
+                        if binding is not None:
+                            break
             if binding is not None:
                 init = target_file.initializer(binding, immutable=True)
                 if init is not None:
@@ -1019,11 +1193,17 @@ class Flow:
         if known is not True:
             branches.append(self.visit(negative))
         combined = followed_by(evaluated, alternatives(*branches))
-        if (negative is None and known is lint.UNKNOWN and pos_result is not None
-                and (_guarded_equals_check(condition, positive, pos_result)
-                     or "next" not in pos_result and "assertion-failure" in pos_result and (
-                         failure_statement(positive) or len(children(body_of(positive) or positive)) == 1
-                         and failure_statement(children(body_of(positive) or positive)[0])))):
+        allow_err = self.file.syntax.language == "kotlin"
+        fail_branch = (
+            negative is None and known is lint.UNKNOWN and pos_result is not None
+            and (_guarded_equals_check(condition, positive, pos_result)
+                 or "next" not in pos_result and ("assertion-failure" in pos_result or allow_err and "throw" in pos_result) and (
+                     failure_statement(positive, allow_error=allow_err)
+                     or len(children(body_of(positive) or positive)) == 1
+                     and failure_statement(children(body_of(positive) or positive)[0], allow_error=allow_err))))
+        if fail_branch:
+            if not any(node_key(c.node) == node_key(node) for c in self.checks.values()):
+                self.record(Check(node))
             if "next" in combined:
                 combined["next"] = replace(combined["next"], checked=True)
             else:
@@ -1147,6 +1327,9 @@ class Flow:
         elif reason in {"break@", "continue@"} and (label := child(node, "label")) is not None:
             reason += label.text()
         evaluated = self.sequence(children(node))
+        if reason == "return" and (returned := next(iter(children(node)), None)) is not None:
+            if (job_ev := self.unjoined_jobs.get(node_key(unwrap(returned)))) is not None:
+                self.last_returned_job = job_ev
         if "next" in evaluated:
             if reason == "throw" and throws_assertion_error(node):
                 evaluated = followed_by(evaluated, self.record(Check(node)))

@@ -46,13 +46,17 @@ KOTEST_PREFIXES = ("shouldBe", "shouldNotBe", "shouldHave", "shouldNotHave", "sh
                    "shouldNotThrow", "shouldContain", "shouldNotContain", "shouldStart", "shouldEnd",
                    "shouldMatch", "shouldNotMatch", "shouldEqual", "shouldNotEqual", "shouldFail")
 VERIFICATIONS = {"verify", "verifyBlocking", "coVerify", "verifySequence", "coVerifySequence",
-                 "verifyOrder", "coVerifyOrder", "verifyAll", "coVerifyAll"}
+                 "verifyOrder", "coVerifyOrder", "verifyAll", "coVerifyAll",
+                 "verifyAny", "coVerifyAny", "verifyCount", "coVerifyCount"}
+MOCKK_BDD_THEN = {"then", "coThen", "thenAll", "coThenAll", "thenOrder", "coThenOrder",
+                  "thenSequence", "coThenSequence", "thenAny", "coThenAny"}
 NO_INTERACTIONS = {"verifyZeroInteractions", "verifyNoInteractions", "verifyNoMoreInteractions",
                    "confirmVerified"}
 BINARY_KINDS = {"binary_expression", "equality_expression", "comparison_expression",
                 "conjunction_expression", "disjunction_expression", "elvis_expression"}
-INTEGER_KINDS = {"integer_literal", "hex_literal", "bin_literal", "decimal_integer_literal",
-                 "hex_integer_literal", "binary_integer_literal", "octal_integer_literal"}
+INTEGER_KINDS = {"integer_literal", "long_literal", "hex_literal", "bin_literal",
+                 "decimal_integer_literal", "hex_integer_literal", "binary_integer_literal",
+                 "octal_integer_literal"}
 SYNCHRONOUS = {"assertAll", "assertSoftly", "assertTimeout", "assertTimeoutPreemptively", "runTest",
                "runBlocking", "run", "apply", "also", "let", "with", "use", "synchronized",
                "assumingThat", "assertDoesNotThrow", "assertNotNull", "assertIs", "assertIsNot",
@@ -388,10 +392,10 @@ def check_call(file, node, call):
                 check.owner = owner or "hamcrest"
                 return check
         return None
-    if method in FLUENT_ROOTS | {"assertWithMessage", "assert_"} | VERIFICATIONS:
+    if method in FLUENT_ROOTS | {"assertWithMessage", "assert_"} | VERIFICATIONS | MOCKK_BDD_THEN:
         if method == "assertThatThrownBy" and owner in {"", "assertj", "soft-assertj"}:
             return Check(node, owner=owner)
-        if method in VERIFICATIONS and owner in {"", "mockk"} and call.callbacks():
+        if method in VERIFICATIONS | MOCKK_BDD_THEN and owner in {"", "mockk"} and call.callbacks():
             from .ast_grep_jvm_controls import disabled_verifications
 
             check = mockk_observations(file, Check(node, owner=owner), call)
@@ -443,6 +447,20 @@ def check_call(file, node, call):
         if method.startswith("assert") and owner in {"", "foreign", "assertj"} and (
                 owner == "assertj" or defines_assertion_api(file, "assertj")):
             return Check(node, owner="assertj")
+        if file.syntax.language == "kotlin" and not call.args and method == "awaitComplete" and any(
+                imp.startswith("app.cash.turbine") for imp in (
+                    *file.imports.values(), *file.wildcard_imports, file.package)):
+            return Check(node, owner="turbine")
+        if file.syntax.language == "kotlin" and method == "first" and len(call.callbacks()) == 1 and len(call.args) == 1:
+            if (file.imports.get("first") == "kotlinx.coroutines.flow.first"
+                    or "kotlinx.coroutines.flow" in file.wildcard_imports):
+                return Check(node, owner="kotlin-flow")
+            recv_name = name(unwrap(call.receiver))
+            if recv_name:
+                _, binding = file.visible_binding(call.receiver, recv_name)
+                init_call = call_of(file.initializer(binding)) if binding is not None else None
+                if init_call is not None and init_call.method in {"MutableStateFlow", "MutableSharedFlow", "flow", "flowOf"}:
+                    return Check(node, owner="kotlin-flow")
     if kotest_matcher(method) and owner in {"", "foreign", "kotest"} and (
             owner != "foreign" or imported_method(file, call.method)[0] in {"", "kotest"}):
         if method in BOOLEANS:
@@ -654,9 +672,10 @@ def collect_observations(file, check, method="", subject=None, expected=None):
         return observe(subject, method in {"isNotEmpty", "shouldNotBeEmpty"})
     if method in {"assertNotNull", "isNotNull"} and (receiver := observed_item(subject)) is not None:
         return observe(receiver, True)
-    if method in {"contains", "containsOnly", "containsAnyOf", "containsExactly", "containsExactlyElementsIn",
-                  "containsAtLeast", "shouldContain", "hasSizeGreaterThan", "hasSizeLessThan", "hasSize",
-                  "shouldHaveSize"}:
+    if method in {"contains", "containsOnly", "containsAnyOf", "containsExactly", "containsExactlyInAnyOrder",
+                  "containsExactlyElementsIn", "containsExactlyInAnyOrderElementsOf",
+                  "containsAtLeast", "containsAtLeastElementsIn", "containsAll", "shouldContain",
+                  "hasSizeGreaterThan", "hasSizeLessThan", "hasSize", "shouldHaveSize"}:
         length = literal(file.syntax, expected)
         if method in {"hasSize", "shouldHaveSize", "hasSizeGreaterThan", "hasSizeLessThan"}:
             if type(length) is int and length >= 0:
@@ -666,7 +685,7 @@ def collect_observations(file, check, method="", subject=None, expected=None):
                     if method in {"hasSize", "shouldHaveSize"} and (key := sized_source(file, subject)) is not None:
                         check.sizes += ((key, length),)
                     return observe(subject, length > 0 or method == "hasSizeGreaterThan")
-        elif method == "containsExactlyElementsIn":
+        elif method in {"containsExactlyElementsIn", "containsExactlyInAnyOrderElementsOf", "containsAtLeastElementsIn"}:
             known = iterable_size(file.syntax, expected)
             if known is not None:
                 return observe(subject, known > 0)

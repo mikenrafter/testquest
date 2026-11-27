@@ -20,6 +20,8 @@ def direct_binding(file, nodes):
 class Setups:
     def __init__(self, file, calls):
         self.assignments = defaultdict(list)
+        self.collections = defaultdict(list)
+        self.assignment_offsets = set()
         for call in calls:
             if (file.framework_name(call.name) != "setUp" or not call.args
                     or file.resolve_name((call.node,), {}, path=call.name) is not None):
@@ -46,12 +48,16 @@ class Setups:
                 binding = direct_binding(file, contents(target))
                 if binding is None:
                     continue
-                expectation = final_call(named(between(tokens(assignment), "=")))
+                rhs = named(between(tokens(assignment), "="))
+                expectation = final_call(rhs)
                 count = file.fixed_number(expectation.keywords.get("count", ())) if expectation else None
                 counted = (offset(assignment) in direct and expectation is not None
                            and file.framework_name(expectation.name) in ASYNC_EXPECTATIONS
                            and type(count) is int and count == 0)
                 self.assignments[offset(owner)].append((binding, counted))
+                self.collections[offset(owner)].append((binding, rhs if offset(assignment) in direct else ()))
+                if offset(assignment) in direct:
+                    self.assignment_offsets.add(offset(assignment))
 
     def callbacks_for(self, *sites):
         bindings = set()
@@ -64,3 +70,15 @@ class Setups:
                 else:
                     bindings.discard(binding)
         return bindings
+
+    def collections_for(self, *sites):
+        values = {}
+        scopes = dict.fromkeys(offset(owner) for site in sites for owner in reversed(site.ancestors())
+                               if owner.kind() in FUNCTION_BODIES)
+        for scope in scopes:
+            for binding, rhs in self.collections.get(scope, ()):
+                if rhs:
+                    values[binding] = rhs
+                else:
+                    values.pop(binding, None)
+        return values, self.assignment_offsets

@@ -138,8 +138,20 @@ def fixed_duration(nodes):
     return bool(values) and all(type(value) is int and value >= 0 for value in values) and any(values)
 
 
+def _is_zone_run(file, call):
+    if call.method != "run" or len(call.args) != 1 or not call.receiver:
+        return False
+    if not any(entry.uri == "dart:async" for entry in file.imports):
+        return False
+    if names(call.receiver) == ("Zone", "current"):
+        return True
+    if len(names(call.receiver)) == 1 and (binding := file.binding(call.receiver)) is not None:
+        return binding.final and names(binding.initializer) == ("Zone", "current")
+    return False
+
+
 class Flow:
-    def __init__(self, file, callback, setup_callbacks=()):
+    def __init__(self, file, callback, setup_callbacks=(), setup_collections=None):
         self.file = file
         self.callback = callback
         self.checks = []
@@ -153,6 +165,7 @@ class Flow:
         self.sink = None
         self.event = None
         self.setup_callbacks = set(setup_callbacks)
+        self.setup_collections = setup_collections
         self.empty_at_exit = None
         self.loop_constants = {}
         self.unconditional_cb_writes = []
@@ -443,6 +456,8 @@ class Flow:
         elif len(call.name) == 1 and (self.file.binding((call.node,)) or self.file.functions.get(call.method)):
             zone_method = ""
         zone = (zone_method in {"runZoned", "runZonedGuarded"}
+                or _is_zone_run(self.file, call)
+                or call.method == "exclusively" and len(call.args) == 1 and "abort" not in call.keywords and completed
                 or call.method == "runZoned"
                 and self.file.library_name(call.name[:-1], "dart:io") == "IOOverrides"
                 or call.method == "runWithHttpOverrides"
@@ -591,7 +606,8 @@ class Flow:
         return False
 
     def nonempty(self, nodes):
-        return bool(minimum_size(self.file, nodes, values=self.supplied_values))
+        return bool(minimum_size(self.file, nodes, values=self.supplied_values,
+                                 setup_collections=self.setup_collections))
 
     def loop(self, node, conditional):
         body = node.field("body")

@@ -21,9 +21,13 @@ MOCKITO = {"verify", "verifyInOrder", "verifyNoMoreInteractions", "verifyZeroInt
 REGISTRATIONS = {"test", "testWidgets", "group"}
 ASYNC_EXPECTATIONS = {"expectAsync", *(f"expectAsync{arity}" for arity in range(7))}
 FUNCTION_BODIES = {"function_expression_body", "function_body"}
-SCOPES = {"source_file", "block", "function_expression", "for_statement", "class_body"}
+SCOPES = {"source_file", "block", "function_expression", "for_statement", "class_body", "extension_body"}
 BOOLEAN = {"isTrue": True, "isFalse": False}
 CHANGING_COLLECTION = {"add", "addAll", "insert", "insertAll", "putIfAbsent"}
+MUTATING_COLLECTION = CHANGING_COLLECTION | {
+    "clear", "remove", "removeAt", "removeWhere", "removeLast", "removeRange", "retainWhere",
+    "replaceRange", "setAll", "setRange", "shuffle", "sort",
+}
 
 
 def expression_operator(nodes):
@@ -216,6 +220,7 @@ class File:
         self.functions = defaultdict(list)
         self.getters = {}
         self.methods = {}
+        self.extension_methods = defaultdict(list)
         self.bindings = defaultdict(list)
         self.collection_writes = {}
         self._unchanged_active = set()
@@ -257,6 +262,13 @@ class File:
                 target = scope.parent().field("name")
                 if target is not None:
                     self.methods[identifier(target), name] = body
+            elif scope.kind() == "extension_body":
+                extension = scope.parent()
+                ext_name = next((identifier(child) for child in contents(extension)
+                                 if child.kind() == "identifier"), "")
+                on_type = next((identifier(child) for child in contents(extension)
+                                if child.kind() == "type_identifier"), "")
+                self.extension_methods[name].append((ext_name, on_type, body))
             else:
                 self.functions[name].append((scope, body))
         for definition in query(syntax.root, "getter_signature"):
@@ -369,19 +381,59 @@ class File:
         return self.resolve_name(nodes, supplied)
 
     def resolve_call(self, call, supplied, active=frozenset(), supplied_values=None):
-        if not call.name:
-            return None
-        target = self.resolve_name((call.node, *call.receiver[1:]), supplied, path=call.name,
-                                   supplied_values=supplied_values)
-        if target is None:
-            getter = self.resolve_getter(call.name)
-            if getter is not None and getter.key not in active:
-                target = getter.file.callback(returned_expression(getter.body), getter.supplied, active | {getter.key})
+        target = None
+        if call.name:
+            target = self.resolve_name((call.node, *call.receiver[1:]), supplied, path=call.name,
+                                       supplied_values=supplied_values)
+            if target is None:
+                getter = self.resolve_getter(call.name)
+                if getter is not None and getter.key not in active:
+                    target = getter.file.callback(returned_expression(getter.body), getter.supplied, active | {getter.key})
+        if target is None and call.receiver:
+            target = self.resolve_extension(call)
         if target is None or target.key in active:
             return None
         arguments = [self.callback(arg, supplied, active | {target.key}) for arg in call.args]
         keywords = {name: self.callback(arg, supplied, active | {target.key}) for name, arg in call.keywords.items()}
         return target.bind(arguments, keywords, raw_args=call.args, raw_keywords=call.keywords, caller_file=self)
+
+    def resolve_extension(self, call):
+        if not call.method or not call.receiver:
+            return None
+        candidates = {}
+        for ext_name, on_type, body in self.extension_methods.get(call.method, ()):
+            cb = Callback(self, body, {})
+            candidates[cb.key] = (on_type, cb)
+        for entry in self.imports:
+            if entry.prefix:
+                continue
+            module = self.modules.load(self.path, entry.uri)
+            if module is None:
+                continue
+            for ext_name, on_type, body in module.extension_methods.get(call.method, ()):
+                if ext_name and not entry.exposes(ext_name):
+                    continue
+                cb = Callback(module, body, {})
+                candidates[cb.key] = (on_type, cb)
+            for export in module.exports:
+                exported = module.modules.load(module.path, export.uri)
+                if exported is None:
+                    continue
+                for ext_name, on_type, body in exported.extension_methods.get(call.method, ()):
+                    if ext_name and (not entry.exposes(ext_name) or not export.exposes(ext_name)):
+                        continue
+                    cb = Callback(exported, body, {})
+                    candidates[cb.key] = (on_type, cb)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))[1]
+        owner = self.receiver_owner(call.receiver)
+        if owner:
+            matching = [cb for on_type, cb in candidates.values() if on_type == owner[-1]]
+            if len(matching) == 1:
+                return matching[0]
+        return None
 
     def resolve_getter(self, path):
         if len(path) == 1:
@@ -526,9 +578,7 @@ class File:
         if names(nodes) == (use.text(),) and parent.kind() in {
                 "argument", "named_argument", "initialized_variable_definition", "static_final_declaration"}:
             return True
-        return any(call.method in CHANGING_COLLECTION | {"clear", "remove", "removeAt", "removeWhere",
-                                                         "removeLast", "removeRange", "retainWhere",
-                                                         "replaceRange", "setAll", "setRange", "shuffle", "sort"}
+        return any(call.method in MUTATING_COLLECTION
                    and call.receiver and call.receiver[0] == use for call in calls(nodes))
 
     def overloads_equality(self, nodes, title):
@@ -677,7 +727,7 @@ class File:
         test = Test(title, title, line(site), bounds.start.line + 1,
                     bounds.end.line + 1, columns[0], qualified=qualified, span_columns=columns)
         return (test, callbacks, span, entry.ignored or any(item.ignored for item in enclosing.values()),
-                setups.callbacks_for(*scopes))
+                setups.callbacks_for(*scopes), setups.collections_for(*scopes))
 
     def check(self, call):
         method = self.framework_name(call.name)
@@ -707,8 +757,8 @@ class File:
             return check
         if method == "fail":
             return Check(call.node)
-        if self.library_name(call.name, "package:mockito/") in MOCKITO or self.library_name(
-                call.name, "package:mocktail/") in MOCKITO:
+        if any(self.library_name(call.name, pkg) in MOCKITO
+               for pkg in ("package:mockito/", "package:mocktail/", "package:mockingjay/")):
             return Check(call.node)
         if call.method == "validate" and call.receiver is not None and self.from_package(
                 call.receiver, "package:test_descriptor/"):
@@ -881,7 +931,7 @@ def parse(source, path, *, inventory=False, observe=None):
     tests = []
     absence = Absence(file)
     candidates = file.inventory() if file.frameworks or path.name.endswith("_test.dart") else ()
-    for test, callbacks, span, ignored, setup_callbacks in candidates:
+    for test, callbacks, span, ignored, setup_callbacks, setup_collections in candidates:
         tests.append(test)
         if ignored:
             continue
@@ -892,7 +942,7 @@ def parse(source, path, *, inventory=False, observe=None):
         for callback in callbacks:
             if callback is None:
                 continue
-            flow = Flow(file, callback, setup_callbacks)
+            flow = Flow(file, callback, setup_callbacks, setup_collections)
             incomplete = flow.run()
             micro_snapshot(file, test, flow.checks)
             test.checks = max(test.checks, len(flow.checks))

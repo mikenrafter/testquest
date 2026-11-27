@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
 import hashlib
+import re
 
 from . import lint
 from .ast_grep import Syntax, children, line, location, offset, query, shape, syntax_errors, text, unwrap
@@ -136,9 +137,14 @@ def bind_arguments(declaration, call):
     parameters = declaration.field("parameters") or child(declaration, "function_value_parameters")
     defaults = {}
     entries = []
+    spread_name = None
     for entry in children(parameters) if parameters is not None else ():
         if entry.kind() in {"parameter", "formal_parameter", "spread_parameter"}:
             entries.append(entry)
+            if entry.kind() == "spread_parameter" or (
+                    entry.prev() is not None and entry.prev().kind() == "parameter_modifiers"
+                    and "vararg" in entry.prev().text()):
+                spread_name = declaration_name(entry)
         elif entries and entry.prev() is not None and entry.prev().kind() == "=":
             defaults[declaration_name(entries[-1])] = entry
     named = {declaration_name(entry): entry for entry in entries}
@@ -146,7 +152,6 @@ def bind_arguments(declaration, call):
         return None
     supplied = {identifier: (value, True) for identifier, value in call.named.items()}
     positional = iter(identifier for identifier in named if identifier not in supplied)
-    spread_name = declaration_name(entries[-1]) if entries and entries[-1].kind() == "spread_parameter" else None
     varargs = []
     in_spread = False
     for argument in call.args:
@@ -154,6 +159,14 @@ def bind_arguments(declaration, call):
             continue
         if argument.kind() in LAMBDAS and argument.parent().kind() == "annotated_lambda":
             identifier = next(reversed(named), None)
+            param_node = named.get(identifier)
+            if param_node is not None and param_node.kind() == "parameter" and not query(param_node, "function_type"):
+                ut = child(param_node, "user_type")
+                if ut is not None and (uname := ut.text().split("<", 1)[0]) not in {
+                        "Runnable", "Callable", "Consumer", "Supplier", "Function", "Predicate",
+                        "Executable", "Action", "Callback", "Handler", "Listener",
+                        "ThrowingRunnable", "ThrowingConsumer", "ThrowingExecutable"} and len(uname) > 1:
+                    return None
         elif in_spread:
             varargs.append(argument)
             continue
@@ -214,15 +227,28 @@ def _repo_package_directories(repo_root, module_parent, pkg_parts):
                 pass
     for root in roots:
         src = root / "src"
-        if not src.is_dir():
-            continue
-        for source_set in src.glob("*"):
-            if source_set.name == "testFixtures":
-                continue
-            for language in ("java", "kotlin"):
-                candidate = source_set.joinpath(language, *pkg_parts)
-                if candidate.is_dir():
-                    dirs.append(candidate)
+        if src.is_dir():
+            for source_set in src.glob("*"):
+                if source_set.name == "testFixtures":
+                    continue
+                for language in ("java", "kotlin"):
+                    candidate = source_set.joinpath(language, *pkg_parts)
+                    if candidate.is_dir():
+                        dirs.append(candidate)
+        else:
+            try:
+                for platform_dir in root.iterdir():
+                    if not platform_dir.is_dir() or platform_dir.name.startswith("."):
+                        continue
+                    for kind_dir in ("src", "test"):
+                        base = platform_dir / kind_dir
+                        if base.is_dir():
+                            dirs.append(base)
+                            nested = base.joinpath(*pkg_parts)
+                            if nested.is_dir():
+                                dirs.append(nested)
+            except OSError:
+                pass
     return tuple(dirs)
 
 
@@ -249,6 +275,10 @@ def parse_syntax(source, language):
         delegate = prefix.removeprefix("by").strip()
         if brace and delegate.isascii() and all(part.isidentifier() for part in delegate.split(".")):
             repairs.append((start, start + len(prefix)))
+    for err in query(syntax.root, "ERROR"):
+        err_start = offset(err)
+        for match in re.finditer(r"\bby\s+(?:this|super|[A-Za-z_][A-Za-z0-9_.]*)\s*(?=\{)", err.text()):
+            repairs.append((err_start + match.start(), err_start + match.end()))
     if not repairs:
         return syntax
     # CLAIM(jvm-delegation-span): masking a misparsed delegate preserves source locations
@@ -285,6 +315,63 @@ class Recorder:
     shared: tuple | None = None
 
 
+def _is_kotlin_extension(fn):
+    if fn.kind() != "function_declaration":
+        return False
+    for entry in children(fn):
+        if entry.kind() in {"simple_identifier", "function_value_parameters"}:
+            return False
+        if entry.kind() in {"user_type", "receiver_type", "nullable_type", "parenthesized_type"}:
+            return True
+    return False
+
+
+def _candidate_score(fn, call):
+    bound = bind_arguments(fn, call)
+    if bound is None:
+        return None
+    mismatches = 0
+    defaults_used = 0
+    for param, arg, supplied in bound:
+        if not supplied:
+            defaults_used += 1
+            continue
+        if isinstance(arg, tuple):
+            continue
+        ut = child(param, "user_type") or param.field("type")
+        ptype = ut.text().split("<", 1)[0].rsplit(".", 1)[-1] if ut is not None else ""
+        if not ptype:
+            continue
+        if arg.kind() in LAMBDAS:
+            if param.kind() == "parameter" and not query(param, "function_type"):
+                mismatches += 1
+            continue
+        atype = ""
+        if arg.kind() == "string_literal":
+            atype = "String"
+        elif (c := call_of(arg)) is not None and c.method[:1].isupper():
+            atype = c.method
+        elif arg.kind() == "object_creation_expression" and arg.field("type") is not None:
+            atype = name(arg.field("type"))
+        if atype and ptype not in {atype, "Any", "Object", "CharSequence"} and len(ptype) > 1:
+            mismatches += 1
+    return mismatches, defaults_used
+
+
+def _pick_helper(candidates, call):
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        scored = [(_candidate_score(fn, call), (f, fn)) for f, fn in candidates]
+        scored = [(s, pair) for s, pair in scored if s is not None]
+        if scored:
+            best = min(s for s, _ in scored)
+            winners = [pair for s, pair in scored if s == best]
+            if len(winners) == 1:
+                return winners[0]
+    return None
+
+
 class File:
     def __init__(self, syntax, path, module):
         self.syntax = syntax
@@ -301,6 +388,7 @@ class File:
         self.packages = {}
         self.resolved_types = {}
         self.callback_origins = None
+        self._active_helpers = set()
         kotlin = syntax.language == "kotlin"
         type_kinds = ("class_declaration", "object_declaration") if kotlin else (
             "class_declaration", "interface_declaration", "record_declaration", "enum_declaration")
@@ -344,14 +432,29 @@ class File:
         return any(annotation in DISABLED_ANNOTATIONS for annotation, _ in self.annotations(node))
 
     def helper(self, node, call):
+        helper_key = (self.path, node_key(node))
+        if helper_key in self._active_helpers or len(self._active_helpers) >= 8:
+            return None
+        self._active_helpers.add(helper_key)
+        try:
+            return self._lookup_helper(node, call)
+        finally:
+            self._active_helpers.discard(helper_key)
+
+    def _lookup_helper(self, node, call):
         if call.receiver is None or call.receiver.text() == "this":
             ancestors = {node_key(parent) for parent in node.ancestors()}
             visible = [(scope, function) for scope, function in self.functions.get(call.method, ())
                        if node_key(scope) in ancestors and bind_arguments(function, call) is not None]
             if visible:
                 closest = max(offset(scope) for scope, _ in visible)
-                candidates = [fn for scope, fn in visible if offset(scope) == closest]
-                return (self, candidates[0]) if len(candidates) == 1 else None
+                candidates = [(self, fn) for scope, fn in visible if offset(scope) == closest and not _is_kotlin_extension(fn)]
+                if (picked := _pick_helper(candidates, call)) is not None:
+                    return picked
+                if not candidates:
+                    ext_candidates = [(self, fn) for scope, fn in visible if offset(scope) == closest]
+                    if (picked := _pick_helper(ext_candidates, call)) is not None:
+                        return picked
             if self.syntax.language == "java" and (owner := owner_of(node)) is not None:
                 cur_file, cur_cls = self, owner
                 seen_cls = {(cur_file.path, node_key(cur_cls))}
@@ -392,6 +495,22 @@ class File:
                               for scope, fn in file.functions.get(method, ())
                               if node_key(scope) == node_key(file.syntax.root)
                               and not has_modifier(fn, "private") and bind_arguments(fn, call) is not None]
+            if not candidates and self.syntax.language == "kotlin" and not qualified and (
+                    call.callbacks() or call.method.startswith(("assert", "check", "verify", "test", "expect"))):
+                from .ast_grep_jvm_signatures import family
+
+                for pkg in sorted(self.wildcard_imports):
+                    if family(pkg) != "foreign":
+                        continue
+                    if not any(d.is_dir() for d in self.package_directories(pkg)):
+                        continue
+                    candidates = [(file, fn) for file in self.package_files(pkg)
+                                  if file.path != self.path
+                                  for scope, fn in file.functions.get(method, ())
+                                  if node_key(scope) == node_key(file.syntax.root)
+                                  and not has_modifier(fn, "private") and bind_arguments(fn, call) is not None]
+                    if candidates:
+                        break
             if not candidates and qualified and (target := self.type_named(package)) is not None:
                 file, owner = target
                 candidates = [(file, fn) for scope, fn in file.functions.get(method, ())
@@ -435,21 +554,99 @@ class File:
                 file, base = target
                 candidates = [(file, fn) for scope, fn in file.functions.get(call.method, ())
                               if node_key(scope) == node_key(base) and bind_arguments(fn, call) is not None]
-                if len(candidates) == 1:
-                    return candidates[0]
+                if (picked := _pick_helper(candidates, call)) is not None:
+                    return picked
             return None
+        elif call.receiver is not None and self.syntax.language == "kotlin":
+            from .ast_grep_jvm_signatures import family, signature
+
+            sig_owner, _ = signature(self, call)
+            if sig_owner not in {"", "foreign"}:
+                return None
+            ancestors = {node_key(parent) for parent in node.ancestors()}
+            candidates = [(self, fn) for scope, fn in self.functions.get(call.method, ())
+                          if node_key(scope) in ancestors and _is_kotlin_extension(fn)
+                          and bind_arguments(fn, call) is not None]
+            if not candidates and (call.method in self.imports or call.callbacks()
+                                   or call.method.startswith(("assert", "check", "verify", "test", "expect"))):
+                qualified = self.imports.get(call.method)
+                pkgs = [qualified.rpartition(".")[0]] if qualified else [self.package]
+                if not qualified and (call.callbacks() or call.method.startswith(("assert", "check", "verify", "test", "expect"))):
+                    pkgs.extend(pkg for pkg in sorted(self.wildcard_imports) if family(pkg) == "foreign")
+                for pkg in pkgs:
+                    if not any(d.is_dir() for d in self.package_directories(pkg)):
+                        continue
+                    candidates = [(file, fn) for file in self.package_files(pkg)
+                                  if file.path != self.path
+                                  for scope, fn in file.functions.get(call.method, ())
+                                  if node_key(scope) == node_key(file.syntax.root)
+                                  and _is_kotlin_extension(fn) and not has_modifier(fn, "private")
+                                  and bind_arguments(fn, call) is not None]
+                    if candidates:
+                        break
+            if not candidates and (recv_name := name(unwrap(call.receiver))):
+                _, binding = self.visible_binding(call.receiver, recv_name)
+                if binding is not None:
+                    type_name = None
+                    init = self.initializer(binding)
+                    if init is not None and (constructed := self.constructed_type(init)) is not None:
+                        type_name = constructed[1]
+                    if type_name is None:
+                        ut = child(binding, "user_type") or binding.parent().field("type")
+                        if ut is not None:
+                            type_name = ut.text().split("<", 1)[0].rsplit(".", 1)[-1]
+                    if type_name and (target := self.type_named(type_name)) is not None:
+                        tfile, tcls = target
+                        in_test_or_fake = (
+                            tfile is self
+                            or bool({"test", "androidTest", "testFixtures", "commonTest", "jvmTest"}.intersection(tfile.path.parts))
+                            or "fake" in str(tfile.path).lower()
+                        )
+                        if in_test_or_fake:
+                            candidates = [(tfile, fn) for scope, fn in tfile.functions.get(call.method, ())
+                                          if node_key(scope) == node_key(tcls)
+                                          and (tfile is self or not has_modifier(fn, "private"))
+                                          and bind_arguments(fn, call) is not None]
         else:
             return None
-        return candidates[0] if len(candidates) == 1 else None
+        return _pick_helper(candidates, call)
 
     def package_directories(self, package):
         directories = {self.path.parent} if package == self.package else set()
+        package_path = package.split(".") if package else ()
+        for parent in self.path.parents:
+            if parent.name in {"src", "test"}:
+                directories.add(parent)
+                directories.add(parent.joinpath(*package_path))
+                if package_path:
+                    directories.add(parent.joinpath(package_path[-1]))
+                for sibling_kind in ("src", "test"):
+                    sibling = parent.parent / sibling_kind
+                    if sibling.is_dir():
+                        directories.add(sibling)
+                        directories.add(sibling.joinpath(*package_path))
+                        if package_path:
+                            directories.add(sibling.joinpath(package_path[-1]))
+            if self.module is not None and parent == self.module:
+                break
         if self.module is not None:
-            package_path = package.split(".") if package else ()
             src = self.module / "src"
-            for source_set in src.glob("*"):
-                for language in ("java", "kotlin"):
-                    directories.add(source_set.joinpath(language, *package_path))
+            if src.is_dir():
+                for source_set in src.glob("*"):
+                    for language in ("java", "kotlin"):
+                        directories.add(source_set.joinpath(language, *package_path))
+            else:
+                try:
+                    for platform_dir in self.module.iterdir():
+                        if not platform_dir.is_dir() or platform_dir.name.startswith("."):
+                            continue
+                        for kind_dir in ("src", "test"):
+                            base = platform_dir / kind_dir
+                            if base.is_dir():
+                                directories.add(base)
+                                directories.add(base.joinpath(*package_path))
+                except OSError:
+                    pass
         return sorted(directories)
 
     def package_files(self, package):
@@ -490,18 +687,24 @@ class File:
             return target
         repo_root = project_root(self.path, None, {".git"})
         module_parent = self.module.parent if self.module is not None else None
+        seen_direct = set()
         for pkg in packages:
             if not pkg:
                 continue
             pkg_parts = tuple(pkg.split("."))
-            for directory in _repo_package_directories(repo_root, module_parent, pkg_parts):
-                for suffix in (".java", ".kt"):
-                    candidate = directory / f"{short}{suffix}"
-                    if candidate.is_file() and not candidate.is_symlink():
-                        file = self if candidate == self.path else read_file(candidate, self.module)
-                        if file is not None and file.package == pkg and short in file.types and (
-                                file is self or not has_modifier(file.types[short], "private")):
-                            direct.append((file, file.types[short]))
+            for base in (self.module, repo_root):
+                for directory in _repo_package_directories(base, module_parent, pkg_parts):
+                    for suffix in (".java", ".kt"):
+                        candidate = directory / f"{short}{suffix}"
+                        if candidate.is_file() and not candidate.is_symlink():
+                            candidate_mod = project_root(candidate, None, MODULE_MARKERS) or self.module
+                            file = self if candidate == self.path else read_file(candidate, candidate_mod)
+                            if file is not None and file.package == pkg and short in file.types and (
+                                    file is self or not has_modifier(file.types[short], "private")):
+                                key = (file.path, node_key(file.types[short]))
+                                if key not in seen_direct:
+                                    seen_direct.add(key)
+                                    direct.append((file, file.types[short]))
             if direct:
                 target = direct[0] if len(direct) == 1 else None
                 self.resolved_types[identifier] = target
@@ -669,8 +872,9 @@ class File:
         if (target := self.type_named(type_name)) is None:
             return None
         file, owner = target
-        if file.path != self.path and not {"test", "androidTest", "testFixtures"}.intersection(
-                file.path.relative_to(self.module).parts[:-1]):
+        base = file.module if (file.module is not None and file.path.is_relative_to(file.module)) else self.module
+        if file.path != self.path and (base is None or not file.path.is_relative_to(base) or not {
+                "test", "androidTest", "testFixtures"}.intersection(file.path.relative_to(base).parts[:-1])):
             return None
         return next(((file.path, node_key(field)) for scope, field in file.bindings.get(identifier, ())
                      if node_key(scope) == node_key(owner)), None)
@@ -759,6 +963,9 @@ class File:
                     if not escaped:
                         return None
         origin = call_of(initialized)
+        if origin is not None and origin.method in {"toList", "toSet"} and not origin.args and origin.receiver is not None:
+            if (source_rec := self.collection_recorder(origin.receiver)) is not None:
+                return source_rec
         if origin is not None and not (origin.receiver is None and origin.method in {
                 "mutableListOf", "mutableSetOf", "mutableMapOf", "arrayListOf", "hashSetOf", "hashMapOf",
                 "ArrayList", "HashSet", "HashMap", "ArrayDeque", "LinkedList", "ConcurrentLinkedQueue",
@@ -1022,6 +1229,39 @@ def completion_control(file, test, body, notes):
     return False
 
 
+def _fixture_result_verified(file, body, check_node, shared_identity, checks):
+    """True when an earlier check in the test verifies a fixture call that writes to shared_identity."""
+    if file.syntax.language != "kotlin" or shared_identity is None:
+        return False
+    check_pos = offset(check_node)
+    earlier = [c for c in checks if offset(c.node) < check_pos
+               and all(present for _, present in c.observations)]
+    if not earlier:
+        return False
+    verified_vars = {name(arg) for c in earlier if (co := call_of(c.node)) is not None
+                     for arg in co.args if name(arg)}
+    if not verified_vars:
+        return False
+    has_initialized_call = any(
+        (init := file.initializer(decl)) is not None and call_of(init) is not None
+        for decl in query(body, "variable_declaration")
+        if declaration_name(decl) in verified_vars and offset(decl) < check_pos)
+    if not has_initialized_call:
+        return False
+    # Confirm a @Disabled fixture class in this file appends to the shared recorder.
+    for cls in query(file.syntax.root, "class_declaration"):
+        if not any(ann in DISABLED_ANNOTATIONS for ann, _ in file.annotations(cls)):
+            continue
+        for entry in query(cls, "assignment", "call_expression"):
+            target = (next(iter(children(entry)), None) if entry.kind() == "assignment"
+                      else (c.receiver if (c := call_of(entry)) is not None and c.method in {"add", "addAll"} else None))
+            if target is not None and target.kind() == "directly_assignable_expression":
+                target = next(iter(children(target)), target)
+            if target is not None and (rec := file.recorder(target)) is not None and rec.identity == shared_identity:
+                return True
+    return False
+
+
 def _seeded_then_drained(file, body, check_node, local_recs):
     limit = offset(check_node)
     call_kind = "call_expression" if file.syntax.language == "kotlin" else "method_invocation"
@@ -1199,6 +1439,10 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
                 local_recs = {recorder.identity for channel, recorder in related
                               if channel == "size" and recorder.shared is None}
                 if local_recs and _seeded_then_drained(file, body, check.node, local_recs):
+                    continue
+                shared_recs = [recorder for channel, recorder in related
+                               if channel == "size" and recorder.shared is not None]
+                if any(_fixture_result_verified(file, body, check.node, rec.shared, checks) for rec in shared_recs):
                     continue
                 same_test_types = {rec.shared for ch, rec in witnesses if ch == "field-mock-type" and rec.shared is not None}
                 if (not flow.throwing_fake_check and not related & (witnesses | checked_reads)

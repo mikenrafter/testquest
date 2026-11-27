@@ -111,7 +111,28 @@ def fixed_field_size(file, binding, field, seen):
     return min(minimum_size(source_file, field_argument(source_file, item, field), seen) for item in items)
 
 
-def minimum_size(file, nodes, seen=frozenset(), values=None):
+def _unchanged_setup_collection(file, binding, setup_offsets):
+    for use in query(binding.scope, "identifier"):
+        if use.text() != binding.node.text() or file.binding((use,)) != binding:
+            continue
+        parent = use.parent()
+        if parent.kind() == "assignable_expression":
+            operation = parent.parent()
+            if operation.kind() == "assignment_expression":
+                if offset(operation) in setup_offsets:
+                    continue
+                return False
+            if file.writes_binding(use):
+                return False
+        nodes = contents(parent)
+        if any(call.method in {"clear", "remove", "removeAt", "removeWhere", "removeLast",
+                               "removeRange", "retainWhere", "replaceRange"}
+               and call.receiver and call.receiver[0] == use for call in calls(nodes)):
+            return False
+    return True
+
+
+def minimum_size(file, nodes, seen=frozenset(), values=None, setup_collections=None):
     """Return zero when the AST cannot prove a positive minimum cardinality."""
     nodes = unwrap(nodes)
     if not nodes:
@@ -126,7 +147,14 @@ def minimum_size(file, nodes, seen=frozenset(), values=None):
         binding = file.binding(nodes)
         if binding is not None and (file, offset(binding.node)) in values_map:
             caller_file, raw_arg = values_map[file, offset(binding.node)]
-            return minimum_size(caller_file, raw_arg, seen, values_map)
+            return minimum_size(caller_file, raw_arg, seen, values_map, setup_collections)
+
+    if setup_collections and len(nodes) == 1 and (path := names(nodes)) and len(path) == 1:
+        col_map, setup_offsets = setup_collections
+        binding = file.binding(nodes)
+        if binding is not None and (file, offset(binding.node)) in col_map and _unchanged_setup_collection(
+                file, binding, setup_offsets):
+            return minimum_size(file, col_map[file, offset(binding.node)], seen, values_map, setup_collections)
 
     if kind(nodes) == "string_literal":
         if any(child.kind() == "template_substitution" for child in contents(nodes[0])):
@@ -166,10 +194,10 @@ def minimum_size(file, nodes, seen=frozenset(), values=None):
                     if type(k) is int and k >= 0 and n >= k:
                         return 1
     path = names(nodes)
-    if member(nodes[-1]) in {"entries", "values", "keys"}:
-        return minimum_size(file, nodes[:-1], seen, values_map)
+    if member(nodes[-1]) in {"entries", "values", "keys", "indexed", "reversed"}:
+        return minimum_size(file, nodes[:-1], seen, values_map, setup_collections)
     if source := initial_collection(file, nodes):
-        return minimum_size(*source, seen, values_map)
+        return minimum_size(*source, seen, values_map, setup_collections)
     if len(path) == 2 and (binding := file.binding(nodes)) and binding.iterable:
         return fixed_field_size(file, binding, path[-1], seen)
     if (call := final_call(nodes)) and call.name in {
