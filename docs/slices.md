@@ -20,7 +20,7 @@ def window(items, n):
     return items[:n]
 ```
 
-Use `//` for Rust, JavaScript, TypeScript, Dart, Kotlin, and Java. Each
+Use `//` for Rust, Go, JavaScript, TypeScript, Dart, Kotlin, and Java. Each
 `| ` line supplies one replacement line. tq adds the first replaced line's
 indentation to the swap. Keep any extra indentation after `| `. The swap
 replaces the same number of lines by default. Set `replaces=N` in the header
@@ -128,8 +128,16 @@ when it checks for a copied test name or identical condition and effect.
 A swap is `trivial` if it only removes whole statements or JSX elements,
 forces a JSX branch off, or empties a body. Empty bodies include an empty
 block, Python `pass`, and a body reduced to `return`, `return null`,
-`return undefined`, or Python `return None`. tq compares syntax trees
-when the source language has a parser. A sidecar for a source language
+`return undefined`, or Python `return None`. A body or statement run that
+reduces to effect-free statements is also trivial. These include empty
+statements, stand-alone names and scalar literals, member reads, and
+`void` applied to those expressions. tq treats member reads as effect-free
+even when a getter can run code. A simple `_ = value` in Python, Rust, or
+Go, or `let _ = value` in Rust, counts as a discard when evaluating
+`value` is effect-free. Python still binds the name `_`. A call in a
+discard or a `void` operand keeps the swap non-trivial.
+
+tq compares syntax trees when the source language has a parser. A sidecar for a source language
 without a parser uses a narrower check for deletion of simple, standalone
 call lines. The test runner still checks whether the swap is killed.
 `non-trivial` means the swap falls outside the trivial patterns.

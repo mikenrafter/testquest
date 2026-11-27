@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from difflib import SequenceMatcher
 import io
 import json
 from pathlib import Path
@@ -13,12 +14,12 @@ from . import repo
 from .ast_grep_languages import EXTENDED_LANGUAGES
 
 
-LANGUAGES = {".py": "python", ".rs": "rust"} | EXTENDED_LANGUAGES
+LANGUAGES = {".py": "python", ".rs": "rust", ".go": "go"} | EXTENDED_LANGUAGES
 COMMENT_KINDS = {
     "python": ("comment",), "rust": ("line_comment",),
     "typescript": ("comment",), "tsx": ("comment",), "javascript": ("comment",),
     "dart": ("comment",), "kotlin": ("line_comment",),
-    "java": ("line_comment",),
+    "java": ("line_comment",), "go": ("comment",),
 }
 MUTANT_ID = r"M-\d+"
 HEADER = re.compile(rf"[ \t]*(?P<comment>\#|//)[ \t]*tq-mutant[ \t]+"
@@ -32,7 +33,32 @@ NON_TRIVIAL_FLIPS = {
 JSX_ELEMENTS = {"jsx_element", "jsx_self_closing_element"}
 STATEMENT_LISTS = {
     "block", "constructor_body", "function_body", "module", "program",
-    "source_file", "statement_block", "statements",
+    "source_file", "statement_block", "statement_list", "statements",
+}
+READ_ATOMS = {
+    "identifier", "simple_identifier", "property_identifier", "field_identifier",
+    "private_property_identifier", "self", "this", "super", "number", "integer", "float",
+    "true", "false", "null", "none", "nil", "undefined", "ellipsis", "unit_expression",
+    "boolean_literal", "char_literal", "character_literal", "decimal_floating_point_literal",
+    "decimal_integer_literal", "float_literal", "imaginary_literal", "int_literal",
+    "integer_literal", "null_literal", "real_literal", "rune_literal",
+}
+READ_EXPRESSIONS = {
+    "parenthesized_expression", "member_expression", "subscript_expression",
+    "attribute", "subscript", "field_expression", "index_expression", "scoped_identifier",
+    "selector_expression", "navigation_expression", "navigation_suffix",
+    "indexing_expression", "indexing_suffix", "conditional_assignable_selector",
+    "unconditional_assignable_selector",
+}
+STRING_LITERALS = {
+    "string", "concatenated_string", "string_literal", "raw_string_literal",
+    "interpreted_string_literal", "template_string", "regex",
+    "string_literal_double_quotes", "string_literal_single_quotes",
+}
+STRING_CONTENT = {
+    "escape_sequence", "string_start", "string_end", "string_content", "string_fragment",
+    "regex_pattern", "regex_flags", "template_chars_double_single", "template_chars_single_single",
+    "interpreted_string_literal_content", "raw_string_literal_content",
 }
 EMPTY_RETURN = re.compile(r"return(?:\s+(?:null|undefined|None))?\s*;?")
 SIMPLE_CALL = re.compile(r"(?m)[ \t]*[A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)*"
@@ -275,31 +301,31 @@ def renders_element(node):
             and renders_element(node.field("right")))
 
 
-def disables_condition(before, after):
+def disables_condition(before, after, language):
     if after.kind() == "false":
         return before.kind() != "false"
     if not all(node.kind() == "binary_expression" and node.field("operator").text() == "&&"
                for node in (before, after)):
         return False
     return any(
-        disables_condition(before.field(changed), after.field(changed))
-        and compare_edits(before.field(kept), after.field(kept)) is Edit.UNCHANGED
+        disables_condition(before.field(changed), after.field(changed), language)
+        and compare_edits(before.field(kept), after.field(kept), language) is Edit.UNCHANGED
         for changed, kept in (("left", "right"), ("right", "left"))
     )
 
 
-def disabled_element(before, after):
+def disabled_element(before, after, language):
     kind = before.kind()
     if kind == "ternary_expression" and kind == after.kind():
         return (renders_element(before.field("consequence"))
-                and disables_condition(before.field("condition"), after.field("condition"))
-                and all(compare_edits(before.field(field), after.field(field)) is Edit.UNCHANGED
+                and disables_condition(before.field("condition"), after.field("condition"), language)
+                and all(compare_edits(before.field(field), after.field(field), language) is Edit.UNCHANGED
                         for field in ("consequence", "alternative")))
     if kind == "binary_expression" and kind == after.kind():
         return (all(node.field("operator").text() == "&&" for node in (before, after))
                 and renders_element(before.field("right"))
-                and disables_condition(before.field("left"), after.field("left"))
-                and compare_edits(before.field("right"), after.field("right")) is Edit.UNCHANGED)
+                and disables_condition(before.field("left"), after.field("left"), language)
+                and compare_edits(before.field("right"), after.field("right"), language) is Edit.UNCHANGED)
     return False
 
 
@@ -316,13 +342,90 @@ def empty_body(node):
                                    or EMPTY_RETURN.fullmatch(statements[0].text())))
 
 
-def emptied_arrow(before, after):
+def effect_free_expression(node):
+    from .ast_grep import children
+
+    if node is None:
+        return False
+    kind = node.kind()
+    if kind in READ_ATOMS or kind in STRING_CONTENT:
+        return True
+    if kind in READ_EXPRESSIONS | STRING_LITERALS:
+        return all(effect_free_expression(child) for child in children(node))
+    if kind == "selector":
+        selectors = children(node)
+        return bool(selectors) and all(effect_free_expression(child) for child in selectors)
+    if kind == "unary_expression":
+        operator = node.field("operator")
+        return (operator is not None and operator.text() == "void"
+                and effect_free_expression(node.field("argument")))
+    return False
+
+
+def discard_assignment(node, language):
+    from .ast_grep import children
+
+    kind = node.kind()
+    if language == "rust" and kind == "let_declaration":
+        pattern = node.field("pattern")
+        return (pattern is not None and pattern.text() == "_"
+                and node.field("alternative") is None
+                and effect_free_expression(node.field("value")))
+    if (language, kind) not in {("python", "assignment"), ("rust", "assignment_expression"),
+                                ("go", "assignment_statement")}:
+        return False
+    left, right = node.field("left"), node.field("right")
+    if left is None or left.text() != "_" or node.field("type") is not None:
+        return False
+    if language == "go":
+        values = children(right)
+        return (node.field("operator").text() == "=" and len(values) == 1
+                and effect_free_expression(values[0]))
+    return effect_free_expression(right)
+
+
+def effect_free_statement(node, language):
+    from .ast_grep import children
+
+    kind = node.kind()
+    if kind == "empty_statement" or (language == "java" and kind == ";"):
+        return True
+    if kind == "expression_statement":
+        expressions = children(node)
+        if len(expressions) == 1 and discard_assignment(expressions[0], language):
+            return True
+        return bool(expressions) and all(effect_free_expression(expression) for expression in expressions)
+    if language == "kotlin" and node.parent().kind() == "statements":
+        statements = node.parent()
+        owner = statements.parent()
+        if (owner.kind() in {"function_body", "anonymous_initializer", "finally_block"}
+                or node != children(statements)[-1]):
+            return effect_free_expression(node)
+    return discard_assignment(node, language)
+
+
+def statements_in(node, language):
+    return [child for child in syntax_children(node)
+            if child.kind() != ";" or language == "java"]
+
+
+def effect_free_body(node, language):
+    if empty_body(node):
+        return True
+    if node.kind() not in STATEMENT_LISTS:
+        return False
+    statements = statements_in(node, language)
+    return all(effect_free_statement(statement, language) for statement in statements
+               if statement.kind() not in {"{", "}"})
+
+
+def emptied_arrow(before, after, language):
     from .ast_grep import children
 
     if before.kind() != "arrow_function" or after.kind() != "arrow_function":
         return False
     old_body, new_body = before.field("body"), after.field("body")
-    if not empty_body(new_body) or empty_body(old_body):
+    if not effect_free_body(new_body, language) or empty_body(old_body):
         return False
     old_params = before.field("parameters") or before.field("parameter")
     new_params = after.field("parameters")
@@ -339,7 +442,38 @@ def removable(parent, child):
     return parent.kind() in STATEMENT_LISTS and child.is_named()
 
 
-def compare_edits(before, after):
+def replaced_statements(before, after, language):
+    if before.kind() not in STATEMENT_LISTS:
+        return Edit.OTHER
+    old, new = statements_in(before, language), statements_in(after, language)
+    if not any(effect_free_statement(node, language) for node in new):
+        return Edit.OTHER
+    old_keys = [(node.kind(), node.text()) for node in old]
+    new_keys = [(node.kind(), node.text()) for node in new]
+    changed = False
+    for tag, start, stop, new_start, new_stop in SequenceMatcher(
+            None, old_keys, new_keys, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "insert":
+            return Edit.OTHER
+        original = old[start:stop]
+        replacement = new[new_start:new_stop]
+        if (all(removable(before, child) for child in original)
+                and all(effect_free_statement(child, language) for child in replacement)):
+            changed = True
+            continue
+        if len(original) != len(replacement):
+            return Edit.OTHER
+        for old_node, new_node in zip(original, replacement):
+            difference = compare_edits(old_node, new_node, language)
+            if difference is Edit.OTHER:
+                return Edit.OTHER
+            changed |= difference is Edit.TRIVIAL
+    return Edit.TRIVIAL if changed else Edit.OTHER
+
+
+def compare_edits(before, after, language):
     """Compare parsed source while ignoring comments and JSX indentation."""
     if before.kind() == after.kind() and before.text() == after.text():
         return Edit.UNCHANGED
@@ -352,7 +486,9 @@ def compare_edits(before, after):
         parent = before.parent()
         if parent is not None and parent.kind() == "arrow_function" and before == parent.field("body"):
             return Edit.TRIVIAL
-    if emptied_arrow(before, after) or disabled_element(before, after):
+    if emptied_arrow(before, after, language) or disabled_element(before, after, language):
+        return Edit.TRIVIAL
+    if before.kind().endswith("_statement") and effect_free_statement(after, language):
         return Edit.TRIVIAL
     if before.kind() != after.kind() or before.is_leaf() or after.is_leaf():
         return Edit.OTHER
@@ -360,23 +496,24 @@ def compare_edits(before, after):
     next_node = next(remaining, None)
     edit = Edit.UNCHANGED
     for child in syntax_children(before):
-        difference = compare_edits(child, next_node) if next_node is not None else Edit.OTHER
+        difference = compare_edits(child, next_node, language) if next_node is not None else Edit.OTHER
         if difference is not Edit.OTHER:
             next_node = next(remaining, None)
         elif removable(before, child):
             difference = Edit.TRIVIAL
         else:
-            return Edit.OTHER
+            break
         if difference is Edit.TRIVIAL:
             edit = Edit.TRIVIAL
-    return edit if next_node is None else Edit.OTHER
+    else:
+        if next_node is None:
+            return edit
+    return replaced_statements(before, after, language)
 
 
 def classify_swap(path, source, updated, updated_tree=None):
     """Classify a full source edit. Use a narrow line heuristic without a grammar."""
     if path.suffix not in LANGUAGES:
-        from difflib import SequenceMatcher
-
         before, after = source.splitlines(), updated.splitlines()
         changes = [op for op in SequenceMatcher(None, before, after, autojunk=False).get_opcodes()
                    if op[0] != "equal"]
@@ -391,7 +528,7 @@ def classify_swap(path, source, updated, updated_tree=None):
             if syntax_errors(before.root, missing=True) or (
                     updated_tree is None and syntax_errors(after.root, missing=True)):
                 return "unknown"
-            trivial = compare_edits(before.root, after.root) is Edit.TRIVIAL
+            trivial = compare_edits(before.root, after.root, before.language) is Edit.TRIVIAL
         except RecursionError:
             return "unknown"
     return "trivial" if trivial else "non-trivial"

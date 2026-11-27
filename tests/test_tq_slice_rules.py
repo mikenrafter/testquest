@@ -12,6 +12,22 @@ from test_tq import FIXTURES, ROOT, TqCase
 SLICES = FIXTURES / "slices"
 
 
+def classify(path, before, after):
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import json
+from pathlib import Path
+import sys
+from tq_rules.pinned_mutants import classify_swap
+path, source, updated = json.load(sys.stdin)
+print(classify_swap(Path(path), source, updated))
+"""],
+        cwd=ROOT, check=True, input=json.dumps([str(path), before, after]),
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
 @unittest.skipUnless(importlib.util.find_spec("ast_grep_py"), "ast-grep-py is optional")
 class SliceRules(TqCase):
     def setUp(self):
@@ -59,25 +75,57 @@ class SliceRules(TqCase):
             ("ready && !hidden ? ", "check() && false ? ", "non-trivial"),
             ("if (!hidden) open();", "if (!hidden) { /* nothing */ }", "trivial"),
             ("(event: Event) => open(event)", "() => {}", "trivial"),
+            ("(event: Event) => open(event)", "() => { void 0; }", "trivial"),
             ("(event: Event) => open(event)", "(event: Event) => { return undefined; }", "trivial"),
             ("active !== tonight", "!entries.includes(active)", "non-trivial"),
             ("onClick={onClick}", "onClick={open}", "non-trivial"),
         ]
         for before, after, expected in changes:
             with self.subTest(before=before):
-                result = subprocess.run(
-                    [sys.executable, "-c", """
-import json
-from pathlib import Path
-import sys
-from tq_rules.pinned_mutants import classify_swap
-path, source, updated = json.load(sys.stdin)
-print(classify_swap(Path(path), source, updated))
-"""],
-                    cwd=ROOT, check=True, input=json.dumps([str(path), original, original.replace(before, after)]),
-                    capture_output=True, text=True,
-                )
-                self.assertEqual(result.stdout.strip(), expected)
+                self.assertEqual(classify(path, original, original.replace(before, after)), expected)
+
+    def test_call_run_replaced_by_effect_free_statements(self):
+        # why: Replacing both branches of a dispatch with reads removes the dispatch.
+        # catches: recognizing removed statements only when the swap adds no syntax.
+        for before, swap in (
+            ("if (replace) send(item); else enqueue(item);", "void item;"),
+            ("send(item); enqueue(item);", "void 0; item; item.kind; 1; ;"),
+            ("send(item); enqueue(item);", ";"),
+        ):
+            with self.subTest(swap=swap):
+                original = f"function select(item) {{ audit(); {before} refresh(); }}"
+                self.assertEqual(classify("dispatch.ts", original, original.replace(before, swap)),
+                                 "trivial")
+
+    def test_effectful_replacements_are_non_trivial(self):
+        # why: A read-shaped statement can still evaluate an expression or change state.
+        # catches: ignoring the operand of void, receivers, or assignments to an ordinary name.
+        original = "async function select(item) { audit(); send(item); refresh(); }"
+        for swap in ("void fetch(item);", "x.y();", "await x;", "entry = next;",
+                     "_ = item;", "return item;", "delete x.y;", "x++;", "fetch(item).kind;",
+                     "item[fetch(x)];", "`${fetch(x)}`;", "void item; send(item);"):
+            with self.subTest(swap=swap):
+                self.assertEqual(classify("dispatch.ts", original, original.replace("send(item);", swap)),
+                                 "non-trivial")
+
+        kotlin = "val item = if (cached) { load() } else { fetch() }"
+        self.assertEqual(classify("dispatch.kt", kotlin, kotlin.replace("load()", "entry")),
+                         "non-trivial")
+
+    def test_discard_only_when_the_right_hand_side_is_effect_free(self):
+        # why: Dropping a value can remove a call, while discarding a call's result keeps it.
+        # catches: deciding from the underscore target without inspecting the assigned expression.
+        for path, source, action, discard, discard_call in (
+            ("dispatch.py", "def select(item):\n    send(item)\n    refresh()\n",
+             "send(item)", "_ = item", "_ = send(item)"),
+            ("dispatch.rs", "fn select(item: i32) { send(item); refresh(); }",
+             "send(item);", "let _ = item; _ = item;", "let _ = send(item);"),
+            ("dispatch.go", "package demo\nfunc selectItem(item int) { send(item); refresh() }\n",
+             "send(item)", "_ = item", "_ = send(item)"),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(classify(path, source, source.replace(action, discard)), "trivial")
+                self.assertEqual(classify(path, source, source.replace(action, discard_call)), "non-trivial")
 
     def test_all_trivial_kills_are_reported_and_disagreement_fails_both_commands(self):
         # why: Even a clean kill cannot justify a set made entirely of trivial pins.
