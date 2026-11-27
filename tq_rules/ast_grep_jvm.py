@@ -299,7 +299,12 @@ class File:
                           for scope, fn in file.functions.get(method, ())
                           if node_key(scope) == node_key(file.syntax.root)
                           and not has_modifier(fn, "private") and bind_arguments(fn, call) is not None]
-        elif call.callbacks() and (receiver := name(unwrap(call.receiver)))[:1].isupper():
+        elif (receiver := name(unwrap(call.receiver)))[:1].isupper() and (
+                call.callbacks() or receiver in self.imports and call.method.startswith(("assert", "check", "verify"))):
+            from .ast_grep_jvm_signatures import family
+
+            if not call.callbacks() and family(self.imports[receiver]) != "foreign":
+                return None
             target = self.type_named(receiver)
             if target is None:
                 return None
@@ -401,6 +406,8 @@ class File:
         if binding is None:
             owner = owner_of(node)
             return Recorder((self.path, node_key(owner) if owner is not None else None, identifier))
+        if (alias := self.recorder_alias(node, scope, binding)) is not None:
+            return self.recorder(alias)
         identity = (self.path, node_key(binding))
         if scope.kind() in CLASSES or scope.kind() in {"source_file", "program"}:
             return Recorder(identity, identity)
@@ -415,6 +422,36 @@ class File:
                    for entry in query(body, kind) if (inner := call_of(entry)) is not None):
                 return Recorder(identity, (file.path, node_key(declaration)))
         return Recorder(identity)
+
+    def recorder_alias(self, use, scope, binding):
+        source = self.initializer(binding)
+        if not member(source)[1] or scope.kind() in CLASSES | {"source_file", "program"}:
+            return None
+        if offset(source) >= offset(use):
+            return None
+        start, end = offset(binding), offset(use)
+        target = declaration_name(binding)
+        paths = {target, source.text()}
+        if source.text().startswith("this."):
+            paths.add(source.text().removeprefix("this."))
+        assignment_kind = "assignment" if self.syntax.language == "kotlin" else "assignment_expression"
+        for assignment in query(scope, assignment_kind):
+            if start < offset(assignment) < end:
+                left = assignment.field("left") or next(iter(children(assignment)), None)
+                if left is not None and left.text() in paths:
+                    return None
+        call_kind = "call_expression" if self.syntax.language == "kotlin" else "method_invocation"
+        for entry in query(scope, call_kind):
+            if not start < offset(entry) < end:
+                continue
+            call = call_of(entry)
+            if call is not None and any(arg.text() in paths for arg in call.args):
+                from .ast_grep_jvm_signatures import accepts, signature
+
+                owner, method = signature(self, call)
+                if not accepts(owner, method):
+                    return None
+        return source
 
     def rig_member(self, node, identifier):
         node = unwrap(node)
@@ -480,6 +517,10 @@ class File:
         while (receiver := member(base)[0]) is not None:
             base = receiver
         scope, binding = self.visible_binding(base, name(base))
+        if binding is not None and base is not None and node_key(base) == node_key(unwrap(node)):
+            alias = self.recorder_alias(base, scope, binding)
+            if alias is not None:
+                return self.collection_recorder(alias)
         initialized = self.initializer(binding)
         if initialized is None or scope.kind() in CLASSES:
             return recorder
@@ -529,13 +570,24 @@ class File:
             return None
         if self.syntax.language == "kotlin" and binding.kind() == "variable_declaration":
             declaration = binding.parent()
+            pattern = declaration if declaration.kind() == "multi_variable_declaration" else None
+            if pattern is not None:
+                declaration = pattern.parent()
             if declaration.kind() == "property_declaration":
                 binding_kind = child(declaration, "binding_pattern_kind")
                 if binding_kind is not None and (not immutable or binding_kind.text() == "val"):
                     tokens = declaration.children()
                     for index, token in enumerate(tokens[:-1]):
                         if token.kind() == "=":
-                            return tokens[index + 1]
+                            value = tokens[index + 1]
+                            if pattern is None:
+                                return value
+                            entries = children(pattern)
+                            call = call_of(value)
+                            if call is not None and call.receiver is None and call.method in {"Pair", "Triple"}:
+                                slot = next(pos for pos, entry in enumerate(entries) if node_key(entry) == node_key(binding))
+                                if slot < len(call.args):
+                                    return call.args[slot]
         if self.syntax.language == "java" and binding.kind() == "variable_declarator":
             declaration = binding.parent()
             modifiers = child(declaration, "modifiers")

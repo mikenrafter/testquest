@@ -1,5 +1,6 @@
 """Track which JVM test exits include a check and a positive recorder observation."""
 
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from functools import reduce
 
@@ -9,6 +10,8 @@ from .ast_grep_jvm import (
     CALLS, CLASSES, FUNCTIONS, LAMBDAS, bind_arguments, body_of, call_of, child, has_safe_navigation,
     member, name, node_key,
 )
+from .ast_grep_jvm_signatures import aggregate, executable_callbacks, signature
+from .ast_grep_micro import branch_path, statement
 from .ast_grep_jvm_controls import declared_value, sized_source
 from .ast_grep_jvm_fixtures import counted_list_builder, fixture_truth, java_list_fixture
 from .ast_grep_jvm_checks import (
@@ -148,6 +151,7 @@ class Flow:
         self.sizes = sizes or {}
         self.fixture_item = None
         self.checks = {}
+        self.buffered_checks = defaultdict(list)
         self.active = set()
         self.invocation = None
         self.bound = {}
@@ -231,16 +235,63 @@ class Flow:
             executed = self.helper(node, call, *local)
         else:
             check = check_call(self.file, node, call)
-            executed = self.record(check) if check is not None and method != "assertAll" else NORMAL
-            if callbacks:
+            executed = NORMAL
+            if check is not None:
+                if check.soft_receiver is None:
+                    executed = self.record(check)
+                else:
+                    self.buffered_checks[check.soft_receiver].append(check)
+            mode = aggregate(self.file, call) if method in {"assertAll", "assertSoftly"} else ""
+            if mode:
+                run = executable_callbacks(self.file, call.args) if mode == "executables" else callbacks
+                executed = self.aggregate_callbacks(run, mode)
+            elif method == "assertAll" and not call.args and signature(self.file, call)[0] == "soft-assertj":
+                executed = self.flush_soft_checks(node, call.receiver)
+            elif callbacks and method not in {"assertAll", "assertSoftly"}:
                 callback_flow = self.callbacks(node, call, method, check)
                 executed = followed_by(executed, callback_flow)
-            if method == "fail":
+            if method == "fail" and check is not None:
                 executed = followed_by(executed, {"assertion-failure": Evidence()})
         executed = followed_by(arguments, executed)
         if has_safe_navigation(call.callee):
             executed = alternatives(NORMAL, executed)
         return followed_by(receiver, executed)
+
+    def flush_soft_checks(self, node, receiver):
+        known = NORMAL
+        flush_path = branch_path(node)
+        for check in self.buffered_checks[self.file.recorder(receiver)]:
+            entry, block = statement(check.node)
+            if block is None:
+                continue
+            for parent in node.ancestors():
+                if parent.kind() in LAMBDAS | FUNCTIONS:
+                    break
+                if node_key(parent) == node_key(block):
+                    if all(node_key(ancestor) != node_key(entry) for ancestor in node.ancestors()):
+                        evidence = self.record(check)
+                        checked_path = branch_path(check.node)
+                        if checked_path != flush_path[:len(checked_path)]:
+                            evidence = alternatives(NORMAL, evidence)
+                        known = followed_by(known, evidence)
+                    break
+        return known
+
+    def aggregate_callbacks(self, callbacks, mode):
+        executed = NORMAL
+        for callback in callbacks:
+            exits = self.invoke_callback(self.file, callback, self.invocation)
+            if mode == "executables":
+                paths = {}
+                for previous, before in executed.items():
+                    for reason, after in exits.items():
+                        outcome = reason if reason not in {"next", "throw", "assertion-failure"} else (
+                            "next" if previous == reason == "next" else "assertion-failure")
+                        paths = alternatives(paths, {outcome: before.then(after)})
+                executed = paths
+            elif "next" in executed:
+                executed = followed_by(executed, exits)
+        return executed
 
     def bound_argument(self, call):
         target = call.callee if call.receiver is None else (

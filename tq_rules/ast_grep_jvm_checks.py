@@ -4,13 +4,14 @@ from dataclasses import dataclass, field
 import re
 
 from . import lint
-from .ast_grep import children, line, query, shape, unwrap
+from .ast_grep import children, line, offset, query, shape, unwrap
 from .ast_grep_jvm import call_of, child, member, name, string_title
+from .ast_grep_jvm_signatures import accepts, imported_method, signature, soft_recorder
 from .ast_grep_lint import COMPARISONS, literal as stage_literal, range_size
 
 
 UNKNOWN = lint.UNKNOWN
-EQUAL = {"assertEquals", "assertArrayEquals", "assertIterableEquals", "isEqualTo", "shouldBe", "equalTo"}
+EQUAL = {"assertEquals", "assertArrayEquals", "assertIterableEquals", "assertContentEquals", "isEqualTo", "shouldBe", "equalTo"}
 UNEQUAL = {"assertNotEquals", "isNotEqualTo", "shouldNotBe", "notEqualTo"}
 IDENTITY = {"assertSame", "isSameAs", "assertNotSame", "isNotSameAs"}
 BOOLEANS = {"assertTrue", "assertFalse", "isTrue", "isFalse", "shouldBeTrue", "shouldBeFalse"}
@@ -189,6 +190,9 @@ class Check:
     controls: dict = field(default_factory=dict)
     disabled: frozenset = frozenset()
     sizes: tuple = ()
+    actual: object = None
+    expected: object = None
+    soft_receiver: object = None
 
     def constant(self, syntax):
         if self.predicate is not None:
@@ -196,11 +200,12 @@ class Check:
         return compare(self.operator, literal(syntax, self.left), literal(syntax, self.right)) is True
 
 
-def equality(node, method, first, second):
+def equality(node, method, first, second, *, expected_first=False):
     if method in EQUAL | UNEQUAL | IDENTITY and first is not None and second is not None:
         operator = "!=" if method in UNEQUAL else "==" if method in EQUAL else (
             "is not" if method in {"assertNotSame", "isNotSameAs"} else "is")
-        return Check(node, operator=operator, left=first, right=second)
+        expected, actual = (first, second) if expected_first else (second, first)
+        return Check(node, operator=operator, left=first, right=second, actual=actual, expected=expected)
     return Check(node)
 
 
@@ -249,25 +254,36 @@ def kotest_matcher(method):
 
 def fluent_origin(file, node, *, preserves_size=False):
     transformed = False
-    while (call := call_of(node)) is not None:
-        method = file.resolve_name(call.method)
+    while node is not None:
+        if (call := call_of(node)) is None:
+            initializer = file.stable_initializer(node, *file.visible_binding(node, name(node)))
+            if initializer is None or offset(initializer) >= offset(node):
+                break
+            node = initializer
+            continue
+        owner, method = signature(file, call)
         if method in FLUENT_ROOTS:
+            if owner not in {"", "assertj", "soft-assertj", "truth"}:
+                return False, None, None
             if method == "then" and (not call.args or call.callbacks()):
-                return False, None
+                return False, None, None
             subject = call.args[0] if method in {"assertThat", "then"} and call.args else None
-            return True, None if transformed else subject
+            buffered = soft_recorder(file, call.receiver) if owner == "soft-assertj" else None
+            return True, None if transformed else subject, buffered
         if method == "that" and call.args:
             sender = call_of(call.receiver)
-            if sender is not None and sender.method in {"assertWithMessage", "withMessage", "assert_"}:
-                return True, None if transformed else call.args[0]
+            if sender is not None:
+                owner, builder = signature(file, sender)
+                if owner in {"", "truth"} and builder in {"assertWithMessage", "withMessage", "assert_"}:
+                    return True, None if transformed else call.args[0], None
         transformed |= method in FLUENT_TRANSFORMS and not (preserves_size and method in {"extracting", "map"})
         if method not in FLUENT_OPTIONS | FLUENT_TRANSFORMS and not method.startswith(FLUENT_TERMINALS):
             break
         node = call.receiver
-    return False, None
+    return False, None, None
 
 
-def junit_args(file, call, method):
+def junit_args(file, call, owner, method):
     args = [arg for arg in call.args if not any(arg is named for named in call.named.values())]
     if method in BOOLEANS | {"assertNotNull"}:
         if "actual" in call.named:
@@ -280,39 +296,38 @@ def junit_args(file, call, method):
                     for label in ("expected", "actual")]
         slots = 2
     if len(args) > slots:
-        _, owner = member(call.receiver)
-        qualified = file.imports.get(call.method, file.imports.get(owner, owner))
-        junit4 = ("org.junit.Assert", "junit.framework.Assert")
-        leading_message = (qualified.startswith(junit4) or owner == "Assert"
-                           or not qualified and file.wildcard_imports.intersection(junit4))
-        trailing_message = qualified.startswith(("org.junit.jupiter.", "kotlin.test.")) or (
-            owner == "Assertions" or "org.junit.jupiter.api.Assertions" in file.wildcard_imports)
-        can_have_leading_message = slots == 1 or method != "assertEquals" or len(args) > 3 or (
-            args[0].kind() == "string_literal")
-        if leading_message and can_have_leading_message or (
-                file.syntax.language == "java" and not trailing_message and args[0].kind() == "string_literal"):
+        initial_call = call_of(args[0])
+        message = (args[0].kind() == "string_literal" or initial_call is not None and
+                   initial_call.method in {"buildString", "getMessage", "format"})
+        numeric_delta = (method in {"assertEquals", "assertNotEquals", "assertArrayEquals"}
+                         and len(args) == 3 and not message and
+                         type(literal(file.syntax, args[-1])) in {int, float})
+        if (owner == "junit4" and not numeric_delta or owner == "" and
+                file.syntax.language == "java" and args[0].kind() == "string_literal"):
             return args[1:]
     return args
 
 
 def check_call(file, node, call):
-    method = file.resolve_name(call.method)
+    owner, method = signature(file, call)
     first = call.args[0] if call.args else None
+    if owner and not accepts(owner, method) and call.receiver is None:
+        return None
+    if method in {"assertAll", "assertSoftly"}:
+        return None
     if method in {"assertDoesNotThrow", "shouldNotThrow", "shouldNotThrowAny"} and first is not None:
         return Check(node, no_throw=True)
     if method == "assertThat":
         matcher = call_of(call.args[-1]) if len(call.args) >= 2 else None
-        hamcrest = file.imports.get(call.method, "").startswith(("org.hamcrest.", "org.junit.Assert."))
-        _, owner = member(call.receiver)
-        if hamcrest or matcher is not None or owner in {"MatcherAssert", "Assert"} and len(call.args) > 1:
+        if owner in {"hamcrest", "junit4"} or not owner and matcher is not None:
             if len(call.args) >= 2:
                 subject = call.args[-2]
                 return hamcrest_check(file, node, subject, matcher)
         return None
     if method in FLUENT_ROOTS | {"assertWithMessage", "assert_"} | VERIFICATIONS:
-        if method == "assertThatThrownBy":
+        if method == "assertThatThrownBy" and owner in {"", "assertj", "soft-assertj"}:
             return Check(node)
-        if method in VERIFICATIONS and call.callbacks():
+        if method in VERIFICATIONS and owner in {"", "mockk"} and call.callbacks():
             from .ast_grep_jvm_controls import disabled_verifications
 
             check = mockk_observations(file, Check(node), call)
@@ -323,7 +338,7 @@ def check_call(file, node, call):
     if method in {"assertGolden", "assertSnapshot", "assertMatchesGolden", "assertMatchesSnapshot",
                   "verifySnapshot"} and first is not None:
         return Check(node, snapshot_subject=call.named.get("actual", first))
-    if method in NO_INTERACTIONS:
+    if method in NO_INTERACTIONS and owner in {"", "mockk", "mockito"}:
         from .ast_grep_jvm_controls import verified_call
 
         check = Check(node)
@@ -332,39 +347,46 @@ def check_call(file, node, call):
                                        if key[0] in {"calls", "mock-type", "installed-mock"}), False)
         return check
     if call.receiver is not None:
-        if (verified := call_of(call.receiver)) is not None and file.resolve_name(verified.method) == "verify":
+        if ((verified := call_of(call.receiver)) is not None
+                and signature(file, verified) in {("", "verify"), ("mockito", "verify")}):
             return mockito_observations(file, Check(node), verified, call.method)
-        found, subject = fluent_origin(file, call.receiver)
+        found, subject, buffered = fluent_origin(file, call.receiver)
         if found and method not in FLUENT_OPTIONS | FLUENT_TRANSFORMS and method.startswith(FLUENT_TERMINALS):
             check = (predicate(node, subject, method in {"isFalse", "shouldBeFalse"})
                      if method in BOOLEANS else equality(node, method, subject, first))
             if subject is None and method in {"hasSize", "containsExactly", "containsOnly", "contains", "isNotEmpty"}:
-                _, subject = fluent_origin(file, call.receiver, preserves_size=True)
+                _, subject, _ = fluent_origin(file, call.receiver, preserves_size=True)
+            check.soft_receiver = buffered
             return collect_observations(file, check, method, subject, first)
         if method == "check" and first is not None and call_of(first) is not None and (
                 call_of(first).method in {"matches", "doesNotExist", "selectedDescendantsMatch"}):
             return Check(node)
-    if kotest_matcher(method):
+    if kotest_matcher(method) and owner in {"", "foreign", "kotest"} and (
+            owner != "foreign" or imported_method(file, call.method)[0] in {"", "kotest"}):
         if method in BOOLEANS:
             return collect_observations(file, predicate(node, call.receiver, method == "shouldBeFalse"))
         return collect_observations(file, equality(node, method, call.receiver, first),
                                     method, call.receiver, first)
+    if owner and not accepts(owner, method):
+        return None
     if method in BOOLEANS:
-        operands = junit_args(file, call, method)
+        operands = junit_args(file, call, owner, method)
         if operands and operands[0] is not None:
             return collect_observations(file, predicate(node, operands[0], method == "assertFalse"))
+        return None
     if method in EQUAL | UNEQUAL | IDENTITY:
-        operands = junit_args(file, call, method)
+        operands = junit_args(file, call, owner, method)
         if len(operands) >= 2:
-            check = equality(node, method, *operands[:2])
+            check = equality(node, method, *operands[:2], expected_first=True)
             if method == "assertSame" and len(call.args) == 3:
                 message = next((arg for arg in call.args if all(arg is not operand for operand in operands[:2])), None)
                 value = literal(file.syntax, message)
                 if isinstance(value, str):
                     check.message = value
             return collect_observations(file, check)
+        return None
     if method == "assertNotNull":
-        operands = junit_args(file, call, method)
+        operands = junit_args(file, call, owner, method)
         return collect_observations(file, Check(node), method, operands[0] if operands else None)
     if lint.assertion(method) or method == "fail" or file.imports.get(call.method) and lint.helper(method):
         return Check(node)
@@ -396,8 +418,8 @@ def infix_check(file, node):
     bindings = children(node)
     if len(bindings) == 3:
         subject, identifier, expected = bindings
-        method = file.resolve_name(name(identifier))
-        if kotest_matcher(method):
+        owner, method = imported_method(file, name(identifier))
+        if owner in {"", "kotest"} and kotest_matcher(method):
             return collect_observations(file, equality(node, method, subject, expected), method, subject, expected)
     return None
 
