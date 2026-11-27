@@ -63,6 +63,66 @@ RULES = {
         ),
         command="lint",
     ),
+    "no-crash": Rule(
+        "This test checks that the call completes without throwing, crashing, or hanging. "
+        "Would checking the result serve better?",
+        "Completion is the regression you need to catch.",
+        Recipe(
+            (
+                "Check the result or side effect if the test promises one.",
+                "If completion is the contract, say why this input used to fail and let that failure reach the runner.",
+            ),
+            "Reject checks that swallow errors or assert an unrelated value.",
+            {
+                "py": ("""
+                    def test_parse_port_does_not_raise():
+                        parse_port("8080")
+                    """, """
+                    def test_parse_port():
+                        assert parse_port("8080") == 8080
+                    """),
+                "rs": ("""
+                    #[test]
+                    fn parse_port_does_not_panic() {
+                        parse_port("8080");
+                    }
+                    """, """
+                    #[test]
+                    fn parses_port() {
+                        assert_eq!(parse_port("8080"), 8080);
+                    }
+                    """),
+                "ts": ("""
+                    test("parsing a port does not throw", () => {
+                      expect(() => parsePort("8080")).not.toThrow();
+                    });
+                    """, """
+                    test("parses a port", () => {
+                      expect(parsePort("8080")).toBe(8080);
+                    });
+                    """),
+                "dart": ("""
+                    import 'package:test/test.dart';
+
+                    void main() {
+                      test('parsing a port does not throw', () {
+                        expect(() => parsePort('8080'), returnsNormally);
+                      });
+                    }
+                    """, """
+                    import 'package:test/test.dart';
+
+                    void main() {
+                      test('parses a port', () {
+                        expect(parsePort('8080'), 8080);
+                      });
+                    }
+                    """),
+            },
+        ),
+        command="lint",
+        level="advisory",
+    ),
     "guarded-assert": Rule(
         "Every check is conditional and the test can skip them all.",
         "The branch is exercised by a named witness, or zero matching items is explicitly a valid case.",
@@ -479,7 +539,7 @@ RULES = {
     ),
 }
 
-LANGUAGES = {"py": "Python", "rs": "Rust", "ts": "TypeScript"}
+LANGUAGES = {"py": "Python", "rs": "Rust", "ts": "TypeScript", "dart": "Dart"}
 
 
 def fix_for(name):
@@ -501,7 +561,10 @@ def describe(name=None, language=None):
         return summary(name)
     steps = "\n".join(f"  {index}. {step}" for index, step in enumerate(recipe.rework, 1))
     sections = [summary(name), f"Rework\n{steps}", f"Review\n  {recipe.gaming}"]
-    for lang in (language,) if language else LANGUAGES:
+    examples = (language,) if language else recipe.examples
+    for lang in examples:
+        if lang not in recipe.examples:
+            continue
         bad, good = recipe.examples[lang]
         sections.append(f"{LANGUAGES[lang]}\nBad example\n{dedent(bad).strip()}\n\n"
                         f"Reworked example\n{dedent(good).strip()}")

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 
 from test_tq import ROOT, RULES, TqCase
 
@@ -12,7 +13,8 @@ class ReworkTests(TqCase):
         has_literal_port = (ROOT / "tq_rules" / "ast_grep_literals.py").is_file()
         rendered = set()
         for rule in sorted(RULES - {"invalid-suppression", "parse-error", "too-deep"}):
-            for language in ("py", "rs", "ts"):
+            languages = ("py", "rs", "ts", "dart") if rule == "no-crash" else ("py", "rs", "ts")
+            for language in languages:
                 with self.subTest(rule=rule, language=language):
                     output = self.tq("rules", rule, "--lang", language)
                     recipe, examples = output.split("Bad example\n")
@@ -22,8 +24,8 @@ class ReworkTests(TqCase):
                     self.assertIn("Review\n  Reject ", recipe)
                     rendered.add((rule, language))
                     name = f"test_recipe.{language}"
-                    engines = [] if language == "ts" or rule == "micro-snapshot" else ["legacy"]
-                    if has_ast_grep:
+                    engines = [] if language in {"ts", "dart"} or rule == "micro-snapshot" else ["legacy"]
+                    if has_ast_grep and (language != "dart" or os.getenv("TQ_DART_GRAMMAR")):
                         engines.append("ast-grep")
                     for engine in engines:
                         with self.subTest(engine=engine):
@@ -41,7 +43,7 @@ class ReworkTests(TqCase):
                             self.write(name, bad)
                             command = "witness" if rule == "missing-witness" else "lint"
                             exit_code = 0 if rule in {
-                                "micro-snapshot", "nondistinguishing-literal", "self-derived-expected",
+                                "micro-snapshot", "no-crash", "nondistinguishing-literal", "self-derived-expected",
                             } else 1
                             rows = json.loads(self.tq(command, *args, code=(exit_code,)))
                             if command == "lint":
@@ -49,7 +51,7 @@ class ReworkTests(TqCase):
                                 rows = rows["findings"]
                             self.assertIn(rule, [row["rule"] for row in rows])
 
-        self.assertEqual(len(rendered), 27)  # Nine finding rules with three languages each.
+        self.assertEqual(len(rendered), 31)  # Nine rules with three languages each, plus four for no-crash.
 
     def test_suppressions_partition_findings_and_preserve_reason(self):
         # WHY: one allow moves one matched row and preserves its location and reason.

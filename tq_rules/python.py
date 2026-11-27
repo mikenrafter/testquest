@@ -12,6 +12,7 @@ import tokenize
 from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, fixed_operand, argument_claims, helper, loose_bounds, named_arguments,
                    prefix_satisfies, describes_distinct_inputs, claims_effect, claims_outcome, suggests_repeatability, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
                    inverse_codecs, path_directories, pins_path)
+from . import lint
 from .source import Comment, Test, project_root
 
 
@@ -1894,6 +1895,29 @@ def has_outcome_evidence(node, scope, checks_call):
     return not setup_only(node, len(evidence))
 
 
+def no_crash_test(test, node, comments, checks_call, scope, missing):
+    statements = node.body
+    description = ast.get_docstring(node, clean=False) or ""
+    if description:
+        statements = statements[1:]
+    direct = []
+    for statement in statements:
+        if isinstance(statement, (ast.Expr, ast.Assign, ast.AnnAssign)):
+            value = statement.value
+        else:
+            return False
+        direct.append(value.value if isinstance(value, ast.Await) else value)
+    calls = [value for value in direct if isinstance(value, ast.Call)]
+    if not calls:
+        return False
+    checks = [part for part in body_nodes(statements)
+              if isinstance(part, ast.Call) and checks_call(scope, name_of(part.func))]
+    if checks:
+        return all(call in calls and name_of(call.func).split(".")[-1] in lint.PYTHON_NO_RAISE
+                   for call in checks)
+    return missing and lint.claims_completion(test, comments, description=description)
+
+
 def body_fingerprint(node, tokens, lines):
     first, last = node.body[0], node.body[-1]
     first_column = len(lines[first.lineno - 1].encode()[:first.col_offset].decode())
@@ -2006,6 +2030,6 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
                 collection_controls.record(path, scan_root, fingerprints[name], test, line)
         test.issues.extend((line, "absence-no-control") for line in inspector.runtime_sweep_checks(checks))
         test.issues.extend((line, "absence-no-control") for line in inspector.unchecked_mocks())
-        if not has_outcome_evidence(node, scope, checks_call):
-            test.issues.append((test.line, "no-assert"))
+        missing = not has_outcome_evidence(node, scope, checks_call)
+        lint.record_completion(test, missing, no_crash_test(test, node, comments, checks_call, scope, missing))
     return tests, comments

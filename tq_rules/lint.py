@@ -269,6 +269,52 @@ def fixed_boundary(calls):
                     for inputs in calls))
 
 
+FAILURE_WORD = (
+    r"throw(?:s|ing)?|crash(?:es|ed|ing)?|panic(?:s|ked|king)?|hang(?:s|ing)?|"
+    r"rais(?:e|es|ed|ing)|diverg(?:e|es|ed|ing)|recurse forever|exceptions?"
+)
+COMPLETION_CLAIM = re.compile(
+    rf"\b(?:without|no|never|not) (?:cause |trigger |provoke )?(?:an? )?(?:{FAILURE_WORD})\b"
+    r"|\b(?:returns? normally|never fails|would throw|errors? (?:is|are) tolerated|"
+    r"(?:can|may) (?:still )?be called (?:multiple times|twice|explicitly))\b"
+    r"|\b(?:bad|broken) implementations?\b.*\b(?:diverge|hang)\b"
+    r"|\bnot (?:provoke|trigger|cause) (?:an? )?infinite recursion\b"
+)
+VERIFICATION = re.compile(
+    r"\b(?:verif(?:y|ies)|checks?|asserts?)\s+(?:that\s+)?(.+)|"
+    r"\bshould have\s+(.+?)\s+without\b", re.I
+)
+RUST_NO_PANIC = {"assert_no_panic", "assert_does_not_panic", "assert_not_panics"}
+PYTHON_NO_RAISE = {"assert_does_not_raise", "assert_no_exception", "assertDoesNotRaise"}
+
+
+def completion_words(text):
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    text = re.sub(r"\b(does|should|must|will)n['’]t\b", r"\1 not", text, flags=re.I)
+    return " ".join(re.findall(r"[^\W_]+", text.casefold()))
+
+
+def claims_completion(test, comments, *, description=""):
+    """Use the title and owned prose to identify completion as the stated outcome."""
+    notes = [comment.text for comment in comments
+             if test.owns_inventory_comment(comment) and not comment.text.startswith(("tq:", "catches:"))]
+    evidence = " ".join(notes)
+    for clause in re.split(r"[.!?]\s+", evidence):
+        verified = VERIFICATION.search(clause)
+        if verified is not None:
+            outcome = verified[1] or verified[2]
+            if not COMPLETION_CLAIM.search(completion_words(outcome)):
+                return False
+    return bool(COMPLETION_CLAIM.search(completion_words(" ".join((test.name, description, evidence)))))
+
+
+def record_completion(test, missing_check, no_crash):
+    if no_crash:
+        test.issues.append((test.line, "no-crash"))
+    elif missing_check:
+        test.issues.append((test.line, "no-assert"))
+
+
 def assertion(name):
     return name.startswith(("assert", "prop_assert", "debug_assert"))
 

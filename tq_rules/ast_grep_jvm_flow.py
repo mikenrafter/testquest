@@ -291,7 +291,7 @@ class Flow:
             body = body_of(callbacks[0])
             condition = children(body)[-1] if body is not None and children(body) else None
             return self.record(collect_observations(self.file, predicate(node, condition, False)))
-        synchronous = method in SYNCHRONOUS or check is not None and method == "satisfies"
+        synchronous = method in SYNCHRONOUS or check is not None and (check.no_throw or method == "satisfies")
         if not synchronous and method not in ITERATING | {"launch", "async", "allSatisfy", "anySatisfy",
                                                            "noneSatisfy"}:
             self.opaque_check |= node.parent().kind() == "function_body" or any(

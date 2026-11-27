@@ -707,6 +707,37 @@ class File:
         return None, None
 
 
+def completion_check(check):
+    from .ast_grep_dart_flow import Flow
+
+    if check.matcher != "returnsNormally" or check.guarded:
+        return False
+    callback = check.file.callback(check.actual)
+    if callback is None:
+        return bool(names(check.actual))
+    flow = Flow(callback.file, callback, ())
+    flow.run()
+    return not flow.checks and not query(callback.body, "catch_clause")
+
+
+def no_crash_test(callback, test, checks, notes):
+    if checks:
+        return all(map(completion_check, checks))
+    if not lint.claims_completion(test, notes):
+        return False
+    body = callback.body
+    if query(body, "catch_clause"):
+        return False
+    block = next((node for node in contents(body) if node.kind() == "block"), None)
+    steps = [contents(step) for step in contents(block)] if block is not None else [contents(body)]
+    for args in steps:
+        if kind(args) == "await_expression":
+            args = contents(args[0])
+        if (call := final_call(args)) is not None and not call.optional:
+            return True
+    return False
+
+
 def parse(source, path, *, inventory=False, observe=None):
     from .ast_grep_dart_absence import Absence
     from .ast_grep_dart_flow import Flow
@@ -729,6 +760,7 @@ def parse(source, path, *, inventory=False, observe=None):
         if inventory and any(callback is not None for callback in callbacks):
             body = contents(span.parent()) if span.kind() == "identifier" else (span,)
             test.body_hash = hashlib.sha256(repr(signature(body)).encode()).hexdigest()
+        completion = []
         for callback in callbacks:
             if callback is None:
                 continue
@@ -736,8 +768,7 @@ def parse(source, path, *, inventory=False, observe=None):
             incomplete = flow.run()
             micro_snapshot(file, test, flow.checks)
             test.checks = max(test.checks, len(flow.checks))
-            if not flow.checks:
-                test.issues.append((test.line, "no-assert"))
+            completion.append((not flow.checks, no_crash_test(callback, test, flow.checks, notes)))
             test.guarded |= bool(flow.checks and incomplete)
             for check in flow.checks:
                 if check.file is not file:
@@ -748,6 +779,9 @@ def parse(source, path, *, inventory=False, observe=None):
                 if flow.compares_itself(check, test.name, line_comments):
                     test.issues.append((site, "self-compare"))
             absence.collect(test, flow)
+        if completion:
+            lint.record_completion(test, any(missing for missing, _ in completion),
+                                   all(no_crash for _, no_crash in completion))
     absence.finish()
     if observe is not None:
         observe(path, tests, syntax_errors(syntax.root, missing=True), [])

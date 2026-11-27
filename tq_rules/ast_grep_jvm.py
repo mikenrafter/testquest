@@ -655,6 +655,24 @@ def comments(syntax):
                               text, standalone or index > 0)
 
 
+def no_crash_test(language, test, body, checks, notes, missing, checked):
+    if checks:
+        return checked and all(check.no_throw for check in checks)
+    if not missing or not lint.claims_completion(test, notes):
+        return False
+    if query(body, "catch_block" if language == "kotlin" else "catch_clause"):
+        return False
+    statements = children(body_of(body) if body.kind() in LAMBDAS else body)
+    while len(statements) == 1 and statements[0].kind() in {"block", "statements", "function_body"}:
+        statements = children(statements[0])
+    for statement in statements:
+        if statement.kind() == "expression_statement":
+            statement = next(iter(children(statement)), statement)
+        if (call := call_of(statement)) is not None and not has_safe_navigation(call.callee):
+            return True
+    return False
+
+
 def parse(source, path, language, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
     from .ast_grep_jvm_checks import compares_itself
     from .ast_grep_jvm_flow import Flow, merge
@@ -686,8 +704,9 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
         checks = list(flow.checks.values())
         micro_snapshot(file, test, flow.checks)
         test.checks = len(checks) + int(expected_exception)
-        if not test.checks and not flow.opaque_check:
-            test.issues.append((test.line, "no-assert"))
+        missing = not test.checks and not flow.opaque_check
+        if not expected_exception:
+            lint.record_completion(test, missing, no_crash_test(language, test, body, checks, notes, missing, evidence.checked))
         test.guarded = bool(checks) and not (evidence.checked or expected_exception)
         if test.guarded and flow.loop_checks.keys() == flow.checks.keys():
             source = next(iter(flow.loop_checks.values()))

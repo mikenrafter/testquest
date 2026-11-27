@@ -8,6 +8,7 @@ from string import Formatter
 from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, argument_claims, fixed_boundary, fixed_operand, helper, loose_bounds,
                    named_arguments, prefix_satisfies, describes_distinct_inputs, claims_effect, claims_outcome, suggests_repeatability,
                    symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN, inverse_codecs, path_directories, pins_path)
+from . import lint
 from .source import Comment, Test
 
 
@@ -2902,6 +2903,19 @@ def has_outcome_evidence(test, inspector, body, evidence):
     return not setup_only(tokens, evidence, scope, len(assertions))
 
 
+def no_crash_test(test, body, checks, comments, missing):
+    if checks and all(name in lint.RUST_NO_PANIC and not guarded for _, name, _, guarded in checks):
+        return True
+    if not missing or not lint.claims_completion(test, comments):
+        return False
+    tokens = body.children
+    if any(token.text in {"catch_unwind", "unwrap_or", "unwrap_or_else", "unwrap_or_default"}
+           for token in walk_tokens(tokens)):
+        return False
+    return any(invocation_at(tokens, index, generic=True) for index in range(len(tokens))
+               if tokens[index].text not in {"if", "for", "while", "match"})
+
+
 def witnessed_by_helpers(inspected, evidence, file_iterables, parameters, missing):
     visited = set()
     for test, inspector, _, ignored, _ in inspected:
@@ -3003,8 +3017,9 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
                     collection_controls.record(path, scan_root, fingerprints[producer], test, line)
                 reported.add(producer)
         test.issues.extend((line, "absence-no-control") for line in inspector.runtime_sweep_checks(checks))
-        if not (panic or ignored or id(body) in macro_tests or has_outcome_evidence(test, inspector, body, evidence)):
-            test.issues.append((test.line, "no-assert"))
+        if not (panic or ignored or id(body) in macro_tests):
+            missing = not has_outcome_evidence(test, inspector, body, evidence)
+            lint.record_completion(test, missing, no_crash_test(test, body, inspector.checks, comments, missing))
         ignored_tool = (scan_root is not None and ignored
                         and all(name == "expect" for _, name, _, _ in inspector.checks))
         test.guarded = bool(inspector.checks) and not (panic or ignored_tool) and all(

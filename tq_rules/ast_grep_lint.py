@@ -2156,6 +2156,36 @@ def micro_snapshot(file, flow, test):
     micro.report(test, fragments, whole, key)
 
 
+def no_crash_test(flow, test, comments, missing):
+    syntax, body = flow.syntax, flow.body
+    python = syntax.language == "python"
+    helpers = lint.PYTHON_NO_RAISE if python else lint.RUST_NO_PANIC
+    if flow.checks and all(check.kind in helpers and not check.guarded for check in flow.checks):
+        return True
+    if not missing:
+        return False
+    statements = list(direct_statements(body))
+    description = ""
+    if python and statements and python_string(statements[0]):
+        description = statements[0].text()
+    if not lint.claims_completion(test, comments, description=description):
+        return False
+    if python and any(statement.kind() not in {"assignment", "call", "await"}
+                      and not python_string(statement) for statement in statements):
+        return False
+    if not python and any(call.method in {"catch_unwind", "unwrap_or", "unwrap_or_else", "unwrap_or_default"}
+                          for _, call in flow.calls):
+        return False
+    for statement in statements:
+        candidate = unwrap(binding(statement)[1] if not python and statement.kind() == "let_declaration"
+                           else statement)
+        if candidate is not None and candidate.kind() in {"await", "await_expression"}:
+            candidate = unwrap(next(iter(children(candidate)), None))
+        if candidate is not None and candidate.kind() in CALLS:
+            return True
+    return False
+
+
 def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
     from . import ast_grep_literals as literals
     from .ast_grep_languages import ECMASCRIPT_LANGUAGES, JVM_LANGUAGES
@@ -2209,8 +2239,9 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
         )
         test.guarded = any(check.reachability for check in flow.checks) and not (
             guaranteed or should_panic or ignored_tool)
-        if not (should_panic or ignored or flow.verifies_outcome(test.name)):
-            test.issues.append((test.line, "no-assert"))
+        if not (should_panic or ignored):
+            missing = not flow.verifies_outcome(test.name)
+            lint.record_completion(test, missing, no_crash_test(flow, test, comments, missing))
         for check in flow.checks:
             check_line = file.line_at(check.location)
             if check.truth() is True:

@@ -22,6 +22,7 @@ RULES = {
     "micro-snapshot",
     "missing-witness",
     "no-assert",
+    "no-crash",
     "nondistinguishing-literal",
     "parse-error",
     "self-compare",

@@ -183,6 +183,7 @@ class Check:
     snapshot_subject: object = None
     fragment_needle: object = None
     fragment_negative: bool = False
+    no_throw: bool = False
 
     def constant(self, syntax):
         if self.predicate is not None:
@@ -288,6 +289,8 @@ def junit_args(file, call, method):
 def check_call(file, node, call):
     method = file.resolve_name(call.method)
     first = call.args[0] if call.args else None
+    if method in {"assertDoesNotThrow", "shouldNotThrow", "shouldNotThrowAny"} and first is not None:
+        return Check(node, no_throw=True)
     if method == "assertThat":
         matcher = call_of(call.args[-1]) if len(call.args) >= 2 else None
         hamcrest = file.imports.get(call.method, "").startswith(("org.hamcrest.", "org.junit.Assert."))

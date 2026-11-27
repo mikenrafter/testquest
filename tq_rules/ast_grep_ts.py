@@ -809,6 +809,8 @@ def matcher(node, subject, members, args):
 
 
 def assert_check(node, method, args):
+    if method in {"doesNotThrow", "doesNotReject", "notThrows", "notThrowsAsync"} and args:
+        return Check(node, method, args[0])
     if len(args) >= 2 and method in ASSERT_EQUAL | ASSERT_UNEQUAL and method != "isTrue":
         operator = {"equal": "==", "notEqual": "!=", "deepEqual": "==",
                     "deepStrictEqual": "===", "strictEqual": "==="}.get(
@@ -938,6 +940,41 @@ def micro_snapshot(file, test, checks):
     micro.report(test, fragments, whole, key)
 
 
+def completion_check(flow, check):
+    from .ast_grep_ts_flow import Flow
+
+    matched = (check.method in {"doesNotThrow", "doesNotReject", "notThrows", "notThrowsAsync"}
+               or check.method in {"toThrow", "toThrowError"} and check.modifiers == ("not",)
+               and check.expected is None)
+    subject = expression(check.actual)
+    if (not matched or check.guarded or subject is None
+            or subject.kind() not in FUNCTIONS | {"identifier", "member_expression"}
+            and check.method != "doesNotReject"):
+        return False
+    callback = flow.callback_target(subject)
+    if callback is None:
+        return True
+    nested = Flow(flow.file, callback, flow.context, flow.active)
+    nested.visit(nested.body)
+    return not nested.checks and not query(nested.body, "catch_clause")
+
+
+def no_crash_test(flow, test, notes):
+    if flow.checks:
+        return all(completion_check(flow, check) for check in flow.checks)
+    body = flow.body
+    if not lint.claims_completion(test, notes) or query(body, "catch_clause"):
+        return False
+    steps = children(body) if body.kind() == "statement_block" else [body]
+    for step in steps:
+        target = next(iter(children(step)), None) if step.kind() == "expression_statement" else step
+        if target is not None and target.kind() == "await_expression":
+            target = next(iter(children(target)), None)
+        if target is not None and target.kind() == "call_expression" and not flow.optional(target):
+            return True
+    return False
+
+
 def parse(source, path, language, *, scan_root=None, inventory=False, observe=None):
     from .ast_grep_ts_flow import Flow
 
@@ -960,8 +997,7 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
         incomplete = flow.visit(body)
         micro_snapshot(file, test, flow.checks)
         test.checks = len(flow.checks)
-        if not flow.checks:
-            test.issues.append((test.line, "no-assert"))
+        lint.record_completion(test, not flow.checks, no_crash_test(flow, test, notes))
         test.guarded = bool(flow.checks) and bool(incomplete)
         if inventory:
             test.body_hash = hashlib.sha256(repr(shape(body)).encode()).hexdigest()

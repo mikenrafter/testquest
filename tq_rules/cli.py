@@ -6,9 +6,11 @@ import sys
 from . import catches, history, ledger, ledger_config, ledger_report, lint, props, repo, rules, witness
 
 
-def print_findings(rows, as_json, *, suppressed=None):
+def print_findings(rows, as_json, *, suppressed=None, no_crash=0):
     if as_json:
         output = rows if suppressed is None else {"findings": rows, "suppressed": suppressed}
+        if no_crash:
+            output["summary"] = {"no_crash": no_crash}
         print(json.dumps(output, indent=2))
     else:
         for row in rows:
@@ -20,6 +22,9 @@ def print_findings(rows, as_json, *, suppressed=None):
             count = len(suppressed)
             noun = "finding" if count == 1 else "findings"
             print(f"Suppressed {count} {noun}.")
+        if no_crash:
+            noun = "test" if no_crash == 1 else "tests"
+            print(f"{no_crash} new no-crash {noun}: confirm each belongs")
     return int(any(row.get("level") != "advisory" for row in rows))
 
 
@@ -68,7 +73,11 @@ def main():
             select = (history.ChangedTests(repo.root("."), options.since, parser=parse)
                       if options.since else None)
             result = lint.find(options.paths or ["."], select=select, parser=parse)
-            return print_findings(result.findings, options.json, suppressed=result.suppressed)
+            no_crash = 0
+            if select is not None:
+                no_crash = sum(row["rule"] == "no-crash" for rows in (result.findings, result.suppressed)
+                               for row in rows)
+            return print_findings(result.findings, options.json, suppressed=result.suppressed, no_crash=no_crash)
         if options.command == "log":
             return run_log(options, parse)
         if options.command == "witness":

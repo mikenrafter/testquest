@@ -1,13 +1,13 @@
 # Rules reference
 
-`tq lint` checks Python and Rust test files. The ast-grep engine also scans TypeScript and JavaScript. `tq witness` checks that conditional tests reach the case they claim to verify.
+`tq lint` checks Python and Rust test files. The ast-grep engine also scans TypeScript, JavaScript, Dart, Kotlin, and Java. `tq witness` checks that conditional tests reach the case they claim to verify.
 
 Rules have two levels:
 
 - `error` (gating): causes `tq lint` or `tq witness` to exit with status 1.
 - `advisory`: prints the finding prefixed with `advisory:` without causing a non-zero exit code on its own.
 
-Run `tq rules` to list the rules and their levels. Each gating finding includes a `fix:` line. Run `tq rules RULE --lang py|rs|ts` to get the full recipe, examples for your language, and shortcuts to reject in review.
+Run `tq rules` to list the rules and their levels. Each gating finding includes a `fix:` line. Run `tq rules RULE --lang py|rs|ts|dart` to get the full recipe, examples for your language, and shortcuts to reject in review.
 
 ## Suppressing a finding
 
@@ -24,7 +24,7 @@ def test_parse_port_accepts_valid_input():
 assert_eq!(a.clone(), a.clone());
 ```
 
-For function-level rules (`no-assert` and `guarded-assert`), `tq` reports the finding on the `def` or `fn` line, so place the comment on that line or the line directly above it. Use a supported lint rule and explain the exception in at least three words beyond the rule name. An invalid allow produces an `invalid-suppression` finding. `parse-error` cannot be suppressed.
+For function-level rules such as `no-assert`, `no-crash`, and `guarded-assert`, `tq` reports the finding on the `def` or `fn` line, so place the comment on that line or the line directly above it. Use a supported lint rule and explain the exception in at least three words beyond the rule name. An invalid allow produces an `invalid-suppression` finding. `parse-error` cannot be suppressed.
 
 An allow applies to one matching finding. It moves that row to `suppressed` in the JSON output, alongside the `findings` list. Each suppressed row includes its `reason`. Text output reports the count of suppressed rows. Only gating rows in `findings` affect the exit status.
 
@@ -157,6 +157,60 @@ def test_parse_port():
 **Exemptions.** Suppress with `# tq: allow self-compare REASON` when the stated property is reflexivity or repeatability and both operands are evaluated independently (for example, checking a `Clone` or `PartialEq` derive).
 
 ## Advisory rules
+
+### `no-crash`
+
+Flags tests whose only stated check is that a call completes without throwing, panicking, crashing, or hanging. If an earlier bug made that input fail, describe the regression and let the failure reach the test runner. If the contract promises a value or side effect, observe it directly.
+
+`tq lint --since <base>` counts `no-crash` rows in changed tests, including suppressed rows, and asks the reviewer to confirm each belongs. With `--json`, the same count appears at `summary.no_crash` when there are matching rows.
+
+Python:
+
+```python
+def test_parse_port_does_not_raise():
+    parse_port("8080")
+
+def test_parse_port():
+    assert parse_port("8080") == 8080
+```
+
+Rust:
+
+```rust
+#[test]
+fn parse_port_does_not_panic() {
+    parse_port("8080");
+}
+
+#[test]
+fn parses_port() {
+    assert_eq!(parse_port("8080"), 8080);
+}
+```
+
+TypeScript:
+
+```typescript
+test("parsing a port does not throw", () => {
+  expect(() => parsePort("8080")).not.toThrow();
+});
+
+test("parses a port", () => {
+  expect(parsePort("8080")).toBe(8080);
+});
+```
+
+Dart:
+
+```dart
+test('parsing a port does not throw', () {
+  expect(() => parsePort('8080'), returnsNormally);
+});
+
+test('parses a port', () {
+  expect(parsePort('8080'), 8080);
+});
+```
 
 ### `micro-snapshot`
 
