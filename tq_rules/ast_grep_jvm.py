@@ -2,11 +2,13 @@
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from functools import lru_cache
 import hashlib
 
 from . import lint
 from .ast_grep import Syntax, children, line, location, offset, query, shape, syntax_errors, text, unwrap
-from .source import Comment, Test
+from .ast_grep_languages import JVM_LANGUAGES
+from .source import Comment, Test, project_root
 
 
 FUNCTIONS = {"method_declaration", "function_declaration"}
@@ -17,6 +19,7 @@ IDENTIFIERS = {"identifier", "simple_identifier", "type_identifier"}
 TEST_ANNOTATIONS = {"Test", "ParameterizedTest", "RepeatedTest", "TestTemplate", "TestFactory", "Theory"}
 DISABLED_ANNOTATIONS = {"Ignore", "Disabled"}
 TEST_NAMESPACES = ("org.junit.", "kotlin.test.", "androidx.test.", "android.test.")
+MODULE_MARKERS = {"build.gradle", "build.gradle.kts", "pom.xml", ".git"}
 STYLES = {
     "BehaviorSpec": ({"given", "when", "and"}, {"then"}),
     "DescribeSpec": ({"describe", "context"}, {"it"}),
@@ -49,6 +52,10 @@ def declaration_name(node):
 
 def body_of(node):
     return node.field("body") or child(node, "function_body", "statements", "block")
+
+
+def owner_of(node):
+    return next((parent for parent in node.ancestors() if parent.kind() in CLASSES), None)
 
 
 def member(node):
@@ -115,6 +122,86 @@ def call_of(node):
     return Call(method, args, receiver, named, callee)
 
 
+def bind_arguments(declaration, call):
+    parameters = declaration.field("parameters") or child(declaration, "function_value_parameters")
+    defaults = {}
+    entries = []
+    for entry in children(parameters) if parameters is not None else ():
+        if entry.kind() in {"parameter", "formal_parameter", "spread_parameter"}:
+            entries.append(entry)
+        elif entries and entry.prev() is not None and entry.prev().kind() == "=":
+            defaults[declaration_name(entries[-1])] = entry
+    named = {declaration_name(entry): entry for entry in entries}
+    if not call.named.keys() <= named.keys():
+        return None
+    supplied = {identifier: (value, True) for identifier, value in call.named.items()}
+    positional = iter(identifier for identifier in named if identifier not in supplied)
+    for argument in call.args:
+        if any(argument is value for value in call.named.values()):
+            continue
+        if argument.kind() in LAMBDAS and argument.parent().kind() == "annotated_lambda":
+            identifier = next(reversed(named), None)
+        else:
+            identifier = next(positional, None)
+        if identifier is None or identifier in supplied:
+            return None
+        supplied[identifier] = argument, True
+    if not named.keys() <= supplied.keys() | defaults.keys():
+        return None
+    return [(parameter, *supplied.get(identifier, (defaults.get(identifier), False)))
+            for identifier, parameter in named.items()]
+
+
+def has_modifier(node, word):
+    modifiers = child(node, "modifiers")
+    return modifiers is not None and any(token.text() == word for token in modifiers.children())
+
+
+def read_file(path, module):
+    try:
+        stat = path.stat()
+        return cached_file(path, module, stat.st_mtime_ns, stat.st_size)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+@lru_cache(maxsize=128)
+def cached_file(path, module, modified, size):
+    return File(parse_syntax(path.read_text(encoding="utf-8"), JVM_LANGUAGES[path.suffix]), path, module)
+
+
+def parse_syntax(source, language):
+    syntax = Syntax.parse(source, language)
+    if language != "kotlin" or not query(syntax.root, "ERROR"):
+        return syntax
+    repairs = []
+    for delegation in query(syntax.root, "explicit_delegation"):
+        if not any(any(name(entry) in {"try", "finally"} for entry in children(infix))
+                   for infix in query(delegation, "infix_expression")):
+            continue
+        keyword = next((entry for entry in delegation.children() if entry.kind() == "by"), None)
+        if keyword is None:
+            continue
+        start = offset(keyword)
+        header = source[start:].split("\n", 1)[0]
+        prefix, brace, _ = header.partition("{")
+        delegate = prefix.removeprefix("by").strip()
+        if brace and delegate.isascii() and all(part.isidentifier() for part in delegate.split(".")):
+            repairs.append((start, start + len(prefix)))
+    if not repairs:
+        return syntax
+    # CLAIM(jvm-delegation-span): masking a misparsed delegate preserves source locations
+    # and recovers the following statements [test_object_delegation_does_not_swallow_a_test].
+    repaired = source
+    for start, end in sorted(repairs, reverse=True):
+        repaired = repaired[:start] + " " * (end - start) + repaired[end:]
+    candidate = Syntax.parse(repaired, language)
+    if len(query(candidate.root, "ERROR")) < len(query(syntax.root, "ERROR")):
+        candidate.source = source
+        return candidate
+    return syntax
+
+
 def string_title(node):
     if node is None or node.kind() != "string_literal":
         return None
@@ -131,16 +218,31 @@ class Registration:
     ignored: bool = False
 
 
+@dataclass(frozen=True)
+class Recorder:
+    identity: tuple
+    shared: tuple | None = None
+
+
 class File:
-    def __init__(self, syntax):
+    def __init__(self, syntax, path, module):
         self.syntax = syntax
+        self.path = path
+        self.module = module
+        package = child(syntax.root, "package_header", "package_declaration")
+        self.package = next(iter(children(package))).text() if package is not None and children(package) else ""
         self.imports = {}
         self.wildcard_imports = set()
         self.functions = defaultdict(list)
         self.bindings = defaultdict(list)
         self.styles = {}
         self.registrations = {}
+        self.packages = {}
+        self.resolved_types = {}
         kotlin = syntax.language == "kotlin"
+        type_kinds = ("class_declaration", "object_declaration") if kotlin else (
+            "class_declaration", "record_declaration", "enum_declaration")
+        self.types = {declaration_name(node): node for node in query(syntax.root, *type_kinds)}
         for entry in query(syntax.root, "import_header" if kotlin else "import_declaration"):
             qualified = child(entry, "identifier", "scoped_identifier")
             if qualified is not None:
@@ -180,22 +282,85 @@ class File:
         return any(annotation in DISABLED_ANNOTATIONS for annotation, _ in self.annotations(node))
 
     def helper(self, node, call):
-        if call.receiver is not None and call.receiver.text() != "this":
+        if call.receiver is None or call.receiver.text() == "this":
+            ancestors = {node_key(parent) for parent in node.ancestors()}
+            visible = [(scope, function) for scope, function in self.functions.get(call.method, ())
+                       if node_key(scope) in ancestors and bind_arguments(function, call) is not None]
+            if visible:
+                closest = max(offset(scope) for scope, _ in visible)
+                candidates = [fn for scope, fn in visible if offset(scope) == closest]
+                return (self, candidates[0]) if len(candidates) == 1 else None
+        if call.receiver is None and call.callbacks():
+            qualified = self.imports.get(call.method)
+            package, _, method = qualified.rpartition(".") if qualified else (self.package, "", call.method)
+            candidates = [(file, fn) for file in self.package_files(package)
+                          if file.path != self.path
+                          for scope, fn in file.functions.get(method, ())
+                          if node_key(scope) == node_key(file.syntax.root)
+                          and not has_modifier(fn, "private") and bind_arguments(fn, call) is not None]
+        elif call.callbacks() and (receiver := name(unwrap(call.receiver)))[:1].isupper():
+            target = self.type_named(receiver)
+            if target is None:
+                return None
+            file, owner = target
+            candidates = [(file, fn) for scope, fn in file.functions.get(call.method, ())
+                          if node_key(scope) == node_key(owner) and bind_arguments(fn, call) is not None
+                          and (file is self or not has_modifier(fn, "private"))
+                          and (owner.kind() == "object_declaration"
+                               or any(parent.kind() == "companion_object" for parent in fn.ancestors())
+                               or file.syntax.language == "java" and has_modifier(fn, "static"))]
+        else:
             return None
-        ancestors = {node_key(parent) for parent in node.ancestors()}
-        visible = [(scope, function) for scope, function in self.functions.get(call.method, ())
-                   if node_key(scope) in ancestors]
-        if not visible:
-            return None
-        closest = max(offset(scope) for scope, _ in visible)
-        candidates = [fn for scope, fn in visible if offset(scope) == closest]
-        matching = [fn for fn in candidates if self.arity(fn) == len(call.args)]
-        return matching[0] if len(matching) == 1 else candidates[0] if len(candidates) == 1 else None
+        return candidates[0] if len(candidates) == 1 else None
 
-    @staticmethod
-    def arity(node):
-        parameters = node.field("parameters") or child(node, "function_value_parameters")
-        return len(children(parameters)) if parameters is not None else 0
+    def package_files(self, package):
+        if package in self.packages:
+            return self.packages[package]
+        directories = {self.path.parent} if package == self.package else set()
+        if self.module is not None:
+            package_path = package.split(".") if package else ()
+            src = self.module / "src"
+            for source_set in src.glob("*"):
+                for language in ("java", "kotlin"):
+                    directories.add(source_set.joinpath(language, *package_path))
+        files = []
+        for directory in sorted(directories):
+            for path in sorted(directory.iterdir()) if directory.is_dir() else ():
+                if path.suffix in JVM_LANGUAGES and path.suffix != ".kts" and not path.is_symlink():
+                    file = self if path == self.path else read_file(path, self.module)
+                    if file is not None and file.package == package:
+                        files.append(file)
+        self.packages[package] = tuple(files)
+        return self.packages[package]
+
+    def type_named(self, identifier):
+        if identifier in self.resolved_types:
+            return self.resolved_types[identifier]
+        qualified = self.imports.get(identifier, identifier)
+        package, _, short = qualified.rpartition(".")
+        local = self.types.get(short)
+        if local is not None and (not package or package == self.package):
+            return self, local
+        packages = [package] if package else [self.package, *sorted(self.wildcard_imports)]
+        candidates = [(file, file.types[short]) for pkg in packages
+                      for file in self.package_files(pkg) if short in file.types
+                      and (file is self or not has_modifier(file.types[short], "private"))]
+        target = candidates[0] if len(candidates) == 1 else None
+        self.resolved_types[identifier] = target
+        return target
+
+    def object_property(self, receiver, identifier):
+        if not (type_name := name(receiver))[:1].isupper() or (target := self.type_named(type_name)) is None:
+            return None
+        file, owner = target
+        if owner.kind() != "object_declaration":
+            return None
+        for scope, field in file.bindings.get(identifier, ()):
+            if node_key(scope) == node_key(owner) and not has_modifier(field.parent(), "private"):
+                value = file.initializer(field, immutable=True)
+                if value is not None:
+                    return file, value
+        return None
 
     def index_binding(self, node):
         identifier = declaration_name(node)
@@ -216,21 +381,120 @@ class File:
             return None
         if receiver is not None:
             if receiver.text() == "this":
-                owner = next((parent for parent in node.ancestors() if parent.kind() in CLASSES), None)
-                return identifier, node_key(owner) if owner is not None else None
+                owner = owner_of(node)
+                fields = self.bindings.get(identifier, ())
+                binding = next((binding for scope, binding in fields
+                                if owner is not None and node_key(scope) == node_key(owner)), None)
+                return self.binding_recorder(node, identifier, owner, binding)
             base = self.recorder(receiver)
-            return (base, identifier) if base is not None else None
+            if base is None:
+                return None
+            shared = self.rig_member(receiver, identifier)
+            if shared is None and base.shared is not None:
+                shared = (*base.shared, identifier)
+            return Recorder((*base.identity, identifier), shared)
         scope, binding = self.visible_binding(node, identifier)
-        if scope is not None and scope.kind() not in CLASSES:
-            return identifier, node_key(binding)
-        owner = next((parent for parent in node.ancestors() if parent.kind() in CLASSES), None)
-        return identifier, node_key(owner) if owner is not None else None
+        return self.binding_recorder(node, identifier, scope, binding)
+
+    def binding_recorder(self, node, identifier, scope, binding):
+        if binding is None:
+            owner = owner_of(node)
+            return Recorder((self.path, node_key(owner) if owner is not None else None, identifier))
+        identity = (self.path, node_key(binding))
+        if scope.kind() in CLASSES or scope.kind() in {"source_file", "program"}:
+            return Recorder(identity, identity)
+        initializer = self.initializer(binding, immutable=True)
+        call = call_of(initializer)
+        if (call is not None and not call.args and call.receiver is None
+                and not call.method[:1].isupper() and (helper := self.helper(initializer, call)) is not None):
+            file, declaration = helper
+            body = body_of(declaration)
+            kind = "call_expression" if file.syntax.language == "kotlin" else "method_invocation"
+            if any(inner.method in {"mockk", "mock", "spy", "spyk"}
+                   for entry in query(body, kind) if (inner := call_of(entry)) is not None):
+                return Recorder(identity, (file.path, node_key(declaration)))
+        return Recorder(identity)
+
+    def rig_member(self, node, identifier):
+        node = unwrap(node)
+        if not (receiver := name(node)):
+            return None
+        scope, binding = self.visible_binding(node, receiver)
+        initializer = self.stable_initializer(node, scope, binding)
+        if initializer is None and scope is not None and scope.kind() in LAMBDAS:
+            parameter_list = child(scope, "lambda_parameters")
+            if parameter_list is not None and len(children(parameter_list)) != 1:
+                return None
+            invoked = next((parent for parent in scope.ancestors() if parent.kind() in CALLS), None)
+            call = call_of(invoked)
+            if call is not None and call.method in {"use", "let", "also"}:
+                initializer = call.receiver
+        if (constructed := self.constructed_type(initializer)) is not None:
+            file, type_name = constructed
+            return file.support_field(type_name, identifier)
+        return None
+
+    def constructed_type(self, node, active=frozenset()):
+        if node is None:
+            return None
+        if node.kind() == "object_creation_expression":
+            target = node.field("type")
+            return (self, target.text()) if target is not None else None
+        call = call_of(node)
+        if call is None:
+            return None
+        if call.method[:1].isupper():
+            return self, call.callee.text() if call.callee is not None else call.method
+        if call.method in {"also", "apply"}:
+            return self.constructed_type(call.receiver, active)
+        if (local := self.helper(node, call)) is not None:
+            file, declaration = local
+            key = file.path, node_key(declaration)
+            if key in active:
+                return None
+            declared_type = next((entry for entry in reversed(children(declaration))
+                                  if entry.kind() == "user_type"), None)
+            if declared_type is not None:
+                return file, declared_type.text()
+            expression = children(body_of(declaration))
+            if len(expression) == 1:
+                return file.constructed_type(expression[0], active | {key})
+        return None
+
+    def support_field(self, type_name, identifier):
+        if (target := self.type_named(type_name)) is None:
+            return None
+        file, owner = target
+        if file.path != self.path and not {"test", "androidTest", "testFixtures"}.intersection(
+                file.path.relative_to(self.module).parts[:-1]):
+            return None
+        return next(((file.path, node_key(field)) for scope, field in file.bindings.get(identifier, ())
+                     if node_key(scope) == node_key(owner)), None)
+
+    def collection_recorder(self, node):
+        recorder = self.recorder(node)
+        if recorder is None or recorder.shared is not None:
+            return recorder
+        base = unwrap(node)
+        while (receiver := member(base)[0]) is not None:
+            base = receiver
+        scope, binding = self.visible_binding(base, name(base))
+        initialized = self.initializer(binding)
+        if initialized is None or scope.kind() in CLASSES:
+            return recorder
+        origin = call_of(initialized)
+        if origin is not None and not (origin.receiver is None and origin.method in {
+                "mutableListOf", "mutableSetOf", "mutableMapOf", "arrayListOf", "hashSetOf", "hashMapOf",
+                "ArrayList", "HashSet", "HashMap", "ArrayDeque", "LinkedList", "ConcurrentLinkedQueue",
+                "LinkedBlockingQueue", "CopyOnWriteArrayList", "mutableStateListOf"}):
+            return None
+        return recorder
 
     def visible_binding(self, node, identifier):
-        position = offset(node)
         candidates = self.bindings.get(identifier)
         if not candidates:
             return None, None
+        position = offset(node)
         ancestors = {node_key(parent) for parent in node.ancestors()}
         visible = [(scope, binding) for scope, binding in candidates
                    if node_key(scope) in ancestors and (offset(binding) < position or scope.kind() in CLASSES)]
@@ -239,22 +503,42 @@ class File:
     def immutable_value(self, node):
         if not (identifier := name(node)):
             return None
-        scope, binding = self.visible_binding(node, identifier)
+        _, binding = self.visible_binding(node, identifier)
+        return self.initializer(binding, immutable=True)
+
+    def local_array(self, node):
+        if self.syntax.language != "java" or not (identifier := name(node)):
+            return None
+        value = self.stable_initializer(node, *self.visible_binding(node, identifier))
+        return value if value is not None and value.kind() in {"array_initializer", "array_creation_expression"} else None
+
+    def stable_initializer(self, node, scope, binding):
+        immutable = self.initializer(binding, immutable=True)
+        if immutable is not None or self.syntax.language != "java" or scope is None or scope.kind() != "block":
+            return immutable
+        identifier = name(node)
+        for assignment in query(scope, "assignment_expression"):
+            left = assignment.field("left")
+            if (left is not None and name(left) == identifier and offset(binding) < offset(left) < offset(node)):
+                return None
+        return self.initializer(binding)
+
+    def initializer(self, binding, *, immutable=False):
         if binding is None:
             return None
         if self.syntax.language == "kotlin" and binding.kind() == "variable_declaration":
             declaration = binding.parent()
             if declaration.kind() == "property_declaration":
                 binding_kind = child(declaration, "binding_pattern_kind")
-                if binding_kind is not None and binding_kind.text() == "val":
-                    entries = children(declaration)
-                    if (len(entries) == 3 and entries[1].kind() == "variable_declaration"
-                            and any(token.kind() == "=" for token in declaration.children())):
-                        return entries[-1]
+                if binding_kind is not None and (not immutable or binding_kind.text() == "val"):
+                    tokens = declaration.children()
+                    for index, token in enumerate(tokens[:-1]):
+                        if token.kind() == "=":
+                            return tokens[index + 1]
         if self.syntax.language == "java" and binding.kind() == "variable_declarator":
             declaration = binding.parent()
             modifiers = child(declaration, "modifiers")
-            if modifiers is not None and any(token.kind() == "final" for token in modifiers.children()):
+            if not immutable or modifiers is not None and any(token.kind() == "final" for token in modifiers.children()):
                 return binding.field("value")
         return None
 
@@ -371,15 +655,18 @@ def comments(syntax):
                               text, standalone or index > 0)
 
 
-def parse(source, path, language, *, inventory=False, observe=None):
+def parse(source, path, language, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
     from .ast_grep_jvm_checks import compares_itself
     from .ast_grep_jvm_flow import Flow, merge
 
-    syntax = Syntax.parse(source, language)
-    file = File(syntax)
+    syntax = parse_syntax(source, language)
+    resolved = path.resolve()
+    file = File(syntax, resolved, project_root(resolved, scan_root, MODULE_MARKERS))
     notes = list(comments(syntax))
     line_comments = {comment.line: comment.text for comment in notes}
     tests = []
+    shared_controls = set()
+    absences = []
     for test, body, ignored, expected_exception in file.inventory():
         tests.append(test)
         if inventory:
@@ -388,7 +675,12 @@ def parse(source, path, language, *, inventory=False, observe=None):
             continue
         flow = Flow(file)
         exits = flow.visit(body_of(body) if body.kind() in LAMBDAS else body)
-        evidence = merge(exits.values())
+        passing_exits = [evidence for reason, evidence in exits.items()
+                         if reason not in {"throw", "assertion-failure"}]
+        evidence = merge(passing_exits or exits.values())
+        for channel, recorder in evidence.witnesses:
+            if recorder.shared is not None:
+                shared_controls.add((channel, recorder.shared))
         checks = list(flow.checks.values())
         fragments = (((*location(check.node), *origin[1:]), check.fragment_subject)
                      for (_, origin), check in flow.checks.items() if check.fragment_subject is not None)
@@ -397,17 +689,37 @@ def parse(source, path, language, *, inventory=False, observe=None):
                  if subject is not None)
         lint.micro_snapshot(test, fragments, whole, key=shape, display=text)
         test.checks = len(checks) + int(expected_exception)
-        if not test.checks:
+        if not test.checks and not flow.opaque_check:
             test.issues.append((test.line, "no-assert"))
         test.guarded = bool(checks) and not (evidence.checked or expected_exception)
+        if test.guarded and flow.loop_checks.keys() == flow.checks.keys():
+            source = next(iter(flow.loop_checks.values()))
+            expression = " ".join(source.text().split())
+            if test.issue_messages is None:
+                test.issue_messages = {}
+            test.issue_messages[test.line, "guarded-assert"] = (
+                f"The checks can all be skipped when the loop over `{expression}` runs zero times.")
         for check in checks:
             site = line(check.node)
             if check.constant(syntax):
                 test.issues.append((site, "const-truth"))
             if compares_itself(syntax, check, test.name, line_comments, checks):
                 test.issues.append((site, "self-compare"))
-            if any(not present and recorder not in evidence.witnesses for recorder, present in check.observations):
+            for key, present in check.observations:
+                if not present and key not in evidence.witnesses:
+                    channel, recorder = key
+                    absences.append((test, site, channel, recorder))
+    if collection_controls is not None:
+        for channel, shared in shared_controls:
+            collection_controls.record(path, file.module, ("jvm", channel, shared))
+    for test, site, channel, recorder in absences:
+        if recorder.shared is None:
+            test.issues.append((site, "absence-no-control"))
+        elif (channel, recorder.shared) not in shared_controls:
+            if collection_controls is None:
                 test.issues.append((site, "absence-no-control"))
+            else:
+                collection_controls.record(path, file.module, ("jvm", channel, recorder.shared), test, site)
     if observe is not None:
         observe(path, tests, syntax_errors(syntax.root, missing=True), [])
     return tests, notes

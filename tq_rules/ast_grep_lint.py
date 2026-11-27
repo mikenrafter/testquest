@@ -2090,7 +2090,8 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
     if path.suffix in JVM_LANGUAGES:
         from .ast_grep_jvm import parse as parse_jvm
 
-        return parse_jvm(source, path, JVM_LANGUAGES[path.suffix], inventory=inventory, observe=observe)
+        return parse_jvm(source, path, JVM_LANGUAGES[path.suffix], scan_root=scan_root,
+                         collection_controls=collection_controls, inventory=inventory, observe=observe)
     file = File(source, "rust" if path.suffix == ".rs" else "python", path, scan_root)
     if file.syntax.language == "python" and (errors := syntax_errors(file.syntax.root)):
         if observe is not None:

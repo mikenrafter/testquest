@@ -12,9 +12,11 @@ class AstGrepJvm(TqCase):
     def fixture(self, language, name):
         return self.copy(FIXTURES / language / name)
 
+    def findings(self, *paths):
+        return json.loads(self.tq("lint", "--engine", "ast-grep", "--json", *paths, code=(0, 1)))["findings"]
+
     def locations(self, *paths):
-        return [(row["line"], row["rule"]) for row in json.loads(
-            self.tq("lint", "--engine", "ast-grep", "--json", *paths, code=(0, 1)))["findings"]]
+        return [(row["line"], row["rule"]) for row in self.findings(*paths)]
 
     def test_kotlin_discovery_and_evidence(self):
         # WHY: registrations, annotated functions and inner assertions have distinct owners.
@@ -98,3 +100,63 @@ class AstGrepJvm(TqCase):
         self.commit("baseline")
         path.write_text(source.replace("      assertTrue(ready());\n", ""))
         self.assertEqual(self.locations("--since", "HEAD"), [(3, "no-assert")])
+
+    def test_wrappers_follow_invoked_callback_bindings(self):
+        # WHY: PersonaRotationLockTest.kt:182 and PersonaSeedLoggingTest.kt:32 run checks through a wrapper.
+        # catches: counting an unresolved or retained lambda, or missing an invoked lambda across files
+        wrappers = self.fixture("jvm", "Wrappers.kt")
+        self.fixture("jvm", "Round2Support.kt")
+        self.assertEqual(self.locations(wrappers.name), [(26, "no-assert")])
+
+    def test_fixed_inputs_execute_the_loop_body(self):
+        # WHY: ActionTypeLabelTest.kt:44, MarkovQueryGeneratorSafetyTest.kt:100,
+        # PersonaNamesTest.kt:38 and CircadianRateModulatorTest.kt:69 iterate over fixed fixtures.
+        # SelfReportLayerTest.kt:25 can still pass when its product loop is empty.
+        # catches: treating fixed inputs and a potentially empty result as interchangeable
+        path = self.fixture("jvm", "FixedInputs.kt")
+        rows = self.findings(path.name)
+        self.assertEqual([(row["line"], row["rule"]) for row in rows], [(18, "guarded-assert")])
+        self.assertIn("`weights().values`", rows[0]["message"])
+
+    def test_failure_helpers_and_polls_check_completion(self):
+        # WHY: ConnectionFlowTest.kt:243, RoundLimitTest.kt:66 and PersonaSeedParserTest.kt:120
+        # check after failure handling. OnboardingScreenTest.kt:134, CustomPoolRepositoryTest.kt:103
+        # and TargetingViewModelSeedLedgerTest.kt:60 fail when their condition fails to arrive.
+        # catches: letting a try/catch bypass later checks, or overlooking a poll that fails on timeout
+        path = self.fixture("jvm", "Completion.kt")
+        self.assertEqual(self.locations(path.name), [])
+
+    def test_kotlin_sibling_controls_match_actual_recorders(self):
+        # WHY: BridgeSupervisionTest.kt:111, PoisonEngineLoopTest.kt:940 and PersonaEgressToggleTest.kt:131
+        # have positive siblings. CustomPoolRepositoryTest.kt:76 and TrackerHostsTest.kt:83 check results.
+        # catches: ignoring a same-recorder sibling, accepting a different field, or treating a result as a recorder
+        path = self.fixture("jvm", "RecorderControls.kt")
+        self.assertEqual(self.locations(path.name), [(18, "absence-no-control"), (28, "absence-no-control")])
+
+    def test_java_sibling_verification_matches_the_mock(self):
+        # WHY: PlaybackManagerMediaSessionTrimTest.java:82 has a positive verification on the same mock.
+        # catches: treating any positive verification as evidence for every mock in the class
+        path = self.fixture("jvm", "RecorderControlsJava.java")
+        self.assertEqual(self.locations(path.name), [(7, "absence-no-control")])
+
+    def test_expression_body_stops_before_next_registration(self):
+        # WHY: Changing the registration after TrackerBlockMonitorTest.kt:222 must select only its own test.
+        # catches: selecting a preceding expression-bodied test when changing only its sibling
+        path = self.fixture("jvm", "Spans.kt")
+        self.git("init", "-q")
+        self.commit("baseline")
+        path.write_text(path.read_text().replace("        work()", "        moreWork()"))
+        self.assertEqual(self.locations("--since", "HEAD"), [(11, "no-assert")])
+
+    def test_object_delegation_does_not_swallow_a_test(self):
+        # WHY: LocationResetPathsTest.kt:138 has a delegate before try/use and another test.
+        # catches: treating the object's class body as a trailing callback to the delegate
+        path = self.fixture("jvm", "DelegatedSpans.kt")
+        self.assertEqual(self.locations(path.name), [(16, "no-assert")])
+
+    def test_controls_share_the_resolved_support_field_across_files(self):
+        # WHY: PersonaEgressToggleTest.kt:131 uses a rig whose payload recorder is checked elsewhere.
+        # catches: requiring identical local receiver names or using a control for a different rig field
+        paths = [self.copy(FIXTURES / "jvm" / name, f"src/test/kotlin/example/{name}")
+                 for name in ("RigSibling.kt", "RigSupport.kt")]
+        self.assertEqual(self.locations(*paths), [(8, "absence-no-control")])
