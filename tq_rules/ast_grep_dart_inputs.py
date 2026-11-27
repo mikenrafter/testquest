@@ -111,7 +111,7 @@ def fixed_field_size(file, binding, field, seen):
     return min(minimum_size(source_file, field_argument(source_file, item, field), seen) for item in items)
 
 
-def minimum_size(file, nodes, seen=frozenset()):
+def minimum_size(file, nodes, seen=frozenset(), values=None):
     """Return zero when the AST cannot prove a positive minimum cardinality."""
     nodes = unwrap(nodes)
     if not nodes:
@@ -121,9 +121,23 @@ def minimum_size(file, nodes, seen=frozenset()):
         return 0
     seen |= {key}
 
-    values = enum_values(file, nodes)
-    if values:
-        return len(values)
+    values_map = values
+    if values_map and len(nodes) == 1 and (path := names(nodes)) and len(path) == 1:
+        binding = file.binding(nodes)
+        if binding is not None and (file, offset(binding.node)) in values_map:
+            caller_file, raw_arg = values_map[file, offset(binding.node)]
+            return minimum_size(caller_file, raw_arg, seen, values_map)
+
+    if kind(nodes) == "string_literal":
+        if any(child.kind() == "template_substitution" for child in contents(nodes[0])):
+            return 0
+        raw = nodes[0].text()
+        stripped = raw.removeprefix("r").strip("'\"")
+        return 1 if stripped else 0
+
+    enum_vals = enum_values(file, nodes)
+    if enum_vals:
+        return len(enum_vals)
     if kind(nodes) in COLLECTIONS:
         minimum = collection_size(nodes)
         for entry in collection_entries(nodes[0]):
@@ -131,13 +145,31 @@ def minimum_size(file, nodes, seen=frozenset()):
                 element = entry[0]
                 body = named(between(tokens(element), ")"))
                 if body and body[0].kind() not in {"spread_element", "if_element", "for_element"}:
-                    minimum += minimum_size(file, named(between(tokens(element), "in", ")")), seen)
+                    minimum += minimum_size(file, named(between(tokens(element), "in", ")")), seen, values_map)
         return minimum
+    # Support Permutations(k, items)() / Combinations(k, items)() from package:trotter or helper.
+    if len(nodes) >= 2 and kind(nodes[-1:]) == "selector":
+        args_node = next(iter(query(nodes[-1], "arguments")), None)
+        if args_node is not None and not named(contents(args_node)):
+            base = unwrap(nodes[:-1])
+            base_call = final_call(base)
+            if base_call and base_call.method in {"Permutations", "Combinations"} and len(base_call.args) >= 2:
+                k = file.fixed_number(base_call.args[0])
+                n = minimum_size(file, base_call.args[1], seen, values_map)
+                if type(k) is int and k >= 0 and n >= k:
+                    return 1
+            if len(base) == 1 and (b := file.binding(base)) is not None:
+                init_call = final_call(b.initializer)
+                if init_call and init_call.method in {"Permutations", "Combinations"} and len(init_call.args) >= 2:
+                    k = file.fixed_number(init_call.args[0])
+                    n = minimum_size(file, init_call.args[1], seen, values_map)
+                    if type(k) is int and k >= 0 and n >= k:
+                        return 1
     path = names(nodes)
     if member(nodes[-1]) in {"entries", "values", "keys"}:
-        return minimum_size(file, nodes[:-1], seen)
+        return minimum_size(file, nodes[:-1], seen, values_map)
     if source := initial_collection(file, nodes):
-        return minimum_size(*source, seen)
+        return minimum_size(*source, seen, values_map)
     if len(path) == 2 and (binding := file.binding(nodes)) and binding.iterable:
         return fixed_field_size(file, binding, path[-1], seen)
     if (call := final_call(nodes)) and call.name in {

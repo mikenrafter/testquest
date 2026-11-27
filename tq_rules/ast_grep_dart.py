@@ -17,7 +17,7 @@ from .source import Test
 
 FRAMEWORKS = {"package:test/test.dart", "package:flutter_test/flutter_test.dart",
               "package:test_core/test_core.dart"}
-MOCKITO = {"verify", "verifyInOrder", "verifyNoMoreInteractions", "verifyZeroInteractions"}
+MOCKITO = {"verify", "verifyInOrder", "verifyNoMoreInteractions", "verifyZeroInteractions", "verifyNever"}
 REGISTRATIONS = {"test", "testWidgets", "group"}
 ASYNC_EXPECTATIONS = {"expectAsync", *(f"expectAsync{arity}" for arity in range(7))}
 FUNCTION_BODIES = {"function_expression_body", "function_body"}
@@ -141,33 +141,48 @@ class Callback:
     file: object
     body: object
     supplied: dict
+    supplied_values: dict = None
+
+    def __post_init__(self):
+        if self.supplied_values is None:
+            object.__setattr__(self, "supplied_values", {})
 
     @property
     def key(self):
         return self.file, offset(self.body)
 
-    def bind(self, arguments, keywords):
+    def bind(self, arguments, keywords, *, raw_args=(), raw_keywords=None, caller_file=None):
         owner = self.body.parent() if self.body.kind() == "function_expression_body" else self.body.prev()
         if owner is not None and owner.kind() == "method_signature":
             owner = next(iter(contents(owner)), None)
         parameters = next((node for node in contents(owner) if node.kind() == "formal_parameter_list"), None)
         supplied = dict(self.supplied)
+        supplied_values = dict(self.supplied_values)
+        raw_keywords = raw_keywords or {}
         positional = iter(arguments)
+        raw_positional = iter(raw_args)
         for parameter in contents(parameters):
             if parameter.kind() == "formal_parameter":
                 target = parameter_name(parameter)
                 argument = next(positional, None)
-                if target is not None and argument is not None:
-                    supplied[offset(target)] = argument
+                raw_argument = next(raw_positional, None)
+                if target is not None:
+                    if argument is not None:
+                        supplied[offset(target)] = argument
+                    if raw_argument is not None and caller_file is not None:
+                        supplied_values[self.file, offset(target)] = (caller_file, raw_argument)
             elif parameter.kind() == "optional_formal_parameters":
                 named_parameters = any(child.kind() == "{" for child in tokens(parameter))
                 for formal in contents(parameter):
                     if formal.kind() != "formal_parameter" or (target := parameter_name(formal)) is None:
                         continue
                     argument = keywords.get(target.text()) if named_parameters else next(positional, None)
+                    raw_argument = raw_keywords.get(target.text()) if named_parameters else next(raw_positional, None)
                     if argument is not None:
                         supplied[offset(target)] = argument
-        return Callback(self.file, self.body, supplied)
+                    if raw_argument is not None and caller_file is not None:
+                        supplied_values[self.file, offset(target)] = (caller_file, raw_argument)
+        return Callback(self.file, self.body, supplied, supplied_values)
 
 
 def parameter_name(parameter):
@@ -199,9 +214,11 @@ class File:
         self.exports = tuple(imports(syntax.root, exports=True))
         self.frameworks = {entry.prefix for entry in self.imports if entry.uri in FRAMEWORKS}
         self.functions = defaultdict(list)
+        self.getters = {}
         self.methods = {}
         self.bindings = defaultdict(list)
         self.collection_writes = {}
+        self._unchanged_active = set()
         self.static_constants = {}
         self.constructors = {}
         self.final_fields = defaultdict(set)
@@ -242,6 +259,17 @@ class File:
                     self.methods[identifier(target), name] = body
             else:
                 self.functions[name].append((scope, body))
+        for definition in query(syntax.root, "getter_signature"):
+            if any(token.text() == "set" for token in tokens(definition)):
+                continue
+            name = next((identifier(node) for node in reversed(contents(definition))
+                         if node.kind() == "identifier"), "")
+            if not name:
+                continue
+            holder = definition.parent() if definition.parent().kind() == "method_signature" else definition
+            body = holder.next()
+            if body is not None and body.kind() == "function_body" and self.scope(definition).kind() == "source_file":
+                self.getters[name] = body
         for node in query(syntax.root, "initialized_variable_definition", "initialized_identifier", "static_final_declaration"):
             self.index_variable(node)
         for declaration in query(syntax.root, "pattern_variable_declaration"):
@@ -321,7 +349,8 @@ class File:
         visible = (entry for entry in self.bindings[path[0]] if is_within(site, entry.scope)
                    and (not entry.iterable or offset(site) >= entry.iterable[-1].range().end.index)
                    and (offset(entry.node) < offset(site)
-                        or entry.const and entry.scope.kind() == "source_file"
+                        or (entry.const or entry.final and self.unchanged(entry))
+                        and entry.scope.kind() == "source_file"
                         and (kind(unwrap(entry.initializer)) in COLLECTIONS
                              or type(constant(entry.initializer)) in {int, float})))
         return max(visible, key=lambda entry: (offset(entry.scope), offset(entry.node)), default=None)
@@ -339,17 +368,33 @@ class File:
             return factory.file.callback(returned_expression(factory.body), factory.supplied, active | {factory.key})
         return self.resolve_name(nodes, supplied)
 
-    def resolve_call(self, call, supplied, active=frozenset()):
+    def resolve_call(self, call, supplied, active=frozenset(), supplied_values=None):
         if not call.name:
             return None
-        target = self.resolve_name((call.node, *call.receiver[1:]), supplied, path=call.name)
+        target = self.resolve_name((call.node, *call.receiver[1:]), supplied, path=call.name,
+                                   supplied_values=supplied_values)
+        if target is None:
+            getter = self.resolve_getter(call.name)
+            if getter is not None and getter.key not in active:
+                target = getter.file.callback(returned_expression(getter.body), getter.supplied, active | {getter.key})
         if target is None or target.key in active:
             return None
         arguments = [self.callback(arg, supplied, active | {target.key}) for arg in call.args]
         keywords = {name: self.callback(arg, supplied, active | {target.key}) for name, arg in call.keywords.items()}
-        return target.bind(arguments, keywords)
+        return target.bind(arguments, keywords, raw_args=call.args, raw_keywords=call.keywords, caller_file=self)
 
-    def resolve_name(self, nodes, supplied, *, path=None):
+    def resolve_getter(self, path):
+        if len(path) == 1:
+            if (body := self.getters.get(path[0])) is not None:
+                return Callback(self, body, {})
+        targets = {}
+        for module, parts in self.imported_modules(path):
+            if len(parts) == 1 and (body := module.getters.get(parts[0])) is not None:
+                cb = Callback(module, body, {})
+                targets[cb.key] = cb
+        return next(iter(targets.values())) if len(targets) == 1 else None
+
+    def resolve_name(self, nodes, supplied, *, path=None, supplied_values=None):
         path = path or names(nodes)
         if not path:
             return None
@@ -361,6 +406,9 @@ class File:
                     return supplied[offset(binding.node)]
                 if binding.final and kind(binding.initializer) == "function_expression":
                     return self.callback(binding.initializer, supplied)
+                if supplied_values and (self, offset(binding.node)) in supplied_values:
+                    caller_file, raw_arg = supplied_values[self, offset(binding.node)]
+                    return caller_file.callback(raw_arg, supplied)
                 return None
             visible = [(scope, body) for scope, body in self.functions.get(path[0], ()) if is_within(site, scope)]
             if visible:
@@ -449,10 +497,16 @@ class File:
 
     def unchanged(self, binding):
         site = offset(binding.node)
+        if site in self._unchanged_active:
+            return True
         if site not in self.collection_writes:
-            self.collection_writes[site] = any(self.mutates_collection(use)
-                for use in query(binding.scope, "identifier")
-                if use.text() == binding.node.text() and self.binding((use,)) == binding)
+            self._unchanged_active.add(site)
+            try:
+                self.collection_writes[site] = any(self.mutates_collection(use)
+                    for use in query(binding.scope, "identifier")
+                    if use.text() == binding.node.text() and self.binding((use,)) == binding)
+            finally:
+                self._unchanged_active.discard(site)
         return not self.collection_writes[site]
 
     def writes_binding(self, use):
@@ -653,13 +707,28 @@ class File:
             return check
         if method == "fail":
             return Check(call.node)
-        if self.library_name(call.name, "package:mockito/") in MOCKITO:
+        if self.library_name(call.name, "package:mockito/") in MOCKITO or self.library_name(
+                call.name, "package:mocktail/") in MOCKITO:
+            return Check(call.node)
+        if call.method == "validate" and call.receiver is not None and self.from_package(
+                call.receiver, "package:test_descriptor/"):
             return Check(call.node)
         if method in ASYNC_EXPECTATIONS:
             count = self.fixed_number(call.keywords.get("count", ()))
             if "count" not in call.keywords or type(count) is int and count >= 0:
                 return Check(call.node)
         return None
+
+    def from_package(self, nodes, package, seen=frozenset()):
+        nodes = unwrap(nodes)
+        if (call := final_call(nodes)) is not None and call.name:
+            if self.library_name(call.name, package):
+                return True
+        if len(names(nodes)) == 1 and (binding := self.binding(nodes)) is not None:
+            key = offset(binding.node)
+            if key not in seen and binding.final and binding.initializer:
+                return self.from_package(binding.initializer, package, seen | {key})
+        return False
 
     def identity(self, nodes):
         path = names(nodes)
@@ -671,6 +740,21 @@ class File:
             if names(binding.initializer) and source is not None and source.final:
                 return (*self.identity(binding.initializer), *path[1:])
         return offset(binding.node), *path[1:]
+
+    def identity_capture(self, nodes, site_offset):
+        path = names(nodes)
+        binding = self.binding(nodes)
+        if binding is None:
+            return (path or None), site_offset, False, None
+        if binding.final:
+            source = self.binding(binding.initializer)
+            if names(binding.initializer) and source is not None and source.final:
+                indirect = len(names(binding.initializer)) >= 2 or any(calls(binding.initializer))
+                base_id, base_off, base_ind, scope = self.identity_capture(binding.initializer, offset(binding.node))
+                if base_id is not None:
+                    cap_off = offset(binding.node) if indirect and not base_ind else base_off
+                    return (*base_id, *path[1:]), cap_off, (indirect or base_ind), (scope or binding.scope)
+        return (offset(binding.node), *path[1:]), offset(binding.node), False, binding.scope
 
     def recorder_binding(self, nodes):
         nodes = unwrap(nodes)

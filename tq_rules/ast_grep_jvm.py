@@ -324,9 +324,10 @@ class File:
             candidates = []
             if qualified:
                 from .ast_grep_jvm_signatures import family
-                if family(qualified) != "foreign":
+                pkg_owner, _, _ = qualified.rpartition(".")
+                if family(qualified) != "foreign" or family(pkg_owner) != "foreign":
                     return None
-            if call.callbacks():
+            if call.callbacks() or call.method.startswith(("assert", "check", "verify", "test", "expect")):
                 candidates = [(file, fn) for file in self.package_files(package)
                               if file.path != self.path
                               for scope, fn in file.functions.get(method, ())
@@ -359,6 +360,25 @@ class File:
                           and (owner.kind() == "object_declaration"
                                or any(parent.kind() == "companion_object" for parent in fn.ancestors())
                                or file.syntax.language == "java" and has_modifier(fn, "static"))]
+        elif call.receiver is not None and call.receiver.text() == "super":
+            owner = owner_of(node)
+            if owner is None:
+                return None
+            for spec in children(owner):
+                if spec.kind() != "delegation_specifier":
+                    continue
+                target_type = child(child(spec, "constructor_invocation"), "user_type") or child(spec, "user_type")
+                if target_type is None:
+                    continue
+                target = self.type_named(target_type.text().rsplit(".", 1)[-1])
+                if target is None:
+                    continue
+                file, base = target
+                candidates = [(file, fn) for scope, fn in file.functions.get(call.method, ())
+                              if node_key(scope) == node_key(base) and bind_arguments(fn, call) is not None]
+                if len(candidates) == 1:
+                    return candidates[0]
+            return None
         else:
             return None
         return candidates[0] if len(candidates) == 1 else None
@@ -628,6 +648,43 @@ class File:
         _, binding = self.visible_binding(node, identifier)
         return self.initializer(binding, immutable=True)
 
+    def setup_initializer(self, node, identifier):
+        if not identifier:
+            return None
+        scope, binding = self.visible_binding(node, identifier)
+        if binding is None or scope is None or scope.kind() not in CLASSES:
+            return None
+        if self.initializer(binding) is not None:
+            return None
+        owner = owner_of(node)
+        if owner is None or node_key(scope) != node_key(owner):
+            return None
+        kotlin = self.syntax.language == "kotlin"
+        assign_kind = "assignment" if kotlin else "assignment_expression"
+        fn_kind = "function_declaration" if kotlin else "method_declaration"
+        found = None
+        for entry in query(owner, fn_kind):
+            if not any(ann in {"Before", "BeforeEach", "BeforeTest"} for ann, _ in self.annotations(entry)):
+                continue
+            body = body_of(entry)
+            if body is None:
+                continue
+            for assign in query(body, assign_kind):
+                left = assign.field("left") or next(iter(children(assign)), None)
+                right = assign.field("right") or next(reversed(children(assign)), None)
+                lhs = name(child(left, *IDENTIFIERS) or unwrap(left)) or (
+                    name(member(left)[1]) if member(left)[0] and member(left)[0].text() == "this" else "")
+                if lhs != identifier or right is None:
+                    continue
+                if any(anc.kind() in {"if_statement", "if_expression", "for_statement", "enhanced_for_statement",
+                                      "while_statement", "try_statement", "try_expression"} | LAMBDAS
+                       for anc in assign.ancestors()):
+                    return None
+                if found is not None:
+                    return None
+                found = right
+        return found
+
     def local_array(self, node):
         if self.syntax.language != "java" or not (identifier := name(node)):
             return None
@@ -871,6 +928,41 @@ def no_crash_test(file, test, body, checks, notes, missing, checked):
     return False
 
 
+def class_validation_check(file, body, test_name):
+    """Detect @Rule failure-validation fields or @ExtendWith callback-asserting extensions."""
+    owner = owner_of(body)
+    if owner is None:
+        return False
+    kotlin = file.syntax.language == "kotlin"
+    prop_kind = "property_declaration" if kotlin else "field_declaration"
+    for entry in query(owner, prop_kind):
+        if any(ann == "Rule" for ann, _ in file.annotations(entry)):
+            txt = entry.text()
+            if f'"{test_name}"' in txt or any(tok in txt for tok in ("Validation", "Verifier", "ExpectedException")):
+                return True
+    owners = [owner]
+    if kotlin and has_modifier(owner, "abstract"):
+        subs = [cls for cls in query(file.syntax.root, "class_declaration")
+                if cls is not owner and any(
+                    spec.kind() == "delegation_specifier"
+                    and declaration_name(owner) in spec.text().split("<", 1)[0].split("(", 1)[0]
+                    for spec in children(cls))]
+        if subs:
+            owners.extend(subs)
+    id_kinds = ("simple_identifier", "type_identifier") if kotlin else ("identifier", "type_identifier")
+    for target in owners:
+        for ann, node in file.annotations(target):
+            if ann == "ExtendWith":
+                for ref in query(node, *id_kinds):
+                    resolved = file.type_named(name(ref))
+                    if resolved is not None and any(
+                            c.method.startswith(("assert", "verify")) or c.method == "fail"
+                            for call_node in query(resolved[1], "call_expression" if kotlin else "method_invocation")
+                            if (c := call_of(call_node)) is not None):
+                        return True
+    return False
+
+
 def parse(source, path, language, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
     from .ast_grep_catches import swallowed_assertions
     from .ast_grep_jvm_checks import compares_itself
@@ -917,7 +1009,8 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
         test.issues.extend((site, "misordered-expected") for site in misordered_expected(file, body, checks))
         micro_snapshot(file, test, flow.checks)
         test.checks = len(checks) + int(expected_exception)
-        missing = not test.checks and not flow.opaque_check
+        opaque = flow.opaque_check or class_validation_check(file, body, test.name)
+        missing = not test.checks and not opaque
         if not expected_exception:
             lint.record_completion(test, missing, no_crash_test(file, test, body, checks, notes, missing, evidence.checked))
         test.guarded = bool(checks) and not (evidence.checked or expected_exception)
@@ -931,10 +1024,17 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
                 f"The checks can all be skipped when filtering the result in `{expression}` leaves no items."
                 if filtered else
                 f"The checks can all be skipped when the loop over `{expression}` runs zero times.")
+        has_real_check = any(
+            not check.constant(syntax) and not compares_itself(syntax, check, test.name, line_comments, checks)
+            for check in checks)
         for check in checks:
             site = line(check.node)
             lib_under_test = bool(check.owner and defines_assertion_api(file, check.owner))
-            if not lib_under_test and check.constant(syntax):
+            raw_const = (check.predicate is not None and not check.negated and check.operator == ""
+                         and not check.message and unwrap(check.predicate) is not None
+                         and unwrap(check.predicate).text() == "true")
+            tail_guard = syntax.language == "kotlin" and has_real_check and raw_const
+            if not lib_under_test and not tail_guard and check.constant(syntax):
                 test.issues.append((site, "const-truth"))
             if not lib_under_test and compares_itself(syntax, check, test.name, line_comments, checks):
                 test.issues.append((site, "self-compare"))
@@ -965,7 +1065,7 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
                               if channel == "size" and recorder.shared is None}
                 if local_recs and _seeded_then_drained(file, body, check.node, local_recs):
                     continue
-                if not related & (witnesses | checked_reads):
+                if not flow.throwing_fake_check and not related & (witnesses | checked_reads):
                     absences.append((index, test, site, shared_keys(related)))
 
     pending = []

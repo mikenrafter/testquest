@@ -24,6 +24,7 @@ FLUENT_ROOTS = {
     "assertThatNullPointerException", "assertThatIllegalArgumentException",
     "assertThatIllegalStateException", "assertThatIOException", "assertThatNoException",
     "assertThatRuntimeException", "assertThatIndexOutOfBoundsException", "assertThatObject",
+    "assertFailure",
     "then", "thenThrownBy", "thenCode", "thenExceptionOfType", "thenNoException",
     "thenNullPointerException", "thenIllegalArgumentException",
     "thenIllegalStateException", "thenIOException", "thenRuntimeException",
@@ -35,7 +36,7 @@ FLUENT_TRANSFORMS = {"extracting", "flatExtracting", "filteredOn", "map", "flatM
                      "element", "get", "actual", "asInstanceOf", "asList", "asString", "asBoolean",
                      "asByte", "asShort", "asInt", "asLong", "asFloat", "asDouble", "asByteArray",
                      "singleElement", "size", "length", "bytes", "hasMessageThat", "hasCauseThat",
-                     "cause", "message"}
+                     "cause", "message", "prop", "transform"}
 FLUENT_TERMINALS = ("is", "has", "have", "contains", "doesNot", "startsWith", "endsWith",
                     "matches", "match", "satisfies", "allSatisfy", "anySatisfy", "noneSatisfy", "fails",
                     "succeeded", "was", "starts", "ends", "completes", "lies", "exists",
@@ -57,7 +58,7 @@ SYNCHRONOUS = {"assertAll", "assertSoftly", "assertTimeout", "assertTimeoutPreem
                "assumingThat", "assertDoesNotThrow", "assertNotNull", "assertIs", "assertIsNot",
                "eventually", "continually", "assertEach", "runOnIdle", "runOnUiThread", "runOnMainSync",
                "onActivity", "runComposeUiTest", "runAndroidComposeUiTest", "dynamicTest",
-               "coroutineScope", "supervisorScope", "withContext", "withTimeout"}
+               "coroutineScope", "supervisorScope", "withContext", "withTimeout", "turbineScope"}
 ITERATING = {"forEach", "forEachIndexed", "map", "mapIndexed", "onEach", "all", "any", "none",
              "filter", "filterNot", "repeat"}
 
@@ -285,7 +286,7 @@ def fluent_origin(file, node, *, preserves_size=False):
         owner, method = signature(file, call)
         if method in FLUENT_ROOTS or method.startswith("assertThat") or (
                 method.startswith("then") and method.endswith("Exception")):
-            if owner not in {"", "assertj", "soft-assertj", "truth"} and not (
+            if owner not in {"", "assertj", "soft-assertj", "truth", "assertk"} and not (
                     owner == "foreign" and (method.startswith("assertThat") or method.endswith("Exception"))):
                 return False, None, None, ""
             if method == "then" and (not call.args or call.callbacks()):
@@ -357,10 +358,17 @@ def step_verifier_origin(file, node):
         imp.startswith("reactor.test.") for imp in file.imports.values())
 
 
+def _allowed_foreign(file, call, owner, method):
+    return (owner == "foreign" and call.receiver is None
+            and (call.method in file.imports or file.syntax.language == "kotlin")
+            and (method in JUNIT_BOOLEANS | JUNIT_EQUAL | JUNIT_UNEQUAL | JUNIT_IDENTITY | {"assertNotNull"}
+                 or method.startswith(("assert", "expect", "verify"))))
+
+
 def check_call(file, node, call):
     owner, method = signature(file, call)
     first = call.args[0] if call.args else None
-    if owner and not accepts(owner, method) and call.receiver is None:
+    if owner and not _allowed_foreign(file, call, owner, method) and not accepts(owner, method) and call.receiver is None:
         return None
     if method in {"assertAll", "assertSoftly"}:
         return None
@@ -386,8 +394,10 @@ def check_call(file, node, call):
                 check.disabled = frozenset(disabled_verifications(file, call))
             return check
         return None
-    if method in {"assertGolden", "assertSnapshot", "assertMatchesGolden", "assertMatchesSnapshot",
-                  "verifySnapshot"} and first is not None:
+    if (method in {"assertGolden", "assertSnapshot", "assertMatchesGolden", "assertMatchesSnapshot",
+                   "verifySnapshot"} and first is not None
+            or method == "snapshot" and (first is not None or call.callbacks())
+            and ("Paparazzi" in file.imports or "paparazzi" in name(call.receiver).lower())):
         return Check(node, snapshot_subject=call.named.get("actual", first), owner=owner)
     if method in NO_INTERACTIONS and owner in {"", "mockk", "mockito"}:
         from .ast_grep_jvm_controls import verified_call
@@ -412,6 +422,8 @@ def check_call(file, node, call):
             if step_verifier_origin(file, call.receiver):
                 return Check(node, owner="stepverifier")
         found, subject, buffered, root_owner = fluent_origin(file, call.receiver)
+        if found and method in {"all", "given"} and call.callbacks() and root_owner in {"", "assertk"}:
+            return Check(node, owner=root_owner or "assertk")
         if found and method not in FLUENT_OPTIONS | FLUENT_TRANSFORMS and method.startswith(FLUENT_TERMINALS):
             check = (predicate(node, subject, method in {"isFalse", "shouldBeFalse"})
                      if method in BOOLEANS else equality(node, method, subject, first))
@@ -435,7 +447,7 @@ def check_call(file, node, call):
         check = equality(node, method, call.receiver, first)
         check.owner = owner or "kotest"
         return collect_observations(file, check, method, call.receiver, first)
-    if owner and not accepts(owner, method):
+    if owner and not _allowed_foreign(file, call, owner, method) and not accepts(owner, method):
         return None
     if method in JUNIT_BOOLEANS:
         operands = junit_args(file, call, owner, method)
@@ -459,7 +471,12 @@ def check_call(file, node, call):
     if method == "assertNotNull":
         operands = junit_args(file, call, owner, method)
         return collect_observations(file, Check(node, owner=owner), method, operands[0] if operands else None)
-    if lint.assertion(method) or method == "fail" or file.imports.get(call.method) and lint.helper(method):
+    if (lint.assertion(method) or method == "fail"
+            or file.imports.get(call.method) and lint.helper(method)
+            or file.syntax.language == "kotlin" and owner in {"", "foreign"} and call.receiver is None
+            and (method == "expectUnreached"
+                 or method in {"expect", "finish"} and len(call.args) == 1
+                 and type(literal(file.syntax, call.args[0])) is int)):
         return Check(node, owner=owner)
     return None
 

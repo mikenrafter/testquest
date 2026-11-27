@@ -233,8 +233,10 @@ class Absence:
                 negatives.append((key, line(check.node)))
 
         checked = checked_result_slots(self.file, flow) if negatives else set()
+        cb_witnessed = {key for group in flow.unconditional_cb_writes if group & witnesses for key in group}
         for key, site in negatives:
-            if key in witnesses or checked and covers_success_paths(self.file, key, writes[key], checked, flow.callback):
+            if (key in witnesses or key in cb_witnessed
+                    or checked and covers_success_paths(self.file, key, writes[key], checked, flow.callback)):
                 continue
             sinks = {sink for _, sink in writes[key] if sink is not None}
             detectors = [collector_dependencies(self.file, write) for write, sink in writes[key] if sink is None]

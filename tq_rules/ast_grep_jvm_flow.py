@@ -154,9 +154,16 @@ def failure_statement(node):
         node = children(node)[0]
     call = call_of(node)
     return (call is not None and (
-                call.method in {"fail", "failBecauseExceptionWasNotThrown", "failWithMessage"}
+                call.method in {"fail", "failBecauseExceptionWasNotThrown", "failWithMessage", "expectUnreached"}
                 or call.method.startswith(("expectAssertion", "shouldHaveThrown", "shouldHaveFailed")))
             or node.kind() in {"jump_expression", "throw_statement"} and throws_assertion_error(node))
+
+
+def _is_param_call(step, param_names):
+    call = call_of(step)
+    if call is None:
+        return False
+    return call.method in param_names or call.receiver is not None and call.method == "invoke" and name(call.receiver) in param_names
 
 
 def expects_failure(declaration):
@@ -171,11 +178,13 @@ def expects_failure(declaration):
     steps = children(block) if block is not None else []
     if len(steps) < 2 or not any(failure_statement(step) for step in steps[1:]):
         return False
-    call = call_of(steps[0])
     parameters = child(declaration, "function_value_parameters")
-    return call is not None and parameters is not None and any(
-        name(call.callee) == name(child(parameter, "simple_identifier"))
-        and child(parameter, "function_type") is not None for parameter in children(parameters))
+    if parameters is None:
+        return False
+    param_names = {name(child(parameter, "simple_identifier"))
+                   for parameter in children(parameters)
+                   if child(parameter, "function_type") is not None}
+    return bool(param_names) and any(_is_param_call(step, param_names) for step in steps[:-1])
 
 
 def loop_steps(loop):
@@ -231,6 +240,7 @@ class Flow:
         self.invocation = None
         self.bound = {}
         self.opaque_check = False
+        self.throwing_fake_check = False
         self.loop_checks = {}
         self.last_branch_positive = None
 
@@ -264,6 +274,16 @@ class Flow:
         if node is None:
             return NORMAL
         kind = node.kind()
+        if kind == "class_body" and node.parent() is not None and node.parent().kind() in {
+                "object_literal", "object_creation_expression"}:
+            call_kind = "call_expression" if self.file.syntax.language == "kotlin" else "method_invocation"
+            throw_kind = "jump_expression" if self.file.syntax.language == "kotlin" else "throw_statement"
+            if any(failure_statement(entry) for entry in query(node, throw_kind, call_kind)):
+                self.opaque_check = True
+                self.throwing_fake_check = True
+            elif self.has_callback_check(node, call_kind):
+                self.opaque_check = True
+            return NORMAL
         if kind in FUNCTIONS | CLASSES | LAMBDAS | {"modifiers", "class_body"}:
             return NORMAL
         if kind in CALLS:
@@ -315,7 +335,7 @@ class Flow:
         if "next" not in arguments:
             return followed_by(receiver, arguments)
         method = self.file.resolve_name(call.method)
-        callbacks = call.callbacks()
+        callbacks = self.bound_callbacks(call)
         bound = self.bound_argument(call)
         if bound is not None and bound[1].kind() in LAMBDAS:
             executed = self.invoke_callback(*bound)
@@ -331,7 +351,7 @@ class Flow:
                     self.buffered_checks[check.soft_receiver].append(check)
             mode = aggregate(self.file, call) if method in {"assertAll", "assertSoftly"} else ""
             if mode:
-                run = executable_callbacks(self.file, call.args) if mode == "executables" else callbacks
+                run = executable_callbacks(self.file, call.args) if mode == "executables" else call.callbacks()
                 executed = self.aggregate_callbacks(run, mode)
             elif method == "assertAll" and not call.args and signature(self.file, call)[0] == "soft-assertj":
                 executed = self.flush_soft_checks(node, call.receiver)
@@ -340,6 +360,8 @@ class Flow:
                 executed = followed_by(executed, callback_flow)
             if method == "fail" and check is not None:
                 executed = followed_by(executed, {"assertion-failure": Evidence()})
+            elif self.file.syntax.language == "kotlin" and call.receiver is None and method == "error" and check is None:
+                executed = followed_by(executed, {"throw": Evidence()})
         executed = followed_by(arguments, executed)
         if has_safe_navigation(call.callee):
             executed = alternatives(NORMAL, executed)
@@ -381,10 +403,29 @@ class Flow:
                 executed = followed_by(executed, exits)
         return executed
 
+    def bound_callbacks(self, call):
+        items = []
+        for arg in call.args:
+            unwrapped = unwrap(arg)
+            if unwrapped is not None and unwrapped.kind() in LAMBDAS:
+                items.append((self.file, unwrapped))
+            elif unwrapped is not None and (bound := self.argument_binding(self.file, unwrapped)) is not None:
+                if not isinstance(bound[1], tuple) and bound[1].kind() in LAMBDAS:
+                    items.append((bound[0], bound[1]))
+        return items
+
     def bound_argument(self, call):
         target = call.callee if call.receiver is None else (
             call.receiver if call.method in {"invoke", "run", "call", "accept", "apply", "get", "test"} else None)
-        return self.argument_binding(self.file, target)
+        if target is not None:
+            return self.argument_binding(self.file, target)
+        if self.file.syntax.language == "kotlin" and call.callee is not None and call.receiver is not None and call.method:
+            _, binding = self.file.visible_binding(call.callee, call.method)
+            if binding is not None:
+                bound = self.bound.get((self.file.path, node_key(binding)))
+                if bound is not None and not isinstance(bound[1], tuple) and bound[1].kind() in LAMBDAS:
+                    return bound
+        return None
 
     def argument_binding(self, file, node):
         _, binding = file.visible_binding(node, name(node))
@@ -429,29 +470,30 @@ class Flow:
             self.file, self.invocation = caller, previous
 
     def callbacks(self, node, call, method, check):
-        callbacks = call.callbacks()
+        callbacks = self.bound_callbacks(call)
         if method.startswith(("assertThrows", "assertFails", "shouldThrow")) or method in {
                 "assertThatThrownBy", "assertThatCode", "thenThrownBy", "thenCode", "isThrownBy"}:
             return NORMAL
         if method.startswith(("verify", "coVerify")):
             return NORMAL
         if method == "waitUntil" and call.receiver is not None and len(callbacks) == 1:
-            body = body_of(callbacks[0])
+            body = body_of(callbacks[0][1])
             condition = children(body)[-1] if body is not None and children(body) else None
             return self.record(collect_observations(self.file, predicate(node, condition, False)))
-        synchronous = (method in SYNCHRONOUS or check is not None and (check.no_throw or method == "satisfies")
+        synchronous = (method in SYNCHRONOUS or check is not None and (
+            check.no_throw or method == "satisfies" or check.owner == "assertk" and method in {"all", "given"})
                        or method in {"consumeNextWith", "assertNext"} and self.file.syntax.language == "java")
         if not synchronous and method not in ITERATING | {"launch", "async", "allSatisfy", "anySatisfy",
                                                            "noneSatisfy"}:
             self.opaque_check |= node.parent().kind() == "function_body" or any(
-                self.has_callback_check(callback, node.kind()) for callback in callbacks)
+                self.has_callback_check(callback, node.kind()) for _, callback in callbacks)
             return NORMAL
         executed = NORMAL
         previous_checks = set(self.checks)
-        for callback in callbacks:
+        for cb_file, callback in callbacks:
             if "next" not in executed:
                 break
-            callback_exits = self.invoke_callback(self.file, callback, self.invocation)
+            callback_exits = self.invoke_callback(cb_file, callback, self.invocation)
             if method == "withTimeout" and timeout_poll(callback):
                 callback_exits = followed_by(self.record(Check(node)), callback_exits)
             executed = followed_by(executed, callback_exits)
@@ -463,9 +505,9 @@ class Flow:
         if method in ITERATING:
             if method == "map" and node.parent() is not None and node.parent().kind() == "return_statement" and any(
                     (inner := call_of(entry)) is not None and inner.method == "dynamicTest"
-                    for callback in callbacks for entry in query(callback, "method_invocation")):
+                    for _, callback in callbacks for entry in query(callback, "method_invocation")):
                 return executed
-            iterable = (self.known_literal(call.args[0]) if method == "repeat" and call.args
+            iterable = (self.minimum_positive_int(call.args[0]) if method == "repeat" and call.args
                         else self.iterable_size(self.loop_receiver(call.receiver)))
             source = self.loop_receiver(call.receiver)
             split_call = call_of(source)
@@ -515,6 +557,58 @@ class Flow:
                     continue
                 self.loop_checks.setdefault(key, source)
 
+    def minimum_positive_int(self, node, file=None, bindings=None, active=frozenset()):
+        file = file or self.file
+        node = unwrap(node)
+        if node is not None and node.kind() == "control_structure_body" and len(children(node)) == 1:
+            node = unwrap(children(node)[0])
+        if node is None:
+            return None
+        key = ("int", file.path, node_key(node))
+        if key in active:
+            return None
+        active = active | {key}
+        known = self.known_literal(node, file, bindings, active)
+        if type(known) is int:
+            return known
+        if (identifier := name(node)):
+            scope, binding = file.visible_binding(node, identifier)
+            target_file = file
+            if binding is None and file.syntax.language == "kotlin":
+                pkg = file.package
+                if (qualified := file.imports.get(identifier)) is not None:
+                    pkg = qualified.rpartition(".")[0]
+                for peer in file.package_files(pkg):
+                    for sc, entry in peer.bindings.get(identifier, ()):
+                        if node_key(sc) == node_key(peer.syntax.root):
+                            target_file, binding = peer, entry
+                            break
+                    if binding is not None:
+                        break
+            if binding is not None:
+                init = target_file.initializer(binding, immutable=True)
+                if init is not None:
+                    return self.minimum_positive_int(init, target_file, bindings, active)
+        if node.kind() == "if_expression":
+            elements = children(node)
+            if len(elements) == 3:
+                pos = self.minimum_positive_int(elements[1], file, bindings, active)
+                neg = self.minimum_positive_int(elements[2], file, bindings, active)
+                if type(pos) is int and type(neg) is int:
+                    return min(pos, neg)
+        if node.kind() in {"multiplicative_expression", "additive_expression"}:
+            elements = [c for c in node.children() if c.kind() not in {"comment", "line_comment", "multiline_comment"}]
+            if len(elements) == 3:
+                op = elements[1].text()
+                left = self.minimum_positive_int(elements[0], file, bindings, active)
+                right = self.minimum_positive_int(elements[2], file, bindings, active)
+                if type(left) is int and type(right) is int:
+                    if op == "*" and left >= 0 and right >= 0:
+                        return left * right
+                    if op == "+" and left >= 0 and right >= 0:
+                        return left + right
+        return None
+
     def known_literal(self, node, file=None, bindings=None, active=frozenset()):
         file = file or self.file
         node = unwrap(node)
@@ -543,6 +637,8 @@ class Flow:
     def iterable_size(self, node, file=None, bindings=None, active=frozenset()):
         file = file or self.file
         node = unwrap(node)
+        if node is not None and node.kind() == "control_structure_body" and len(children(node)) == 1:
+            node = unwrap(children(node)[0])
         if node is None:
             return None
         key = file.path, node_key(node)
@@ -556,7 +652,7 @@ class Flow:
             return self.iterable_size(value, defining_file, bindings, active)
         if self.sizes and (source := sized_source(file, node)) in self.sizes:
             return self.sizes[source]
-        value = file.immutable_value(node) or file.local_array(node)
+        value = file.immutable_value(node) or file.local_array(node) or file.setup_initializer(node, name(node))
         if value is None and file.syntax.language == "java" and (ident := name(node)):
             value = file.stable_initializer(node, *file.visible_binding(node, ident))
             if value is not None and value.kind() == "object_creation_expression":
@@ -748,7 +844,10 @@ class Flow:
             branches.append(self.visit(negative))
         combined = followed_by(evaluated, alternatives(*branches))
         if (negative is None and known is lint.UNKNOWN and pos_result is not None
-                and _guarded_equals_check(condition, positive, pos_result)):
+                and (_guarded_equals_check(condition, positive, pos_result)
+                     or "next" not in pos_result and "assertion-failure" in pos_result and (
+                         failure_statement(positive) or len(children(body_of(positive) or positive)) == 1
+                         and failure_statement(children(body_of(positive) or positive)[0])))):
             if "next" in combined:
                 combined["next"] = replace(combined["next"], checked=True)
             else:
@@ -788,6 +887,13 @@ class Flow:
                 return self.sequence(elements)
             iterable, body = elements[-2:]
             size = self.iterable_size(iterable)
+            filtered = self.enum_filter_steps(node, iterable, body)
+            if filtered is not None and size is not None and size > 1:
+                before = self.visit(iterable)
+                if "next" not in before:
+                    return before
+                executed = finish(self.sequence(filtered), *loop_jumps(node))
+                return followed_by(before, executed)
             return self.iterate(node, self.visit(iterable), body, size is not None and size > 0, iterable)
         if kind == "enhanced_for_statement":
             iterable = node.field("value")
@@ -923,13 +1029,73 @@ class Flow:
             self.buffered_checks[rec] = remaining
         return known
 
+    def enum_filter_steps(self, loop, iterable, body):
+        steps = loop_steps(loop)
+        if not steps or steps[0].kind() != "if_expression":
+            return None
+        parts = children(steps[0])
+        if len(parts) != 2 or len(children(body_of(parts[1]) or parts[1])) != 1:
+            stmt_list = children(parts[1]) if len(parts) == 2 else ()
+            if not stmt_list or stmt_list[0].kind() != "jump_expression" or stmt_list[0].children()[0].kind() != "continue":
+                return None
+        jump_body = body_of(parts[1]) if len(parts) == 2 else None
+        jump_nodes = children(jump_body) if jump_body is not None else children(parts[1]) if len(parts) == 2 else ()
+        if not (len(jump_nodes) == 1 and jump_nodes[0].kind() == "jump_expression" and jump_nodes[0].children()[0].kind() == "continue"):
+            return None
+        var_node = child(loop, "variable_declaration")
+        var_name = name(child(var_node, "simple_identifier")) if var_node is not None else ""
+        cond = unwrap(parts[0])
+        negated = negate(cond)
+        inner = negated or cond
+        recv, prop = member(inner)
+        if not var_name or not prop or name(recv) != var_name:
+            return None
+        it_call = call_of(unwrap(iterable))
+        enum_recv, comp = (it_call.receiver, it_call.method) if it_call is not None else member(unwrap(iterable))
+        if comp not in {"values", "entries"} or not (enum_name := name(enum_recv))[:1].isupper():
+            return None
+        target = self.file.type_named(enum_name)
+        if target is None or (enum_body := child(target[1], "enum_class_body")) is None:
+            return None
+        entries = [e for e in children(enum_body) if e.kind() == "enum_entry"]
+        if len(entries) < 2:
+            return None
+        # Check whether at least one entry lacks the skipped boolean argument or passes the opposite.
+        skip_true = negated is None
+        for entry in entries:
+            txt = entry.text()
+            if skip_true and f"{prop} = true" not in txt:
+                return steps[1:]
+            if not skip_true and f"{prop} = true" in txt:
+                return steps[1:]
+        return None
+
     def expected_failure(self, body, catches):
         steps = children(body) if body is not None else []
         if len(steps) < 2 or not failure_statement(steps[-1]):
             return NORMAL
+        fail_msg = ""
+        fail_call = call_of(steps[-1])
+        if fail_call is not None and fail_call.args:
+            val = literal(self.file.syntax, fail_call.args[0])
+            if isinstance(val, str):
+                fail_msg = val
         for catch in catches:
             caught = child(catch, "user_type") or child(child(catch, "catch_formal_parameter"), "catch_type")
-            if caught is None or any(entry.text().rsplit(".", 1)[-1] in {"Error", "Throwable", "AssertionError"}
-                                     for entry in children(caught)):
+            if caught is None:
                 return NORMAL
+            names_caught = [entry.text().rsplit(".", 1)[-1] for entry in children(caught)]
+            if any(n in {"Error", "Throwable"} for n in names_caught):
+                return NORMAL
+            if "AssertionError" in names_caught:
+                catch_body = body_of(catch)
+                call_kind = "call_expression" if self.file.syntax.language == "kotlin" else "method_invocation"
+                if catch_body is None or not any(
+                        (c := call_of(cn)) is not None and c.method in {"contains", "assertContains", "assertEquals"}
+                        for cn in query(catch_body, call_kind)):
+                    return NORMAL
+                if fail_msg and any(
+                        (needle := literal(self.file.syntax, n)) and isinstance(needle, str) and needle in fail_msg
+                        for n in query(catch_body, "string_literal")):
+                    return NORMAL
         return {"next": Evidence(checked=True)}

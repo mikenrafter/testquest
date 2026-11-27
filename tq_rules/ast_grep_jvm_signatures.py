@@ -24,6 +24,7 @@ OWNERS = {
     "org.mockito.Mockito": "mockito", "org.mockito.BDDMockito": "mockito",
     "org.mockito.InOrder": "mockito",
     "io.mockk": "mockk",
+    "assertk": "assertk", "assertk.assertions": "assertk",
     "reactor.test.StepVerifier": "stepverifier",
 }
 ASSERTION_OWNERS = {"junit4", "jupiter", "kotlin"}
@@ -48,6 +49,8 @@ API_SOURCE_MARKERS = {
 
 
 def family(owner):
+    if owner == "assertk" or owner.startswith("assertk."):
+        return "assertk"
     if owner.startswith(("io.kotest.matchers", "io.kotest.assertions")):
         return "kotest"
     if owner in OWNERS:
@@ -109,6 +112,8 @@ def accepts(owner, method):
         return method in {"create", "withVirtualTime"} or method.startswith(("expect", "verify", "consume", "assert"))
     if owner == "kotest":
         return method.startswith(("assert", "should", "fail"))
+    if owner == "assertk":
+        return method.startswith(("assertThat", "assertFailure", "assertSuccess")) or method in {"assertAll", "fail"}
     return False
 
 
