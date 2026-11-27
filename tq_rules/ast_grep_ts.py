@@ -3,6 +3,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 import hashlib
+from pathlib import PurePosixPath
 
 from . import lint
 from .ast_grep import Syntax, children, line, offset, opposite, query, shape, split_operands, syntax_errors, unwrap
@@ -59,6 +60,16 @@ def chain(node):
         names.append(name(node.field("property")))
         node = expression(node.field("object"))
     return node, tuple(reversed(names))
+
+
+def const_declaration(binding):
+    return binding.parent().children()[0].kind() == "const"
+
+
+def plain_array(node):
+    elements = [child for child in node.children() if child.kind() != "comment"][1:-1]
+    return all(child.kind() != "spread_element" and (
+        child.kind() != "," or index % 2 == 1) for index, child in enumerate(elements))
 
 
 def arguments(node):
@@ -178,34 +189,42 @@ class Check:
             return truth(self.predicate) is (not self.negated)
         return False
 
-    def observation(self, identity):
-        """Identify the observed recorder and whether the check proves presence."""
+    def observation(self):
+        """Identify an observed collection or recorder and whether the check proves presence."""
         method = self.method
         negated = self.negated
         subject = expression(self.actual)
+        expected = expression(self.expected)
         if method in SPY_MATCHERS:
             presence = not negated if method in {"toHaveBeenCalled", "toBeCalled"} else True if not negated else None
-            return ("calls", identity(subject)), presence
+            return "calls", subject, presence
         if method in SPY_COUNTS:
             counter = "calls"
         elif method in {"toHaveLength", "length", "lengthOf"}:
             counter = "length"
-        elif self.operator in {"===", "==", "!==", "!="} and member(subject, "length"):
+        elif member(subject, "length") and (self.operator or method in {"toBeGreaterThan", "toBeGreaterThanOrEqual"}):
             counter = "length"
             subject = expression(subject.field("object"))
+            if method in {"toBeGreaterThan", "toBeGreaterThanOrEqual"}:
+                value = literal(expected)
+                minimum = 0 if method == "toBeGreaterThan" else 1
+                return counter, subject, True if type(value) in {int, float} and value >= minimum and not negated else None
             negated = self.operator in {"!==", "!="}
+        elif (self.operator in {"===", "=="} and expected is not None
+              and expected.kind() == "array" and plain_array(expected) and children(expected)):
+            return "length", subject, True
         else:
-            return None, None
-        value = literal(self.expected)
-        if subject is None or subject.kind() in {"array", "string", "template_string"} or type(value) not in {int, float}:
-            return None, None
+            return None, None, None
+        value = literal(expected)
+        if subject is None or type(value) not in {int, float}:
+            return None, None, None
         if counter == "length" and member(subject, "calls"):
             recorder = expression(subject.field("object"))
             if member(recorder, "mock"):
                 counter, subject = "calls", expression(recorder.field("object"))
         if value == 0:
-            return (counter, identity(subject)), negated
-        return (counter, identity(subject)), True if value > 0 and not negated else None
+            return counter, subject, negated
+        return counter, subject, True if value > 0 and not negated else None
 
 
 def member(node, property_name):
@@ -226,8 +245,11 @@ class File:
     def __init__(self, syntax):
         self.syntax = syntax
         self.imports = {}
-        self.imported_helpers = set()
+        self.imported_helpers = {}
+        self.namespace_imports = set()
         self.bindings = defaultdict(list)
+        self.fixture_references = None
+        self.destructured = defaultdict(list)
         self.registrations = {}
         self.index_imports()
         for node in query(syntax.root, "variable_declarator", "function_declaration", "generator_function_declaration"):
@@ -241,6 +263,16 @@ class File:
         for node in query(syntax.root, "variable_declarator"):
             if (target := node.field("name")) is not None and target.kind() == "object_pattern":
                 self.index_destructured_require(target, node.field("value"))
+                if not const_declaration(node):
+                    continue
+                scope = next((parent for parent in node.ancestors() if parent.kind() in SCOPES), syntax.root)
+                for entry in children(target):
+                    if entry.kind() == "pair_pattern":
+                        key, local = name(entry.field("key")), name(entry.field("value"))
+                    else:
+                        key = local = name(entry)
+                    if key and local:
+                        self.destructured[local].append((scope, node, key))
 
     def index_imports(self):
         for node in query(self.syntax.root, "import_statement"):
@@ -250,10 +282,16 @@ class File:
                 continue
             if source not in FRAMEWORKS | ASSERT_MODULES:
                 if source is not None and source.startswith("."):
+                    self.namespace_imports.update(children(child)[0].text() for child in children(clause)
+                                                  if child.kind() == "namespace_import" and children(child))
                     for specifier in query(clause, "import_specifier"):
                         original = name(specifier.field("name"))
-                        if lint.helper(original):
-                            self.imported_helpers.add(name(specifier.field("alias")) or original)
+                        helper_module = PurePosixPath(source).stem
+                        local = name(specifier.field("alias")) or original
+                        if helper_module == "must" and original in {"must", "mustFail"}:
+                            self.imported_helpers[local] = "result helper"
+                        elif lint.helper(original):
+                            self.imported_helpers[local] = "imported helper"
                 continue
             for child in children(clause):
                 if child.kind() == "identifier":
@@ -267,7 +305,10 @@ class File:
 
     def require(self, node):
         base, members = chain(node)
-        if base is not None and base.kind() == "call_expression" and name(base.field("function")) == "require":
+        if base is not None and base.kind() == "await_expression":
+            base = expression(next(iter(children(base)), None))
+        if (base is not None and base.kind() == "call_expression"
+                and base.field("function").text() in {"require", "import"}):
             source = next((text_literal(arg) for arg in arguments(base)), None)
             if source in FRAMEWORKS | ASSERT_MODULES:
                 return source, members
@@ -330,6 +371,254 @@ class File:
             if candidate is not None and candidate.kind() in FUNCTIONS:
                 return candidate
         return None
+
+    def destructuring(self, node):
+        use = offset(node)
+        visible = [(declaration, key) for scope, declaration, key in self.destructured.get(name(node), ())
+                   if offset(scope) <= use < scope.range().end.index and offset(declaration) < use]
+        return max(visible, key=lambda item: offset(item[0]), default=(None, ""))
+
+    def sibling_control(self, node, seen=frozenset()):
+        """Identify a recorder or output that another test can observe independently."""
+        node = expression(node)
+        if node is None:
+            return None
+        kind = node.kind()
+        if kind == "await_expression":
+            return self.sibling_control(next(iter(children(node)), None), seen)
+        if kind == "member_expression":
+            root = self.sibling_control(node.field("object"), seen)
+            return ("member", root, name(node.field("property"))) if root is not None else None
+        if kind == "call_expression":
+            callee = node.field("function")
+            args = arguments(node)
+            _, names = self.callee(callee)
+            if names in {("vi", "spyOn"), ("jest", "spyOn")} and len(args) >= 2:
+                method = literal(args[1])
+                if name(args[0]) in self.namespace_imports and isinstance(method, str):
+                    return "spy", name(args[0]), method
+                return None
+            if names in {("vi", "fn"), ("jest", "fn")}:
+                return None
+            method = names[-1] if names else ""
+            if method.startswith("mock") and member(callee, method):
+                return self.sibling_control(callee.field("object"), seen)
+            detector = self.sibling_control(callee, seen)
+            if method in {"querySelectorAll", "getElementsByClassName", "qa", "pw"}:
+                selector = literal(args[-1]) if args else None
+                return ("selector", detector or shape(callee), selector) if isinstance(selector, str) else None
+            if method in {"filter", "flatMap", "map", "slice"}:
+                return None
+            if name(callee) and self.destructuring(callee)[0] is not None:
+                return None
+            if detector is None and name(callee) and self.binding(callee) is None:
+                detector = "named call", name(callee)
+            return ("call", detector) if detector is not None else None
+        if not name(node):
+            return None
+        binding = self.binding(node)
+        declaration, key = self.destructuring(node)
+        if declaration is not None and (binding is None or offset(declaration) > offset(binding)):
+            root = self.sibling_control(declaration.field("value"), seen)
+            return ("member", root, key) if root is not None else None
+        if binding is None or offset(binding) in seen:
+            return None
+        site = offset(binding)
+        if binding.kind() == "variable_declarator" and const_declaration(binding):
+            root = self.sibling_control(binding.field("value"), seen | {site})
+            if root is not None:
+                return root
+        if not any(parent.kind() in FUNCTIONS for parent in binding.ancestors()):
+            return "binding", site
+        return None
+
+    def control_group(self, node, *, calls):
+        node = expression(node)
+        if node is None:
+            return None
+        if (name(node) and (binding := self.binding(node)) is not None
+                and binding.kind() == "variable_declarator" and const_declaration(binding)):
+            value = expression(binding.field("value"))
+            if member(value, "length"):
+                node = value
+        if node.kind() == "member_expression":
+            receiver = node.field("object")
+            if name(node.field("property")) == "length":
+                return self.control_group(receiver, calls=calls)
+            if name(receiver) or receiver.kind() == "member_expression":
+                if calls:
+                    root, _ = chain(receiver)
+                    binding = self.binding(root)
+                    if binding is None or not any(parent.kind() in FUNCTIONS for parent in binding.ancestors()):
+                        return None
+                return self.recorder(receiver)
+        return None
+
+    def indexed_collection(self, node):
+        node = expression(node)
+        while node is not None:
+            if any(child.kind() in {"?.", "optional_chain"} for child in node.children()):
+                return None
+            if member(node, "length"):
+                return None
+            if node.kind() == "subscript_expression":
+                index = literal(node.field("index"))
+                return node.field("object") if type(index) is int and index >= 0 else None
+            if node.kind() == "member_expression":
+                node = expression(node.field("object"))
+                continue
+            binding = self.binding(node)
+            if binding is not None and binding.kind() == "variable_declarator" and const_declaration(binding):
+                node = expression(binding.field("value"))
+                continue
+            return None
+        return None
+
+    def fixed(self, node, supplied=None, seen=frozenset()):
+        """Resolve a fixture expression together with the helper arguments it closes over."""
+        node = expression(node)
+        supplied = supplied or {}
+        if node is None:
+            return None, {}
+        span = offset(node), node.range().end.index
+        if span in seen:
+            return node, supplied
+        seen = seen | {span}
+        if name(node) in supplied:
+            return supplied[name(node)]
+        if (binding := self.binding(node)) is not None and binding.kind() == "variable_declarator":
+            if const_declaration(binding) and self.fixture_unchanged(node, binding):
+                return self.fixed(binding.field("value"), supplied, seen)
+        if node.kind() in {"member_expression", "subscript_expression"}:
+            receiver, bindings = self.fixed(node.field("object"), supplied, seen)
+            if receiver is not None and receiver.kind() == "object":
+                key = name(node.field("property")) or text_literal(node.field("index"))
+                item = self.object_field(receiver, key, bindings, seen)
+                if item is not None:
+                    return item
+            if receiver is not None and receiver.kind() == "array":
+                index = literal(node.field("index"))
+                values = children(receiver)
+                if type(index) is int and 0 <= index < len(values) and plain_array(receiver):
+                    return self.fixed(values[index], bindings, seen)
+        if node.kind() == "call_expression":
+            callee = node.field("function")
+            if not any(child.kind() == "?." for child in node.children()) and (target := self.helper(callee)) is not None:
+                body = expression(target.field("body"))
+                if body is not None and body.kind() == "statement_block":
+                    statements = children(body)
+                    body = next(iter(children(statements[0])), None) if (
+                        len(statements) == 1 and statements[0].kind() == "return_statement") else None
+                if body is not None:
+                    arguments_by_name = {key: self.fixed(arg, supplied, seen)
+                                         for key, arg in zip(formal_parameters(target), arguments(node)) if key}
+                    return self.fixed(body, arguments_by_name, seen)
+        return node, supplied
+
+    def object_field(self, node, key, supplied, seen):
+        if node is None or node.kind() != "object":
+            return None
+        span = offset(node), node.range().end.index
+        if span in seen:
+            return None
+        seen = seen | {span}
+        for field in reversed(children(node)):
+            if field.kind() == "pair" and (name(field.field("key")) or text_literal(field.field("key"))) == key:
+                return self.fixed(field.field("value"), supplied, seen)
+            if field.kind() == "spread_element":
+                spread, bindings = self.fixed(children(field)[0], supplied, seen)
+                return self.object_field(spread, key, bindings, seen) if spread is not None else None
+        return None
+
+    def fixture_unchanged(self, use, binding):
+        key = name(use)
+        if self.fixture_references is None:
+            self.fixture_references = defaultdict(list)
+            for reference in query(self.syntax.root, "identifier"):
+                self.fixture_references[name(reference)].append(reference)
+        for reference in self.fixture_references[key]:
+            if not offset(binding) < offset(reference) < offset(use):
+                continue
+            owner = self.binding(reference)
+            if owner is None or offset(owner) != offset(binding):
+                continue
+            current, parent = reference, reference.parent()
+            while parent.kind() in {"member_expression", "subscript_expression", *TRANSPARENT}:
+                current, parent = parent, parent.parent()
+            if parent.kind() == "arguments" and self.callee(parent.parent().field("function"))[1] in {
+                    ("expect",), ("expect", "soft"), ("expect", "poll")}:
+                continue
+            if parent.kind() in {"assignment_expression", "augmented_assignment_expression", "update_expression",
+                                 "arguments", "unary_expression", "return_statement", "variable_declarator",
+                                 "pair", "array", "spread_element"}:
+                return False
+            if parent.kind() == "call_expression" and offset(parent.field("function")) == offset(current):
+                if name(current.field("property")) not in {"map", "filter", "forEach", "every", "some", "find",
+                                                          "includes", "join", "slice", "entries", "values", "keys"}:
+                    return False
+        return True
+
+    def fixture_number(self, node, supplied=None, seen=frozenset()):
+        node, bindings = self.fixed(node, supplied)
+        if node is None:
+            return lint.UNKNOWN
+        span = offset(node), node.range().end.index
+        if span in seen:
+            return lint.UNKNOWN
+        seen = seen | {span}
+        if member(node, "length"):
+            return self.fixture_size(node.field("object"), bindings, seen)
+        operator, base, exponent = split_operands(node)
+        if operator == "**":
+            base = literal(base)
+            exponent = self.fixture_number(exponent, bindings, seen)
+            if type(base) is int and 0 <= base <= 2**16 and type(exponent) is int and 0 <= exponent <= 32:
+                return base ** exponent
+        return literal(node)
+
+    def fixture_size(self, node, supplied=None, seen=frozenset()):
+        node, bindings = self.fixed(node, supplied)
+        if node is None:
+            return lint.UNKNOWN
+        span = offset(node), node.range().end.index
+        if span in seen:
+            return lint.UNKNOWN
+        seen = seen | {span}
+        kind = node.kind()
+        value = literal(node)
+        if isinstance(value, str):
+            return len(value.encode("utf-16-le")) // 2
+        if kind == "array" and plain_array(node):
+            return len(children(node))
+        if kind != "call_expression" or any(child.kind() == "?." for child in node.children()):
+            return lint.UNKNOWN
+        function = expression(node.field("function"))
+        receiver, methods = chain(function)
+        args = arguments(node)
+        if name(receiver) == "Array" and methods == ("from",) and args and self.binding(receiver) is None:
+            source, bindings = self.fixed(args[0], bindings)
+            if source is not None and source.kind() == "object":
+                length = self.object_field(source, "length", bindings, frozenset())
+                if length is not None:
+                    size = self.fixture_number(*length, seen=seen)
+                    if type(size) is int and 0 <= size <= 2**32 - 1:
+                        return size
+            return self.fixture_size(source, bindings, seen)
+        method = methods[-1] if methods else ""
+        if method in {"map", "sort", "toReversed", "toSorted"} or method == "slice" and not args:
+            return self.fixture_size(function.field("object"), bindings, seen)
+        return lint.UNKNOWN
+
+    def constant_length(self, check):
+        if check.method in {"toHaveLength", "length", "lengthOf"}:
+            actual = self.fixture_size(check.actual)
+            expected = literal(check.expected)
+            return type(actual) is int and type(expected) is int and (actual == expected) != check.negated
+        if check.operator and member(expression(check.actual), "length"):
+            actual = self.fixture_number(check.actual)
+            expected = literal(check.expected)
+            return actual is not lint.UNKNOWN and expected is not lint.UNKNOWN and compare(check.operator, actual, expected) is True
+        return False
 
     def registration(self, node, context):
         callee = expression(node.field("function"))
@@ -422,7 +711,7 @@ class File:
             return matcher(node, subject, members[index + 1:], args)
         if not names:
             return None
-        if names in {("expect", "assertions"), ("expect", "hasAssertions")}:
+        if names in {("expect", "assertions"), ("expect", "hasAssertions"), ("expect", "fail")}:
             return Check(node, names[-1])
         receiver, *methods = names
         local = self.binding(base) if name(base) and not source else None
@@ -434,7 +723,7 @@ class File:
             method = methods[-1] if methods else receiver
             return assert_check(node, method, args)
         if name(base) in self.imported_helpers and not members and local is None:
-            return Check(node, "imported helper")
+            return Check(node, self.imported_helpers[name(base)])
         return None
 
     def property_check(self, node):
@@ -455,18 +744,14 @@ class File:
         return None
 
 
-def parameters(callback):
-    if callback is None:
-        return ()
+def formal_parameters(callback):
     formal = callback.field("parameters")
     entries = children(formal) if formal is not None else [callback.field("parameter")]
-    names = []
-    for entry in entries[:1]:
-        if entry is not None and entry.kind() in {"required_parameter", "optional_parameter"}:
-            entry = children(entry)[0]
-        if name(entry):
-            names.append(name(entry))
-    return tuple(names)
+    return tuple(name(entry.field("pattern") or entry) if entry is not None else "" for entry in entries)
+
+
+def parameters(callback):
+    return tuple(key for key in formal_parameters(callback)[:1] if key)
 
 
 def matcher(node, subject, members, args):
@@ -521,6 +806,8 @@ def parse(source, path, language, *, inventory=False, observe=None):
     line_comments = {comment.line: comment.text for comment in notes}
     entries = list(file.inventory())
     tests = []
+    sibling_witnesses = set()
+    test_absences = []
     for test, callback, ignored in entries:
         tests.append(test)
         if ignored or callback is None:
@@ -537,19 +824,43 @@ def parse(source, path, language, *, inventory=False, observe=None):
         if inventory:
             test.body_hash = hashlib.sha256(repr(shape(body)).encode()).hexdigest()
         witnesses = set()
+        groups = set()
         absences = []
         for check in flow.checks:
             site = line(check.node)
-            if check.constant():
-                test.issues.append((site, "const-truth"))
             if flow.compares_itself(check, test.name, line_comments):
                 test.issues.append((site, "self-compare"))
-            key, presence = check.observation(file.recorder)
+            if check.constant() or file.constant_length(check):
+                test.issues.append((site, "const-truth"))
+                continue
+            counter, subject, presence = check.observation()
+            expected = literal(check.expected)
+            if not check.guarded and check.operator in {"===", "=="} and expected is not lint.UNKNOWN and expected is not None:
+                indexed = file.indexed_collection(check.actual)
+                if indexed is not None:
+                    witnesses.add(("length", file.recorder(indexed)))
+                    if (group := file.control_group(indexed, calls=False)) is not None:
+                        groups.add(("length", group))
+            if presence is None:
+                continue
+            local = counter, file.recorder(subject)
+            sibling = file.sibling_control(subject)
+            sibling = (counter, sibling) if sibling is not None else None
+            group = file.control_group(subject, calls=counter == "calls")
             if presence is True and not check.guarded:
-                witnesses.add(key)
-            if presence is False:
-                absences.append((key, site))
-        test.issues.extend((site, "absence-no-control") for key, site in absences if key not in witnesses)
+                witnesses.add(local)
+                if sibling is not None and not test.conditional:
+                    sibling_witnesses.add(sibling)
+                if group is not None:
+                    groups.add((counter, group))
+            elif presence is False:
+                absences.append((local, sibling, group, site))
+        for local, sibling, group, site in absences:
+            if local not in witnesses and (group is None or (local[0], group) not in groups):
+                test_absences.append((test, sibling, site))
+    for test, sibling, site in test_absences:
+        if sibling not in sibling_witnesses:
+            test.issues.append((site, "absence-no-control"))
     if observe is not None:
         observe(path, tests, syntax_errors(syntax.root, missing=True), [])
     return tests, notes
