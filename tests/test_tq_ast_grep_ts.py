@@ -289,3 +289,186 @@ class AstGrepTypeScript(TqCase):
         self.assertEqual(self.locations(path.name), [
             (4, "const-truth"), (8, "absence-no-control"), (10, "no-assert"), (14, "no-assert"),
         ])
+
+    def test_browser_element_assertions_must_finish(self):
+        # WHY: ChatMarkdown.browser.test.tsx awaits the locator matcher.
+        # catches: overlooking expect.element or treating the locator lookup as a check
+        path = self.write("browser.test.ts", """
+            import { expect as verify } from "vitest";
+            test("checks the locator", async () => {
+              await verify.element(screen.getByText("Saved")).toBeVisible();
+            });
+            test("looks up but never checks", () => verify.element(screen.getByText("Saved")));
+            test("drops the check", () => {
+              verify.element(screen.getByText("Saved")).toHaveAttribute("role", "status");
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(5, "no-assert"), (6, "guarded-assert")])
+
+    def test_recorder_controls_follow_factory_declarations_and_member_aliases(self):
+        # WHY: stream.test.ts destructures setup events, and clearRuntime.test.ts aliases fake methods.
+        # catches: comparing source spelling or accepting a different recorder's calls
+        path = self.write("recorders.test.ts", """
+            function setup() {
+              const events = { unauthorized: vi.fn(), pending: vi.fn() };
+              configure(events);
+              return { events };
+            }
+            describe("fixture members", () => {
+              let fixture;
+              beforeEach(() => { fixture = setup(); });
+              test("positive control", () => {
+                const unauthorized = fixture.events.unauthorized;
+                expect(unauthorized.mock.calls.length).toBeGreaterThan(0);
+              });
+              test("same factory, separately created", () => {
+                const { events } = setup();
+                expect(events.unauthorized).not.toHaveBeenCalled();
+                expect(events.pending).not.toHaveBeenCalled();
+              });
+            });
+            test("independent local with the same name", () => {
+              const events = { unauthorized: vi.fn() };
+              expect(events.unauthorized).not.toHaveBeenCalled();
+            });
+            test("control later in the same test", () => {
+              const scroll = vi.fn();
+              expect(scroll).not.toHaveBeenCalled();
+              expect(scroll.mock.calls).toEqual([[616]]);
+            });
+            test("guarded control is insufficient", () => {
+              const scroll = vi.fn();
+              expect(scroll).not.toHaveBeenCalled();
+              if (enabled()) expect(scroll.mock.calls).toEqual([[616]]);
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [
+            (16, "absence-no-control"), (21, "absence-no-control"), (30, "absence-no-control"),
+        ])
+
+    def test_imported_assertions_require_repo_source(self):
+        # WHY: Optic.test.ts and Record.test.ts call assertion wrappers from source.
+        # catches: ignoring aliased helpers, trusting names, or treating a conditional wrapper as guaranteed
+        self.write("assertions.ts", """
+            import { strictEqual } from "node:assert";
+            export function equalOutput(actual, expected) {
+              strictEqual(actual, expected);
+            }
+            export function assertReady(value) { return value; }
+            export function checkIfEnabled(value) {
+              if (enabled()) strictEqual(value, 1);
+            }
+        """)
+        self.write("packages/harness/package.json", '{"name":"@demo/harness","exports":{"./*":"./src/*.ts"}}')
+        self.write("packages/harness/src/checks.ts", """
+            import { expect } from "vitest";
+            export const confirm = value => expect(value).toBeVisible();
+        """)
+        path = self.write("helpers.test.ts", """
+            import { equalOutput as verify, assertReady, checkIfEnabled } from "./assertions.js";
+            import { confirm } from "@demo/harness/checks";
+            import { confirm as unavailable } from "@other/harness/checks";
+            test("local source", () => verify(out(), 1));
+            test("package source", () => confirm(locator()));
+            test("name alone", () => assertReady(out()));
+            test("source unavailable", () => unavailable(out()));
+            test("conditional helper", () => checkIfEnabled(out()));
+        """)
+        self.assertEqual(self.locations(path.name), [(6, "no-assert"), (7, "no-assert"), (8, "guarded-assert")])
+
+    def test_literal_arguments_make_helper_loops_nonempty(self):
+        # WHY: Glob.test.ts passes fixed matching and nonmatching path lists to assertMatches.
+        # catches: ignoring the caller's fixture or accepting an empty or optional input
+        path = self.write("loops.test.ts", """
+            function assertMatches(pattern, matching, nonmatching) {
+              for (const path of matching) expect(matches(pattern, path)).toBe(true);
+              for (const path of nonmatching) expect(matches(pattern, path)).toBe(false);
+            }
+            test("fixed lists", () => assertMatches("*.ts", ["test.ts"], ["test.js"]));
+            test("fixed object keys", () => {
+              const optics = { Iso: makeIso(), Lens: makeLens() };
+              for (const key of Object.keys(optics) as Array<keyof typeof optics>) {
+                expect(optics[key].get(1)).toBeDefined();
+              }
+            });
+            test("both lists empty", () => assertMatches("*.ts", [], []));
+            test("unknown and empty", () => assertMatches("*.ts", paths(), []));
+            function checkAfterClear(paths) {
+              paths.length = 0;
+              for (const path of paths) expect(matches("*.ts", path)).toBe(true);
+            }
+            test("helper empties its input", () => checkAfterClear(["test.ts"]));
+        """)
+        self.assertEqual(self.locations(path.name), [
+            (12, "guarded-assert"), (13, "guarded-assert"), (18, "guarded-assert"),
+        ])
+
+    def test_indexed_mock_observation_controls_the_factory_collection(self):
+        # WHY: stream.test.ts records a decode on an indexed decoder from recoveryFixture.
+        # catches: ignoring the collection proven present or crediting optional access
+        path = self.write("recorders.test.ts", """
+            const setup = () => ({ decoders: [], peers: [] });
+            test("proves that setup can create a decoder", () => {
+              const { decoders, peers } = setup();
+              expect(decoders[0]!.decode).toHaveBeenCalledOnce();
+              expect(peers[0]?.decode).toHaveBeenCalledOnce();
+            });
+            test("leaves the collections empty", () => {
+              const { decoders, peers } = setup();
+              expect(decoders).toHaveLength(0);
+              expect(peers).toHaveLength(0);
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(10, "absence-no-control")])
+
+    def test_imported_fixture_checks_do_not_prove_the_test_output(self):
+        # WHY: tools.last.test.ts checks an import during setup, and graph.evidence-buttons.test.ts mounts a fixture.
+        # catches: letting setup preconditions stand in for the checks inside an optional output loop
+        self.write("fixture.ts", """
+            import { assert, expect } from "vitest";
+            export function must(result) {
+              if (!result.ok) assert.fail("setup failed");
+              return result.value;
+            }
+            export async function mount() {
+              const world = await open();
+              expect(world).toBeDefined();
+              return world;
+            }
+        """)
+        path = self.write("outputs.test.ts", """
+            import { mount, must } from "./fixture";
+            async function importAt(input) {
+              clock.set();
+              must(await importFixture(input));
+              clock.reset();
+            }
+            const openGraph = () => mount();
+            test("import success does not guarantee a row", async () => {
+              await importAt(example);
+              for (const row of loadRows()) expect(row.lastCapture).toBeNull();
+            });
+            test("mount success does not guarantee a graph node", async () => {
+              const graph = await openGraph();
+              for (const node of graph.nodes()) expect(node.links()).toHaveLength(0);
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(8, "guarded-assert"), (12, "guarded-assert"),
+                                                    (14, "absence-no-control")])
+
+    def test_package_namespace_export_resolves_a_static_assertion(self):
+        # WHY: Tuple.test.ts reaches its assertions through effect/testing's namespace export.
+        # catches: recognizing a package by name or skipping a declared static assertion
+        self.write("packages/harness/package.json", '{"name":"@demo/harness","exports":{"./testing":"./src/index.ts"}}')
+        self.write("packages/harness/src/index.ts", 'export * as Checks from "./checks.ts";')
+        self.write("packages/harness/src/checks.ts", """
+            import assert from "node:assert";
+            export class Compare {
+              static schema = { fields: { equal: (actual, expected) => assert.deepStrictEqual(actual, expected) } };
+            }
+        """)
+        path = self.write("helpers.test.ts", """
+            import { Checks } from "@demo/harness/testing";
+            test("checks two fields", () => Checks.Compare.schema.fields.equal(out(), expected));
+        """)
+        self.assertEqual(self.locations(path.name), [])

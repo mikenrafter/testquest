@@ -2,6 +2,8 @@
 
 import re
 
+from .ast_grep_ts_imports import imported_helper
+
 from . import lint
 from .ast_grep import children, line, offset, query, shape, split_operands
 from .ast_grep_ts import (
@@ -38,13 +40,15 @@ def is_async(callback):
 
 
 class Flow:
-    def __init__(self, file, callback, context, active=frozenset(), callbacks=None):
+    def __init__(self, file, callback, context, active=frozenset(), callbacks=None, supplied=None, follow_imports=True):
         self.file = file
         self.callback = callback
         self.body = callback.field("body")
         self.context = context
-        self.active = active | {offset(callback)}
+        self.active = active | {(file.path, offset(callback))}
         self.callbacks = callbacks or {}
+        self.supplied = supplied or {}
+        self.follow_imports = follow_imports
         self.checks = []
         self.references = None
 
@@ -225,8 +229,10 @@ class Flow:
         joined = self.completed(node)
         callbacks = {key: callback for key, arg in zip(formal_parameters(target), args)
                      if key and (callback := self.callback_target(arg)) is not None} if target is not None else {}
-        if target is not None and offset(target) not in self.active and target.field("body") is not None:
-            nested = Flow(self.file, target, (), self.active, callbacks)
+        if target is not None and (self.file.path, offset(target)) not in self.active and target.field("body") is not None:
+            supplied = self.file.fixture_arguments(target, args, self.supplied)
+            nested = Flow(self.file, target, (), self.active, callbacks, {**self.supplied, **supplied},
+                          self.follow_imports)
             incomplete = nested.visit(nested.body)
             detached = is_async(target) and not joined
             forwarded = [check for check in nested.checks
@@ -236,14 +242,28 @@ class Flow:
             if forwarded:
                 return followed_by(result, NEXT if optional or detached or incomplete else 0)
             checks = [check for check in nested.checks if check.method != "result helper"]
-            if not checks and len(children(nested.body)) == 1:
-                checks = nested.checks
+            if not checks and nested.checks and len(children(nested.body)) == 1:
+                coverage = self.result_helper(node, guarded, optional or detached or bool(incomplete))
+                return followed_by(result, coverage)
             if checks:
                 failure_helper = all(check.method in {"throw", "fail"} for check in checks)
                 if not failure_helper or not callbacks:
                     return followed_by(result, self.record(Check(node, "helper"), guarded,
                                                            optional or detached or bool(incomplete) and not failure_helper))
             return result
+
+        if self.follow_imports and target is None and (imported := imported_helper(self.file, callee)) is not None:
+            module, helper = imported
+            if module is None:
+                return followed_by(result, self.record(Check(node, "helper"), guarded, optional))
+            if helper is not None and helper.kind() in FUNCTIONS and helper.field("body") is not None:
+                summary = imported_check_summary(module, helper)
+                if summary is not None:
+                    returns_value, unchecked = summary
+                    detached = optional or is_async(helper) and not joined or unchecked
+                    coverage = (self.result_helper(node, guarded, detached) if returns_value else
+                                self.record(Check(node, "helper"), guarded, detached))
+                    return followed_by(result, coverage)
 
         if joined and not optional and target is None:
             for arg in args:
@@ -257,6 +277,15 @@ class Flow:
                         del self.checks[count:]
         return result
 
+    def result_helper(self, node, guarded, detached):
+        parent = node.parent()
+        while parent is not None and parent.kind() in TRANSPARENT | {"await_expression"}:
+            node, parent = parent, parent.parent()
+        if parent is not None and (parent.kind() in {"expression_statement", "return_statement"}
+                                   or same(node, parent.field("body")) and parent.kind() in FUNCTIONS):
+            return self.record(Check(node, "result helper"), guarded, detached)
+        return NEXT
+
     def check_callback(self, callback):
         body = callback.field("body")
         if body is None:
@@ -269,9 +298,10 @@ class Flow:
         ) for node in query(body, "return_statement"))
 
     def invoke(self, callback, conditional, catches, *, detached):
-        if callback is None or offset(callback) in self.active or callback.field("body") is None:
+        if callback is None or (self.file.path, offset(callback)) in self.active or callback.field("body") is None:
             return NEXT
-        nested = Flow(self.file, callback, self.context, self.active)
+        nested = Flow(self.file, callback, self.context, self.active, supplied=self.supplied,
+                      follow_imports=self.follow_imports)
         remaining = nested.visit(nested.body, conditional or detached, catches or detached)
         self.checks.extend(nested.checks)
         return NEXT if detached or remaining else 0
@@ -359,7 +389,7 @@ class Flow:
         return False
 
     def nonempty(self, node, *, keys=False, supplied=None, seen=frozenset()):
-        node, supplied = self.file.fixed(node, supplied)
+        node, supplied = self.file.fixed(node, self.supplied if supplied is None else supplied)
         if node is None:
             return False
         span = offset(node), node.range().end.index
@@ -380,7 +410,8 @@ class Flow:
             fn = expression(node.field("function"))
             receiver, methods = chain(fn)
             args = arguments(node)
-            if name(receiver) == "Object" and methods in {("entries",), ("keys",), ("values",)} and args:
+            if (name(receiver) == "Object" and methods in {("entries",), ("keys",), ("values",)} and args
+                    and self.file.binding(receiver) is None and self.file.parameter_scope(receiver) is None):
                 return self.nonempty(args[0], keys=True, supplied=supplied, seen=seen)
             if name(receiver) == "Array" and methods == ("from",) and args:
                 return self.nonempty(args[0], supplied=supplied, seen=seen)
@@ -442,6 +473,27 @@ class Flow:
                         or companion.operator in {"==", "==="} and literal(other) is not lint.UNKNOWN):
                     return False
         return True
+
+
+def imported_check_summary(module, helper):
+    site = offset(helper)
+    if site not in module.helper_summaries:
+        flow = Flow(module, helper, (), follow_imports=False)
+        incomplete = flow.visit(flow.body)
+        summary = None
+        if flow.checks:
+            checked = {offset(check.node) for check in flow.checks if check.method != "result helper"}
+            returned = [flow.body] if flow.body.kind() != "statement_block" else [
+                next(iter(children(statement)), None) for statement in query(flow.body, "return_statement")
+                if not any(parent.kind() in FUNCTIONS and within(parent, flow.body)
+                           for parent in statement.ancestors())
+            ]
+            returns_value = any(value is not None and value.text() != "undefined"
+                                and offset(expression(value)) not in checked for value in returned)
+            failure_helper = all(check.method in {"throw", "fail"} for check in flow.checks)
+            summary = returns_value, bool(incomplete) and not failure_helper
+        module.helper_summaries[site] = summary
+    return module.helper_summaries[site]
 
 
 def inverse(value):

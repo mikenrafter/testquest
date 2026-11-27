@@ -3,7 +3,6 @@
 from collections import defaultdict
 from dataclasses import dataclass
 import hashlib
-from pathlib import PurePosixPath
 
 from . import ast_grep_micro as micro, lint
 from .ast_grep import Syntax, children, line, location, offset, opposite, query, shape, split_operands, syntax_errors, text, unwrap
@@ -19,7 +18,7 @@ TESTS = {"test", "it", "specify"}
 MODIFIERS = {"each", "only", "skip", "todo", "concurrent", "serial", "parallel", "failing", "fixme", "skipIf", "runIf", "fails"}
 FACTORIES = {"each", "skipIf", "runIf"}
 FRAMEWORKS = {"vitest", "jest", "@jest/globals", "node:test", "mocha", "@playwright/test", "playwright/test",
-              "bun:test", "ava", "chai", "fast-check"}
+              "bun:test", "ava", "chai", "fast-check", "vite-plus/test"}
 ASSERT_MODULES = {"assert", "assert/strict", "node:assert", "node:assert/strict"}
 ASSERT_EQUAL = {"equal", "equals", "eq", "strictEqual", "deepEqual", "deepStrictEqual", "eql", "eqls",
                 "strictEquals", "deepEquals", "is", "toBe", "toEqual", "toStrictEqual"}
@@ -33,6 +32,7 @@ SPY_MATCHERS = {"toHaveBeenCalled", "toBeCalled", "toHaveBeenCalledWith", "toBeC
                 "toHaveBeenCalledOnce", "toHaveBeenCalledExactlyOnceWith", "toHaveBeenLastCalledWith",
                 "toHaveBeenNthCalledWith", "lastCalledWith", "nthCalledWith"}
 SPY_COUNTS = {"toHaveBeenCalledTimes", "toBeCalledTimes"}
+EXPECT_RECEIVERS = {("expect",), ("expect", "soft"), ("expect", "poll"), ("expect", "element")}
 ITERATORS = {"map", "forEach", "flatMap", "filter", "some", "every", "find", "findIndex", "reduce", "reduceRight"}
 CHAINS = {"then", "catch", "finally"}
 TRANSPARENT = {"parenthesized_expression", "as_expression", "satisfies_expression", "non_null_expression",
@@ -49,7 +49,8 @@ def expression(node):
 def name(node):
     node = expression(node)
     return node.text() if node is not None and node.kind() in {
-        "identifier", "property_identifier", "shorthand_property_identifier_pattern", "this"
+        "identifier", "property_identifier", "shorthand_property_identifier_pattern",
+        "shorthand_property_identifier", "this"
     } else ""
 
 
@@ -177,7 +178,7 @@ class Check:
     @property
     def asynchronous(self):
         return self.method in {"rejects", "doesNotReject", "throwsAsync", "notThrowsAsync"} or any(
-            part in {"resolves", "rejects", "poll"} for part in self.modifiers)
+            part in {"resolves", "rejects", "poll", "element"} for part in self.modifiers)
 
     def constant(self):
         if self.predicate is not None and self.method in {"isTrue", "isFalse", "true", "false"}:
@@ -209,23 +210,30 @@ class Check:
             if method in {"toBeGreaterThan", "toBeGreaterThanOrEqual"}:
                 value = literal(expected)
                 minimum = 0 if method == "toBeGreaterThan" else 1
+                counter, subject = observation_subject(counter, subject)
                 return counter, subject, True if type(value) in {int, float} and value >= minimum and not negated else None
             negated = self.operator in {"!==", "!="}
         elif (self.operator in {"===", "=="} and expected is not None
               and expected.kind() == "array" and plain_array(expected) and children(expected)):
-            return "length", subject, True
+            counter, subject = observation_subject("length", subject)
+            return counter, subject, True
         else:
             return None, None, None
         value = literal(expected)
         if subject is None or type(value) not in {int, float}:
             return None, None, None
-        if counter == "length" and member(subject, "calls"):
-            recorder = expression(subject.field("object"))
-            if member(recorder, "mock"):
-                counter, subject = "calls", expression(recorder.field("object"))
+        counter, subject = observation_subject(counter, subject)
         if value == 0:
             return counter, subject, negated
         return counter, subject, True if value > 0 and not negated else None
+
+
+def observation_subject(counter, subject):
+    if counter == "length" and member(subject, "calls"):
+        mock = expression(subject.field("object"))
+        if member(mock, "mock"):
+            return "calls", expression(mock.field("object"))
+    return counter, subject
 
 
 def member(node, property_name):
@@ -250,7 +258,9 @@ class File:
         self.local_imports = {}
         self.imported_returns = {}
         self.imports = {}
-        self.imported_helpers = {}
+        self.source_imports = {}
+        self.hook_values = None
+        self.helper_summaries = {}
         self.namespace_imports = set()
         self.bindings = defaultdict(list)
         self.fixture_references = None
@@ -286,18 +296,24 @@ class File:
             if clause is None:
                 continue
             if source not in FRAMEWORKS | ASSERT_MODULES:
-                if source is not None and source.startswith("."):
-                    self.namespace_imports.update(children(child)[0].text() for child in children(clause)
-                                                  if child.kind() == "namespace_import" and children(child))
-                    for specifier in query(clause, "import_specifier"):
-                        original = name(specifier.field("name"))
-                        local = name(specifier.field("alias")) or original
+                if source is None or any(child.kind() == "type" for child in node.children()):
+                    continue
+                for child in children(clause):
+                    if child.kind() == "identifier":
+                        self.source_imports[child.text()] = source, ("default",)
+                    elif child.kind() == "namespace_import":
+                        local = children(child)[0].text()
+                        self.source_imports[local] = source, ()
+                        if source.startswith("."):
+                            self.namespace_imports.add(local)
+                for specifier in query(clause, "import_specifier"):
+                    if any(child.kind() == "type" for child in specifier.children()):
+                        continue
+                    original = name(specifier.field("name"))
+                    local = name(specifier.field("alias")) or original
+                    self.source_imports[local] = source, (original,)
+                    if source.startswith("."):
                         self.local_imports[local] = source, original
-                        helper_module = PurePosixPath(source).stem
-                        if helper_module == "must" and original in {"must", "mustFail"}:
-                            self.imported_helpers[local] = "result helper"
-                        elif lint.helper(original):
-                            self.imported_helpers[local] = "imported helper"
                 continue
             for child in children(clause):
                 if child.kind() == "identifier":
@@ -365,7 +381,7 @@ class File:
         if (binding := self.binding(node)) is not None:
             if binding.kind() == "variable_declarator" and binding.parent().children()[0].kind() == "const":
                 value = expression(binding.field("value"))
-                if name(value):
+                if name(value) or value is not None and value.kind() == "member_expression":
                     return self.recorder(value)
             return name(node), offset(binding)
         return shape(node)
@@ -524,8 +540,10 @@ class File:
         if span in seen:
             return node, supplied
         seen = seen | {span}
-        if name(node) in supplied:
-            return supplied[name(node)]
+        if supplied and (owner := self.parameter_scope(node)) is not None:
+            if (key := (offset(owner), name(node))) in supplied and self.fixture_unchanged(node, owner, parameter=True):
+                return supplied[key]
+            return node, supplied
         if (binding := self.binding(node)) is not None and binding.kind() == "variable_declarator":
             if const_declaration(binding) and self.fixture_unchanged(node, binding):
                 return self.fixed(binding.field("value"), supplied, seen)
@@ -550,10 +568,22 @@ class File:
                     body = next(iter(children(statements[0])), None) if (
                         len(statements) == 1 and statements[0].kind() == "return_statement") else None
                 if body is not None:
-                    arguments_by_name = {key: self.fixed(arg, supplied, seen)
-                                         for key, arg in zip(formal_parameters(target), arguments(node)) if key}
+                    arguments_by_name = {**supplied, **self.fixture_arguments(target, arguments(node), supplied, seen)}
                     return self.fixed(body, arguments_by_name, seen)
         return node, supplied
+
+    def parameter_scope(self, node):
+        key = name(node)
+        if not key:
+            return None
+        owner = next((parent for parent in node.ancestors()
+                      if parent.kind() in FUNCTIONS and key in formal_parameters(parent)), None)
+        binding = self.binding(node) if owner is not None else None
+        return owner if binding is None or offset(binding) < offset(owner) else None
+
+    def fixture_arguments(self, target, args, supplied, seen=frozenset()):
+        return {(offset(target), key): self.fixed(arg, supplied, seen)
+                for key, arg in zip(formal_parameters(target), args) if key}
 
     def object_field(self, node, key, supplied, seen):
         if node is None or node.kind() != "object":
@@ -570,7 +600,7 @@ class File:
                 return self.object_field(spread, key, bindings, seen) if spread is not None else None
         return None
 
-    def fixture_unchanged(self, use, binding):
+    def fixture_unchanged(self, use, binding, *, parameter=False):
         key = name(use)
         if self.fixture_references is None:
             self.fixture_references = defaultdict(list)
@@ -579,15 +609,19 @@ class File:
         for reference in self.fixture_references[key]:
             if not offset(binding) < offset(reference) < offset(use):
                 continue
-            owner = self.binding(reference)
+            owner = self.parameter_scope(reference) if parameter else self.binding(reference)
             if owner is None or offset(owner) != offset(binding):
                 continue
             current, parent = reference, reference.parent()
             while parent.kind() in {"member_expression", "subscript_expression", *TRANSPARENT}:
                 current, parent = parent, parent.parent()
-            if parent.kind() == "arguments" and self.callee(parent.parent().field("function"))[1] in {
-                    ("expect",), ("expect", "soft"), ("expect", "poll")}:
-                continue
+            if parent.kind() == "arguments":
+                function = parent.parent().field("function")
+                receiver, methods = chain(function)
+                if self.callee(function)[1] in EXPECT_RECEIVERS or (
+                        name(receiver) == "Object" and methods in {("keys",), ("values",), ("entries",)}
+                        and self.binding(receiver) is None and self.parameter_scope(receiver) is None):
+                    continue
             if parent.kind() in {"assignment_expression", "augmented_assignment_expression", "update_expression",
                                  "arguments", "unary_expression", "return_statement", "variable_declarator",
                                  "pair", "array", "spread_element"}:
@@ -738,10 +772,11 @@ class File:
             return None
         if members and base.kind() == "call_expression":
             _, origin = self.callee(base.field("function"))
-            if origin in {("expect",), ("expect", "soft"), ("expect", "poll")} and (subject := arguments(base)):
+            if (origin in EXPECT_RECEIVERS
+                    and (origin != ("expect", "element") or self.binding(chain(base.field("function"))[0]) is None)
+                    and (subject := arguments(base))):
                 check = matcher(node, subject[0], members, args)
-                if origin == ("expect", "poll"):
-                    check.modifiers = ("poll", *check.modifiers)
+                check.modifiers = (*origin[1:], *check.modifiers)
                 return check
         if "should" in members and members[-1] != "should":
             index = members.index("should")
@@ -762,8 +797,6 @@ class File:
                                             len(methods) == 1 and methods[-1] in CONTEXT_CHECKS)):
             method = methods[-1] if methods else receiver
             return assert_check(node, method, args)
-        if name(base) in self.imported_helpers and not members and local is None:
-            return Check(node, self.imported_helpers[name(base)])
         return None
 
     def property_check(self, node):
@@ -977,6 +1010,7 @@ def no_crash_test(flow, test, notes):
 
 def parse(source, path, language, *, scan_root=None, inventory=False, observe=None):
     from .ast_grep_ts_flow import Flow
+    from .ast_grep_ts_recorders import fixture_origin
 
     syntax = Syntax.parse(source, language)
     file = File(syntax, path, scan_root)
@@ -1022,10 +1056,14 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
             if presence is None:
                 continue
             local = counter, file.recorder(subject)
-            sibling = file.sibling_control(subject)
+            sibling = fixture_origin(file, subject) or file.sibling_control(subject)
             sibling = (counter, sibling) if sibling is not None else None
             group = file.control_group(subject, calls=counter == "calls")
             if presence is True and not check.guarded:
+                if counter == "calls" and (collection := file.indexed_collection(subject)) is not None:
+                    witnesses.add(("length", file.recorder(collection)))
+                    if not test.conditional and (origin := fixture_origin(file, collection)) is not None:
+                        sibling_witnesses.add(("length", origin))
                 witnesses.add(local)
                 if sibling is not None and not test.conditional:
                     sibling_witnesses.add(sibling)
