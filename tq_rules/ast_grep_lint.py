@@ -4,7 +4,7 @@ from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 import hashlib
-from math import prod
+from math import comb, prod
 import operator
 import tokenize
 import tomllib
@@ -239,7 +239,15 @@ class Flow:
         self.recorder_changes = defaultdict(list)
         self.recorder_escapes = None
         self.collection_growth = defaultdict(list)
-        self.strategies = dict(initial)
+        strategy_entries = []
+        param_values = {}
+        for key, val in initial:
+            if key == "__params__":
+                param_values = val
+            else:
+                strategy_entries.append((key, val))
+        self.strategies = dict(strategy_entries)
+        self.param_values = param_values
         self.loop_values = {}
         self.loop_ranges = {}
         self.checked_collections = {}
@@ -368,6 +376,31 @@ class Flow:
         if kind in {"reference_expression", "try_expression"} and elements:
             return self.size(elements[-1], before=before, exact=exact, seen=seen)
         if kind == "subscript":
+            if self.syntax.language == "python" and (slc := next(
+                    (part for part in children(node) if part.kind() == "slice"), None)) is not None:
+                slice_parts = []
+                current = None
+                for token in slc.children():
+                    if token.kind() == ":":
+                        slice_parts.append(current)
+                        current = None
+                    elif token.is_named() and token.kind() not in COMMENTS:
+                        current = token
+                slice_parts.append(current)
+                if len(slice_parts) <= 3:
+                    start_node = slice_parts[0]
+                    stop_node = slice_parts[1] if len(slice_parts) >= 2 else None
+                    step_node = slice_parts[2] if len(slice_parts) == 3 else None
+                    step_val = 1 if step_node is None else self.known_value(step_node)
+                    length = self.size(node.field("value"), before=before, exact=exact, seen=seen)
+                    if step_val == 1 and length is not None:
+                        start_val = 0 if start_node is None else self.known_value(start_node)
+                        if start_val is not None and start_val >= 0:
+                            if stop_node is None:
+                                return max(0, length - start_val)
+                            stop_val = self.known_value(stop_node)
+                            if stop_val is not None and stop_val >= 0:
+                                return max(0, min(stop_val, length) - start_val)
             rows = self.fixture_rows(node.field("value"), before, seen)
             keys = self.loop_values.get(parts(node.field("subscript")), (node.field("subscript"),))
             wanted = [literal(self.syntax, key) for key in keys]
@@ -403,6 +436,14 @@ class Flow:
                 sizes = [self.known_value(arg) for arg in args]
                 if None not in sizes:
                     return range_size(0, sizes[0]) if len(sizes) == 1 else range_size(*sizes)
+            if self.syntax.language == "python" and method == "combinations" and len(args) == 2:
+                n = self.size(args[0], before=before, exact=exact, seen=seen)
+                r = self.known_value(args[1])
+                if n is not None and type(r) is int and 0 <= r <= n:
+                    return comb(n, r)
+            if (self.syntax.language == "python" and call.receiver is not None and method == "split"
+                    and not args and not exact and self._is_pil_image(call.receiver, before, seen)):
+                return 1
             if call.name == ("vec",):
                 if args:
                     return len(args)
@@ -504,7 +545,20 @@ class Flow:
                 call = self.syntax.call(strategy)
                 if call.name[-2:] == ("collection", "vec") and len(call.arguments) == 2:
                     return self.strategy_minimum(call.arguments[1])
+            elif self.syntax.language == "python" and strategy.kind() == "call":
+                scall = self.syntax.call(strategy)
+                if scall.method == "tuples":
+                    return len(scall.arguments)
+                if scall.method in {"lists", "sets", "dictionaries", "text", "binary"}:
+                    for arg in scall.arguments:
+                        if arg.kind() == "keyword_argument" and child_text(arg.field("name")) == "min_size":
+                            return self.known_value(arg.field("value"))
+                    return 0
             return None
+        if not entries and not exact and len(name) == 1 and (pvals := self.param_values.get(name[0])):
+            sizes = [self.size(item, before=before, exact=exact, seen=seen | {name}) for item in pvals]
+            if sizes and None not in sizes:
+                return min(sizes)
         binding_site = max((site for site, _ in entries if site < before), default=-1)
         if any(binding_site < start < before for start in self.writes[name]):
             return None
@@ -513,6 +567,8 @@ class Flow:
             return None
         initial = self.size(value, before=before, exact=exact, seen=seen | {name})
         grown = sum(added for site, added in self.collection_growth[name] if binding_site < site < before)
+        if self.syntax.language == "python" and not entries and not exact:
+            grown += sum(self.file.setup_growth.get(name, ()))
         if grown and exact:
             return None
         checked = self.checked_collections.get(name)
@@ -741,10 +797,53 @@ class Flow:
             else:
                 branches.append(self.isolated(arm.field("body") or next(iter(children(arm)), None)))
         exhaustive = bool(alternatives and alternatives[-1].kind() == "else_clause" and all(branches))
+        if (not exhaustive and self.syntax.language == "python" and len(branches) == 2
+                and alternatives and alternatives[-1].kind() == "else_clause"
+                and self._parametrized_raises_dual(condition, branches, node.field("consequence"), alternatives[-1])):
+            exhaustive = True
         if not exhaustive:
             for check in self.checks[before:]:
                 check.guarded = True
         return exhaustive
+
+    def _is_pil_image(self, node, before, seen=frozenset()):
+        node = unwrap(node)
+        if node is None:
+            return False
+        if node.kind() == "call":
+            call = self.syntax.call(node)
+            if call.method in {"new", "open"} and parts(call.receiver)[-1:] == ("Image",):
+                return True
+            if call.receiver is not None and call.method == "resize" and any(
+                    imp == "Image" or imp[-1:] == ("Image",) for imp in self.file.imports.values()):
+                return True
+            if call.receiver is not None and call.method in {
+                    "resize", "convert", "crop", "rotate", "transpose", "copy", "filter", "point"}:
+                return self._is_pil_image(call.receiver, before, seen)
+        name = parts(node)
+        if name:
+            entry = next(((site, value) for site, value in reversed(self.bindings.get(name, ()))
+                          if site < before and value is not None and (site, name) not in seen), None)
+            if entry is not None:
+                return self._is_pil_image(entry[1], entry[0], seen | {(entry[0], name)})
+            if (-1, name) not in seen and (value := self.file.constant(name, self.scope)) is not None:
+                return self._is_pil_image(value, -1, seen | {(-1, name)})
+        return False
+
+    def _parametrized_raises_dual(self, condition, branches, consequence, else_clause):
+        if branches.count(True) != 1 or branches.count(False) != 1:
+            return False
+        cond = unwrap(condition)
+        if (neg := opposite(cond)) is not None:
+            cond = neg
+        name = parts(cond)
+        if len(name) != 1 or name[0] not in self.param_values:
+            return False
+        bools = {literal(self.syntax, val) for val in self.param_values[name[0]]}
+        if not ({True, False} <= {v for v in bools if type(v) is bool}):
+            return False
+        unchecked_arm = else_clause if branches[0] else consequence
+        return unchecked_arm is not None and bool(query(unchecked_arm, "call"))
 
     def branch_witness(self, condition):
         op, left, right = split_operands(condition)
@@ -1009,16 +1108,35 @@ class Flow:
                     call = Call((*owner, call.method), call.arguments, call.receiver)
             if self.syntax.language == "python":
                 qualified = self.file.python_import(call.name, self.scope)
-                if qualified == ("pytest", "raises"):
+                if qualified in {("pytest", "raises"), ("pytest", "warns"), ("pytest", "deprecated_call")}:
                     manager = node
                     while manager.parent().kind() in {"as_pattern", "parenthesized_expression"}:
                         manager = manager.parent()
                     recognized = outcome = len(call.arguments) >= 2 or manager.parent().kind() == "with_item"
+                elif qualified == ("warnings", "catch_warnings"):
+                    manager = node
+                    while manager.parent().kind() in {"as_pattern", "parenthesized_expression"}:
+                        manager = manager.parent()
+                    in_with = manager.parent().kind() == "with_item"
+                    is_error = any(
+                        arg.kind() == "keyword_argument" and child_text(arg.field("name")) == "action"
+                        and literal(self.syntax, arg.field("value")) == "error"
+                        for arg in call.arguments
+                    )
+                    if not is_error and in_with and (with_stmt := manager.parent().parent().parent()) is not None:
+                        is_error = any(
+                            self.syntax.call(inner).method in {"simplefilter", "filterwarnings"}
+                            and self.syntax.call(inner).arguments
+                            and literal(self.syntax, self.syntax.call(inner).arguments[0]) == "error"
+                            for inner in query(with_stmt, "call")
+                        )
+                    recognized = outcome = in_with and is_error
                 elif qualified[:2] == ("unittest", "TestCase") and len(qualified) == 3:
                     recognized = outcome = lint.assertion(call.method) and bool(call.arguments)
                     if recognized:
                         call = Call(call.name, call.arguments[1:], call.receiver)
-                elif qualified and (call.method in PYTHON_PREDICATES or call.method in {"raises", "assertTrue", "assertFalse"}):
+                elif qualified and (call.method in PYTHON_PREDICATES or call.method in {
+                        "raises", "warns", "deprecated_call", "assertTrue", "assertFalse"}):
                     recognized = outcome = False
                 else:
                     recognized, outcome = self.file.check_call(call, self.scope)
@@ -1103,9 +1221,12 @@ class Flow:
                 targets, values = children(pattern), children(value)
                 if len(targets) == len(values):
                     location = self.syntax.absolute(node)
+                    shapes = [shape(v) for v in values] if self.syntax.language == "python" and len(values) > 1 else []
                     for entry, initial in zip(targets, values):
                         if target := parts(entry):
-                            self.bindings[target].append((location, initial))
+                            repeated_eval = (bool(shapes) and shapes.count(shape(initial)) > 1
+                                             and (len(parts(initial)) >= 2 or bool(query(initial, *self.call_kinds))))
+                            self.bindings[target].append((location, None if repeated_eval else initial))
                             self.recorder_changes[target].append(location)
         return any([self.visit(child) for child in children(node)])
 
@@ -1165,6 +1286,14 @@ class Flow:
         alias = self.resolve_alias(value, site, seen | {name})
         if alias and not any(site < changed < before for key in {root[0], alias[0]}
                              for changed in self.alias_changes[key]):
+            if self.syntax.language == "python" and len(alias) >= 2:
+                pure_checks = {c.location for c in self.checks
+                               if c.kind == "assert" or c.kind.startswith(("assert", "raises", "warns", "deprecated"))}
+                for call_node, call in self.calls:
+                    call_site = self.syntax.absolute(call_node)
+                    if site < call_site < before and call_site not in pure_checks and call.method not in {
+                            "len", "bool", "str", "repr", "isinstance", "issubclass", "type", "id", "hash"}:
+                        return name
             return (*alias, *name[1:])
         return name
 
@@ -1212,6 +1341,14 @@ class Flow:
         if lhs != rhs:
             alias = self.resolve_alias(left, check.location)
             return bool(alias) and alias == self.resolve_alias(right, check.location)
+        if self.syntax.language == "python":
+            if operator in {"!=", "is not"}:
+                return not query(left, *self.call_kinds)
+            lhs_node = unwrap(left)
+            if operator in {"==", "is"} and lhs_node is not None and lhs_node.kind() == "call":
+                lcall = self.syntax.call(lhs_node)
+                if lcall.method[:1].isupper():
+                    return False
         if operator not in {"==", "is"} or not query(left, *self.call_kinds):
             return True
         at = self.file.line_at(check.location)
@@ -1661,6 +1798,7 @@ class File:
         self.helper_checks = {}
         self.pending_helpers = set()
         self.incomplete = []
+        self.setup_growth = defaultdict(list)
         self.index()
 
     def line_at(self, position):
@@ -1678,6 +1816,18 @@ class File:
                 self.function_items.append((name, node))
                 self.functions.setdefault(name, node)
         if not rust:
+            for names, node in self.function_items:
+                if names[-1] in {"setup_module", "setup_class", "setup_method", "setUp", "setUpClass"}:
+                    setup_body = body_of(node)
+                    for stmt in children(setup_body) if setup_body is not None else ():
+                        if stmt.kind() != "expression_statement":
+                            continue
+                        expr = next(iter(children(stmt)), None)
+                        if expr is not None and expr.kind() == "call":
+                            scall = self.syntax.call(expr)
+                            if scall.receiver is not None and scall.method in {"append", "add"}:
+                                if target := parts(scall.receiver):
+                                    self.setup_growth[target].append(1)
             for node in query(self.syntax.root, "class_definition"):
                 bases = node.field("superclasses")
                 if bases is not None:
@@ -2027,21 +2177,96 @@ class File:
             verifies = self.checks_in_helper(target, call.macro)
             return verifies or lint.helper(method) and not call.macro, verifies
         if method in {"check_returncode", "assert_that"} or lint.helper(method) or (
+                self.syntax.language == "python" and call.receiver is not None
+                and method in {"fnmatch_lines", "fnmatch_lines_random", "re_match_lines", "re_match_lines_random"}) or (
                 self.syntax.language == "rust" and method.startswith("debug_assert")):
             return True, True
         return False, False
 
+    def python_test_initial(self, fn):
+        parent = fn.parent()
+        if parent is None or parent.kind() != "decorated_definition":
+            return ()
+        strategies = []
+        param_values = defaultdict(list)
+        param_nodes = children(fn.field("parameters")) if fn.field("parameters") is not None else ()
+        fn_params = []
+        for entry in param_nodes:
+            pname = child_text(entry.field("name")) if entry.kind().startswith("default") else child_text(entry)
+            if pname and pname not in {"self", "cls"}:
+                fn_params.append(pname.lstrip("*"))
+        for dec in children(parent):
+            if dec.kind() != "decorator":
+                continue
+            call_node = next((c for c in children(dec) if c.kind() == "call"), None)
+            if call_node is None:
+                continue
+            dcall = self.syntax.call(call_node)
+            if dcall.method == "given":
+                pos = []
+                for arg in dcall.arguments:
+                    if arg.kind() == "keyword_argument":
+                        kname = child_text(arg.field("name"))
+                        if kname and arg.field("value") is not None:
+                            strategies.append((kname, arg.field("value")))
+                    else:
+                        pos.append(arg)
+                if pos and len(fn_params) >= len(pos):
+                    for pname, strat in zip(fn_params[-len(pos):], pos):
+                        strategies.append((pname, strat))
+            elif dcall.method == "parametrize":
+                argnames = None
+                argvalues = None
+                positional = [a for a in dcall.arguments if a.kind() != "keyword_argument"]
+                for a in dcall.arguments:
+                    if a.kind() == "keyword_argument":
+                        k = child_text(a.field("name"))
+                        if k == "argnames":
+                            argnames = a.field("value")
+                        elif k == "argvalues":
+                            argvalues = a.field("value")
+                if argnames is None and positional:
+                    argnames = positional[0]
+                if argvalues is None and len(positional) >= 2:
+                    argvalues = positional[1]
+                names_list = []
+                if argnames is not None:
+                    raw = literal(self.syntax, argnames)
+                    if isinstance(raw, str):
+                        names_list = [part.strip() for part in raw.split(",") if part.strip()]
+                    elif isinstance(raw, (list, tuple)):
+                        names_list = [str(part).strip() for part in raw if str(part).strip()]
+                if names_list and argvalues is not None and argvalues.kind() in {"list", "tuple"}:
+                    for row in children(argvalues):
+                        if row.kind() == "call" and self.syntax.call(row).method == "param":
+                            p_args = [a for a in self.syntax.call(row).arguments if a.kind() != "keyword_argument"]
+                        elif len(names_list) == 1:
+                            p_args = [row]
+                        elif row.kind() in {"list", "tuple"}:
+                            p_args = children(row)
+                        else:
+                            p_args = []
+                        if len(p_args) == len(names_list):
+                            for kname, pval in zip(names_list, p_args):
+                                param_values[kname].append(pval)
+        if param_values:
+            strategies.append(("__params__", dict(param_values)))
+        return tuple(strategies)
+
     def inventory(self):
         if self.syntax.language == "python":
+            if any(part in {"example_scripts", "plugins_integration"} for part in self.path.parts):
+                return
             for names, fn in self.function_items:
                 if not names[-1].startswith("test") or any(
                         parent.kind() in FUNCTIONS for parent in fn.ancestors()):
                     continue
                 parent = fn.parent()
                 start = offset(parent) if parent.kind() == "decorated_definition" else offset(fn)
+                initial = self.python_test_initial(fn)
                 yield self.syntax, fn, Test(names[-1], ".".join((
                     *self.path.with_suffix("").parts, *names)), line(fn), self.line_at(start),
-                    fn.range().end.line + 1, fn.range().start.column, qualified="::".join(names)), (), ()
+                    fn.range().end.line + 1, fn.range().start.column, qualified="::".join(names)), (), initial
             return
         for names, fn in self.function_items:
             if item := self.rust_test(self.syntax, fn, names):

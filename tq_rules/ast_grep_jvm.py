@@ -47,6 +47,9 @@ def node_key(node):
 
 
 def declaration_name(node):
+    if node is not None and node.kind() == "spread_parameter":
+        declarator = child(node, "variable_declarator")
+        return declaration_name(declarator) if declarator is not None else ""
     return name(node.field("name") or child(node, *IDENTIFIERS))
 
 
@@ -87,7 +90,14 @@ class Call:
     callee: object = None
 
     def callbacks(self):
-        return [arg for arg in self.args if arg.kind() in LAMBDAS]
+        result = []
+        for arg in self.args:
+            node = unwrap(arg)
+            while node is not None and node.kind() == "cast_expression":
+                node = unwrap(node.field("value") or next(reversed(children(node)), None))
+            if node is not None and node.kind() in LAMBDAS:
+                result.append(node)
+        return result
 
 
 def call_of(node):
@@ -136,16 +146,33 @@ def bind_arguments(declaration, call):
         return None
     supplied = {identifier: (value, True) for identifier, value in call.named.items()}
     positional = iter(identifier for identifier in named if identifier not in supplied)
+    spread_name = declaration_name(entries[-1]) if entries and entries[-1].kind() == "spread_parameter" else None
+    varargs = []
+    in_spread = False
     for argument in call.args:
         if any(argument is value for value in call.named.values()):
             continue
         if argument.kind() in LAMBDAS and argument.parent().kind() == "annotated_lambda":
             identifier = next(reversed(named), None)
+        elif in_spread:
+            varargs.append(argument)
+            continue
         else:
             identifier = next(positional, None)
         if identifier is None or identifier in supplied:
             return None
+        if identifier == spread_name:
+            in_spread = True
+            varargs.append(argument)
+            supplied[identifier] = None, True
+            continue
         supplied[identifier] = argument, True
+    if spread_name is not None and spread_name not in supplied:
+        if not (set(named) - {spread_name}) <= supplied.keys() | defaults.keys():
+            return None
+        supplied[spread_name] = (), True
+    elif spread_name is not None and supplied[spread_name][0] is None:
+        supplied[spread_name] = tuple(varargs), True
     if not named.keys() <= supplied.keys() | defaults.keys():
         return None
     return [(parameter, *supplied.get(identifier, (defaults.get(identifier), False)))
@@ -165,7 +192,7 @@ def read_file(path, module):
         return None
 
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=2048)
 def cached_file(path, module, modified, size):
     return File(parse_syntax(path.read_text(encoding="utf-8"), JVM_LANGUAGES[path.suffix]), path, module)
 
@@ -242,7 +269,7 @@ class File:
         self.callback_origins = None
         kotlin = syntax.language == "kotlin"
         type_kinds = ("class_declaration", "object_declaration") if kotlin else (
-            "class_declaration", "record_declaration", "enum_declaration")
+            "class_declaration", "interface_declaration", "record_declaration", "enum_declaration")
         self.types = {declaration_name(node): node for node in query(syntax.root, *type_kinds)}
         for entry in query(syntax.root, "import_header" if kotlin else "import_declaration"):
             qualified = child(entry, "identifier", "scoped_identifier")
@@ -260,7 +287,7 @@ class File:
         for entry in query(syntax.root, *(
                 ("variable_declaration", "parameter", "class_parameter")
                 if kotlin else ("variable_declarator", "formal_parameter", "spread_parameter",
-                                "enhanced_for_statement", "catch_formal_parameter"))):
+                                "enhanced_for_statement", "catch_formal_parameter", "resource"))):
             self.index_binding(entry)
 
     def resolve_name(self, identifier):
@@ -291,19 +318,36 @@ class File:
                 closest = max(offset(scope) for scope, _ in visible)
                 candidates = [fn for scope, fn in visible if offset(scope) == closest]
                 return (self, candidates[0]) if len(candidates) == 1 else None
-        if call.receiver is None and call.callbacks():
+        if call.receiver is None:
             qualified = self.imports.get(call.method)
             package, _, method = qualified.rpartition(".") if qualified else (self.package, "", call.method)
-            candidates = [(file, fn) for file in self.package_files(package)
-                          if file.path != self.path
-                          for scope, fn in file.functions.get(method, ())
-                          if node_key(scope) == node_key(file.syntax.root)
-                          and not has_modifier(fn, "private") and bind_arguments(fn, call) is not None]
+            candidates = []
+            if qualified:
+                from .ast_grep_jvm_signatures import family
+                if family(qualified) != "foreign":
+                    return None
+            if call.callbacks():
+                candidates = [(file, fn) for file in self.package_files(package)
+                              if file.path != self.path
+                              for scope, fn in file.functions.get(method, ())
+                              if node_key(scope) == node_key(file.syntax.root)
+                              and not has_modifier(fn, "private") and bind_arguments(fn, call) is not None]
+            if not candidates and qualified and (target := self.type_named(package)) is not None:
+                file, owner = target
+                candidates = [(file, fn) for scope, fn in file.functions.get(method, ())
+                              if node_key(scope) == node_key(owner) and bind_arguments(fn, call) is not None
+                              and (file is self or not has_modifier(fn, "private"))
+                              and (owner.kind() == "object_declaration"
+                                   or any(parent.kind() == "companion_object" for parent in fn.ancestors())
+                                   or file.syntax.language == "java" and has_modifier(fn, "static"))]
         elif (receiver := name(unwrap(call.receiver)))[:1].isupper() and (
-                call.callbacks() or receiver in self.imports and call.method.startswith(("assert", "check", "verify"))):
-            from .ast_grep_jvm_signatures import family
+                call.callbacks() or call.method.startswith(("assert", "check", "verify", "test", "expect"))):
+            from .ast_grep_jvm_signatures import family, signature
 
-            if not call.callbacks() and family(self.imports[receiver]) != "foreign":
+            sig_owner, _ = signature(self, call)
+            if sig_owner not in {"", "foreign"}:
+                return None
+            if not call.callbacks() and receiver in self.imports and family(self.imports[receiver]) != "foreign":
                 return None
             target = self.type_named(receiver)
             if target is None:
@@ -319,9 +363,7 @@ class File:
             return None
         return candidates[0] if len(candidates) == 1 else None
 
-    def package_files(self, package):
-        if package in self.packages:
-            return self.packages[package]
+    def package_directories(self, package):
         directories = {self.path.parent} if package == self.package else set()
         if self.module is not None:
             package_path = package.split(".") if package else ()
@@ -329,8 +371,13 @@ class File:
             for source_set in src.glob("*"):
                 for language in ("java", "kotlin"):
                     directories.add(source_set.joinpath(language, *package_path))
+        return sorted(directories)
+
+    def package_files(self, package):
+        if package in self.packages:
+            return self.packages[package]
         files = []
-        for directory in sorted(directories):
+        for directory in self.package_directories(package):
             for path in sorted(directory.iterdir()) if directory.is_dir() else ():
                 if path.suffix in JVM_LANGUAGES and path.suffix != ".kts" and not path.is_symlink():
                     file = self if path == self.path else read_file(path, self.module)
@@ -348,6 +395,20 @@ class File:
         if local is not None and (not package or package == self.package):
             return self, local
         packages = [package] if package else [self.package, *sorted(self.wildcard_imports)]
+        direct = []
+        for pkg in packages:
+            for directory in self.package_directories(pkg):
+                for suffix in (".java", ".kt"):
+                    candidate = directory / f"{short}{suffix}"
+                    if candidate.is_file() and not candidate.is_symlink():
+                        file = self if candidate == self.path else read_file(candidate, self.module)
+                        if file is not None and file.package == pkg and short in file.types and (
+                                file is self or not has_modifier(file.types[short], "private")):
+                            direct.append((file, file.types[short]))
+        if direct:
+            target = direct[0] if len(direct) == 1 else None
+            self.resolved_types[identifier] = target
+            return target
         candidates = [(file, file.types[short]) for pkg in packages
                       for file in self.package_files(pkg) if short in file.types
                       and (file is self or not has_modifier(file.types[short], "private"))]
@@ -369,6 +430,8 @@ class File:
         return None
 
     def index_binding(self, node):
+        if node.kind() == "variable_declarator" and node.parent() is not None and node.parent().kind() == "spread_parameter":
+            return
         identifier = declaration_name(node)
         if not identifier:
             return
@@ -380,6 +443,9 @@ class File:
 
     def recorder(self, node):
         node = unwrap(node)
+        while (view := call_of(node)) is not None and not view.args and view.receiver is not None and view.method in {
+                "asMap", "asList", "asSet", "entrySet", "keySet", "values"}:
+            node = unwrap(view.receiver)
         if node is None:
             return None
         receiver, identifier = member(node)
@@ -425,6 +491,9 @@ class File:
 
     def recorder_alias(self, use, scope, binding):
         source = self.initializer(binding)
+        if (view := call_of(source)) is not None and not view.args and view.receiver is not None and view.method in {
+                "asMap", "asList", "asSet", "entrySet", "keySet", "values"}:
+            source = unwrap(view.receiver)
         if not member(source)[1] or scope.kind() in CLASSES | {"source_file", "program"}:
             return None
         if offset(source) >= offset(use):
@@ -514,16 +583,27 @@ class File:
         if recorder is None or recorder.shared is not None:
             return recorder
         base = unwrap(node)
+        while (view := call_of(base)) is not None and not view.args and view.receiver is not None and view.method in {
+                "asMap", "asList", "asSet", "entrySet", "keySet", "values"}:
+            base = unwrap(view.receiver)
+        unwrapped_base = base
         while (receiver := member(base)[0]) is not None:
             base = receiver
         scope, binding = self.visible_binding(base, name(base))
-        if binding is not None and base is not None and node_key(base) == node_key(unwrap(node)):
+        if binding is not None and base is not None and unwrapped_base is not None and node_key(base) == node_key(unwrapped_base):
             alias = self.recorder_alias(base, scope, binding)
             if alias is not None:
                 return self.collection_recorder(alias)
         initialized = self.initializer(binding)
         if initialized is None or scope.kind() in CLASSES:
             return recorder
+        if initialized.kind() == "object_creation_expression":
+            created = name(initialized.field("type"))
+            created_args = child(initialized, "argument_list")
+            has_args = created_args is not None and bool(children(created_args))
+            if has_args and not created.endswith((
+                    "List", "Set", "Map", "Queue", "Deque", "Collection", "Stack", "Bag", "Multiset", "Multimap")):
+                return None
         origin = call_of(initialized)
         if origin is not None and not (origin.receiver is None and origin.method in {
                 "mutableListOf", "mutableSetOf", "mutableMapOf", "arrayListOf", "hashSetOf", "hashMapOf",
@@ -588,7 +668,7 @@ class File:
                                 slot = next(pos for pos, entry in enumerate(entries) if node_key(entry) == node_key(binding))
                                 if slot < len(call.args):
                                     return call.args[slot]
-        if self.syntax.language == "java" and binding.kind() == "variable_declarator":
+        if self.syntax.language == "java" and binding.kind() in {"variable_declarator", "resource"}:
             declaration = binding.parent()
             modifiers = child(declaration, "modifiers")
             if not immutable or modifiers is not None and any(token.kind() == "final" for token in modifiers.children()):
@@ -751,6 +831,26 @@ def completion_control(file, test, body, notes):
     return False
 
 
+def _seeded_then_drained(file, body, check_node, local_recs):
+    limit = offset(check_node)
+    call_kind = "call_expression" if file.syntax.language == "kotlin" else "method_invocation"
+    seeded, drained = set(), set()
+    for entry in query(body, call_kind):
+        if offset(entry) >= limit:
+            continue
+        call = call_of(entry)
+        if call is None or call.receiver is None:
+            continue
+        rec = file.recorder(call.receiver)
+        if rec is None or rec.identity not in local_recs:
+            continue
+        if call.method in {"add", "addAll", "put", "putAll", "offer", "push", "append"}:
+            seeded.add(rec.identity)
+        elif call.method in {"clear", "remove", "removeAll", "poll", "pop"}:
+            drained.add(rec.identity)
+    return bool(seeded & drained)
+
+
 def no_crash_test(file, test, body, checks, notes, missing, checked):
     if checks:
         return checked and all(check.no_throw for check in checks)
@@ -774,6 +874,7 @@ def no_crash_test(file, test, body, checks, notes, missing, checked):
 def parse(source, path, language, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
     from .ast_grep_catches import swallowed_assertions
     from .ast_grep_jvm_checks import compares_itself
+    from .ast_grep_jvm_signatures import defines_assertion_api
     from .ast_grep_jvm_controls import (
         analyze, answer_controls, capture_controls, shared_keys, sibling_controls, split_collection_controls,
     )
@@ -832,9 +933,10 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
                 f"The checks can all be skipped when the loop over `{expression}` runs zero times.")
         for check in checks:
             site = line(check.node)
-            if check.constant(syntax):
+            lib_under_test = bool(check.owner and defines_assertion_api(file, check.owner))
+            if not lib_under_test and check.constant(syntax):
                 test.issues.append((site, "const-truth"))
-            if compares_itself(syntax, check, test.name, line_comments, checks):
+            if not lib_under_test and compares_itself(syntax, check, test.name, line_comments, checks):
                 test.issues.append((site, "self-compare"))
             if check.disabled:
                 issue = site, "absence-no-control"
@@ -858,6 +960,10 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
                         test.issue_messages = {}
                     test.issue_messages[issue] = (
                         f"The output path is disabled by `{setting} = false`. Enable it to exercise the path checked here.")
+                    continue
+                local_recs = {recorder.identity for channel, recorder in related
+                              if channel == "size" and recorder.shared is None}
+                if local_recs and _seeded_then_drained(file, body, check.node, local_recs):
                     continue
                 if not related & (witnesses | checked_reads):
                     absences.append((index, test, site, shared_keys(related)))

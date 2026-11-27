@@ -3,9 +3,10 @@
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from functools import reduce
+import re
 
 from . import lint
-from .ast_grep import children, query, shape, unwrap
+from .ast_grep import children, offset, query, shape, unwrap
 from .ast_grep_jvm import (
     CALLS, CLASSES, FUNCTIONS, LAMBDAS, bind_arguments, body_of, call_of, child, has_safe_navigation,
     member, name, node_key,
@@ -63,6 +64,78 @@ def finish(exits, *local_exits):
                           for reason, evidence in exits.items()))
 
 
+def _platform_kind(file, condition):
+    call = call_of(unwrap(condition))
+    if call is None or call.method != "isAbsolute" or call.args or call.receiver is None:
+        return ""
+    base = unwrap(call.receiver)
+    arg = None
+    if base.kind() == "object_creation_expression" and name(base.field("type")) == "File":
+        arg = next(iter(children(child(base, "argument_list"))), None)
+    elif (factory := call_of(base)) is not None and name(factory.receiver) in {"Path", "Paths"} and factory.method in {
+            "of", "get"} and len(factory.args) == 1:
+        arg = factory.args[0]
+    text = literal(file.syntax, arg)
+    if not isinstance(text, str):
+        return ""
+    if re.match(r"^(?:[A-Za-z]:[/\\]|\\\\)", text):
+        return "windows"
+    return "unix" if text.startswith("/") else ""
+
+
+def _local_added_count(file, node, ident):
+    scope, binding = file.visible_binding(node, ident)
+    if binding is None or scope is None or scope.kind() in CLASSES:
+        return 0
+    init = file.initializer(binding)
+    if init is None or init.kind() != "object_creation_expression":
+        return 0
+    created = name(init.field("type"))
+    if not created.endswith(("List", "Set", "Queue", "Deque", "Collection")):
+        return 0
+    start, end = offset(binding), offset(node)
+    for entry in query(scope, "method_invocation"):
+        if not start < offset(entry) < end:
+            continue
+        called = call_of(entry)
+        if called is not None and name(called.receiver) == ident and called.method in {
+                "clear", "remove", "removeAll", "removeIf", "poll", "pop", "retainAll"}:
+            return 0
+    count = 0
+    for stmt in children(scope):
+        if not start < offset(stmt) < end or stmt.kind() != "expression_statement":
+            continue
+        called = call_of(next(iter(children(stmt)), None))
+        if called is not None and name(called.receiver) == ident and called.method in {"add", "offer", "push"}:
+            count += 1
+    return count
+
+
+def _guarded_equals_check(condition, positive, pos_result):
+    cond = unwrap(condition)
+    if cond is None or cond.kind() != "unary_expression" or not cond.text().lstrip().startswith("!"):
+        return False
+    inner = unwrap(cond.field("operand") or next(reversed(children(cond)), None))
+    call = call_of(inner)
+    if call is None:
+        return False
+    if call.method == "equals" and call.receiver is not None and len(call.args) == 1:
+        pair = {shape(call.receiver), shape(call.args[0])}
+    elif call.method == "equals" and name(call.receiver) == "Objects" and len(call.args) == 2:
+        pair = {shape(call.args[0]), shape(call.args[1])}
+    else:
+        return False
+    if not (pos_result.get("next", Evidence()).checked or "assertion-failure" in pos_result):
+        return False
+    for entry in query(positive, "method_invocation"):
+        asserted = call_of(entry)
+        if asserted is None:
+            continue
+        if asserted.method in {"fail", "assertEquals", "assertArrayEquals"}:
+            return True
+    return False
+
+
 def throws_assertion_error(node):
     for entry in children(node):
         call = call_of(entry)
@@ -80,7 +153,9 @@ def failure_statement(node):
     if node.kind() == "expression_statement":
         node = children(node)[0]
     call = call_of(node)
-    return (call is not None and call.method == "fail"
+    return (call is not None and (
+                call.method in {"fail", "failBecauseExceptionWasNotThrown", "failWithMessage"}
+                or call.method.startswith(("expectAssertion", "shouldHaveThrown", "shouldHaveFailed")))
             or node.kind() in {"jump_expression", "throw_statement"} and throws_assertion_error(node))
 
 
@@ -157,13 +232,26 @@ class Flow:
         self.bound = {}
         self.opaque_check = False
         self.loop_checks = {}
+        self.last_branch_positive = None
 
     def sequence(self, nodes):
         exits = NORMAL
+        platform_checked = set()
         for node in nodes:
             if "next" not in exits:
                 break
-            exits = followed_by(exits, self.visit(node))
+            os_kind = ""
+            if node is not None and node.kind() == "if_statement" and node.field("alternative") is None:
+                os_kind = _platform_kind(self.file, node.field("condition"))
+            self.last_branch_positive = None
+            step = self.visit(node)
+            if os_kind and step.get("next", Evidence()).checked is False:
+                pos_ev = self.last_branch_positive
+                if pos_ev is not None and pos_ev.get("next", Evidence()).checked:
+                    platform_checked.add(os_kind)
+                    if {"windows", "unix"} <= platform_checked and "next" in step:
+                        step["next"] = replace(step["next"], checked=True)
+            exits = followed_by(exits, step)
         return exits
 
     def record(self, check):
@@ -314,7 +402,7 @@ class Flow:
         slots = {}
         for parameter, argument, supplied in bind_arguments(declaration, call):
             origin = caller if supplied else file
-            forwarded = self.argument_binding(origin, argument)
+            forwarded = None if isinstance(argument, tuple) else self.argument_binding(origin, argument)
             slots[file.path, node_key(parameter)] = forwarded or (origin, argument, previous)
         self.bound.update(slots)
         self.file = file
@@ -343,7 +431,7 @@ class Flow:
     def callbacks(self, node, call, method, check):
         callbacks = call.callbacks()
         if method.startswith(("assertThrows", "assertFails", "shouldThrow")) or method in {
-                "assertThatThrownBy", "isThrownBy"}:
+                "assertThatThrownBy", "assertThatCode", "thenThrownBy", "thenCode", "isThrownBy"}:
             return NORMAL
         if method.startswith(("verify", "coVerify")):
             return NORMAL
@@ -351,7 +439,8 @@ class Flow:
             body = body_of(callbacks[0])
             condition = children(body)[-1] if body is not None and children(body) else None
             return self.record(collect_observations(self.file, predicate(node, condition, False)))
-        synchronous = method in SYNCHRONOUS or check is not None and (check.no_throw or method == "satisfies")
+        synchronous = (method in SYNCHRONOUS or check is not None and (check.no_throw or method == "satisfies")
+                       or method in {"consumeNextWith", "assertNext"} and self.file.syntax.language == "java")
         if not synchronous and method not in ITERATING | {"launch", "async", "allSatisfy", "anySatisfy",
                                                            "noneSatisfy"}:
             self.opaque_check |= node.parent().kind() == "function_body" or any(
@@ -367,11 +456,15 @@ class Flow:
                 callback_exits = followed_by(self.record(Check(node)), callback_exits)
             executed = followed_by(executed, callback_exits)
         if method == "assumingThat":
-            known = truth(self.file.syntax, call.args[0])
+            known = self.known_truth(call.args[0])
             return executed if known is True else alternatives(NORMAL, executed)
         if synchronous:
             return executed
         if method in ITERATING:
+            if method == "map" and node.parent() is not None and node.parent().kind() == "return_statement" and any(
+                    (inner := call_of(entry)) is not None and inner.method == "dynamicTest"
+                    for callback in callbacks for entry in query(callback, "method_invocation")):
+                return executed
             iterable = (self.known_literal(call.args[0]) if method == "repeat" and call.args
                         else self.iterable_size(self.loop_receiver(call.receiver)))
             source = self.loop_receiver(call.receiver)
@@ -430,12 +523,18 @@ class Flow:
             if binding is not None:
                 if (bound := self.bound_value(node, file, bindings)) is not None:
                     origin, argument = bound
+                    if isinstance(argument, tuple):
+                        return lint.UNKNOWN
                     return literal(origin.syntax, origin.immutable_value(unwrap(argument)) or argument)
                 node = file.stable_initializer(node, scope, binding) or node
         receiver, measurement = member(node)
         called = call_of(node)
-        if called is not None and not called.args:
-            receiver, measurement = called.receiver, called.method
+        if called is not None:
+            if not called.args:
+                receiver, measurement = called.receiver, called.method
+            elif len(called.args) == 2 and name(called.receiver) in {"Integer", "Long"} and called.method in {
+                    "getInteger", "getLong"}:
+                return self.known_literal(called.args[1], file, bindings, active)
         if measurement in {"size", "length", "count"} and receiver is not None:
             if (size := self.iterable_size(receiver, file, bindings, active)) is not None:
                 return size
@@ -452,10 +551,16 @@ class Flow:
         active = active | {key}
         if (bound := self.bound_value(node, file, bindings)) is not None:
             defining_file, value = bound
+            if isinstance(value, tuple):
+                return len(value)
             return self.iterable_size(value, defining_file, bindings, active)
         if self.sizes and (source := sized_source(file, node)) in self.sizes:
             return self.sizes[source]
         value = file.immutable_value(node) or file.local_array(node)
+        if value is None and file.syntax.language == "java" and (ident := name(node)):
+            value = file.stable_initializer(node, *file.visible_binding(node, ident))
+            if value is not None and value.kind() == "object_creation_expression":
+                value = None
         if value is not None:
             origin = call_of(value)
             if origin is not None and origin.method.startswith("mutable"):
@@ -475,6 +580,56 @@ class Flow:
             if (property_value := file.object_property(receiver, component)) is not None:
                 defining_file, value = property_value
                 return self.iterable_size(value, defining_file, bindings, active)
+        if call is not None and file.syntax.language == "java":
+            if call.method in {"parallel", "sequential", "unordered", "boxed", "map",
+                               "mapToInt", "mapToLong", "mapToDouble", "mapToObj", "sorted"} and call.receiver is not None:
+                return self.iterable_size(call.receiver, file, bindings, active)
+            if call.method in {"range", "rangeClosed"} and len(call.args) == 2 and name(call.receiver) in {
+                    "", "IntStream", "LongStream"}:
+                start = self.known_literal(call.args[0], file, bindings, active)
+                end = self.known_literal(call.args[1], file, bindings, active)
+                if type(start) is type(end) is int:
+                    return max(0, end - start + int(call.method == "rangeClosed"))
+            if call.method == "stream" and len(call.args) == 1 and name(call.receiver) == "Arrays":
+                return self.iterable_size(call.args[0], file, bindings, active)
+            if call.method == "of" and name(call.receiver) in {"Stream", "IntStream", "LongStream", "DoubleStream"} and call.args:
+                if len(call.args) == 1:
+                    inner = self.iterable_size(call.args[0], file, bindings, active)
+                    return inner if inner is not None else 1
+                return len(call.args)
+            if call.method == "asList" and name(call.receiver) == "Arrays" or (
+                    call.method == "of" and name(call.receiver) in {"List", "Set"}):
+                if len(call.args) == 1:
+                    inner = self.iterable_size(call.args[0], file, bindings, active)
+                    if inner is not None:
+                        return inner
+                return len(call.args)
+            if call.method == "getParameters" and not call.args and call.receiver is not None:
+                recv = unwrap(call.receiver)
+                recv_init = (file.immutable_value(recv)
+                             or (file.stable_initializer(recv, *file.visible_binding(recv, name(recv)))
+                                 if name(recv) else None)
+                             or recv)
+                if (ctor := call_of(recv_init)) is not None and ctor.method in {
+                        "getConstructor", "getDeclaredConstructor"}:
+                    return len(ctor.args)
+            if call.method in {"getDeclaredMethods", "getDeclaredFields"} and not call.args and call.receiver is not None:
+                target_file, recv = file, unwrap(call.receiver)
+                if recv.kind() != "class_literal" and (bound := self.bound_value(recv, file, bindings)) is not None:
+                    target_file, recv = bound[0], unwrap(bound[1])
+                if recv is not None and recv.kind() == "class_literal":
+                    cls_node = recv.field("type") or next(iter(children(recv)), None)
+                    if (target := target_file.type_named(name(cls_node))) is not None:
+                        decl_kind = "method_declaration" if call.method == "getDeclaredMethods" else "field_declaration"
+                        body_node = child(target[1], "class_body", "interface_body")
+                        count = sum(1 for entry in children(body_node) if entry.kind() == decl_kind) if body_node is not None else 0
+                        if count > 0:
+                            return count
+        if file.syntax.language == "java" and call is None and receiver is None and (ident := name(node)):
+            if (added := _local_added_count(file, node, ident)) > 0:
+                return added
+            if fixtures := java_list_fixture(file, node):
+                return len(fixtures)
         if call is not None and file.syntax.language == "kotlin":
             if call.method == "List" and call.receiver is None and call.args and call.callbacks():
                 count = self.known_literal(call.args[0], file, bindings)
@@ -554,6 +709,22 @@ class Flow:
             return argument_file, argument
         return None
 
+    def known_truth(self, condition):
+        if self.fixture_item is not None:
+            return fixture_truth(self.file, condition, *self.fixture_item)
+        known = truth(self.file.syntax, condition)
+        if known is not lint.UNKNOWN:
+            return known
+        node = unwrap(condition)
+        operator, left, right = split(node)
+        if operator:
+            lval, rval = self.known_literal(left), self.known_literal(right)
+            if lval is not lint.UNKNOWN and rval is not lint.UNKNOWN:
+                return compare(operator, lval, rval)
+            return lint.UNKNOWN
+        val = self.known_literal(node)
+        return val if type(val) is bool else lint.UNKNOWN
+
     def branch(self, node):
         if node.kind() in {"if_statement", "ternary_expression"}:
             condition = node.field("condition")
@@ -564,15 +735,25 @@ class Flow:
             condition, positive, negative = (elements + [None] * 3)[:3]
         evaluated = self.visit(condition)
         if "next" not in evaluated:
+            self.last_branch_positive = None
             return evaluated
-        known = (fixture_truth(self.file, condition, *self.fixture_item) if self.fixture_item is not None
-                 else truth(self.file.syntax, condition))
+        known = self.known_truth(condition)
         branches = []
+        pos_result = None
         if known is not False:
-            branches.append(self.visit(positive))
+            pos_result = self.visit(positive)
+            branches.append(pos_result)
+        self.last_branch_positive = pos_result if node.kind() == "if_statement" and negative is None else None
         if known is not True:
             branches.append(self.visit(negative))
-        return followed_by(evaluated, alternatives(*branches))
+        combined = followed_by(evaluated, alternatives(*branches))
+        if (negative is None and known is lint.UNKNOWN and pos_result is not None
+                and _guarded_equals_check(condition, positive, pos_result)):
+            if "next" in combined:
+                combined["next"] = replace(combined["next"], checked=True)
+            else:
+                combined["next"] = Evidence(True)
+        return combined
 
     def selection(self, node):
         if node.kind() == "when_expression":
@@ -693,8 +874,17 @@ class Flow:
 
     def try_block(self, node):
         entries = children(node)
+        resources = node.field("resources") or child(node, "resource_specification")
+        prefix = self.visit(resources) if resources is not None else NORMAL
+        if "next" not in prefix:
+            return prefix
         body = node.field("body") or child(node, "statements", "block")
         tried = self.visit(body)
+        if node.kind() == "try_with_resources_statement" and resources is not None:
+            flushed = self.flush_try_resources(node, body, resources)
+            if "next" in flushed:
+                tried = {reason: evidence.then(flushed["next"]) for reason, evidence in tried.items()}
+        tried = followed_by(prefix, tried)
         catches = [entry for entry in entries if entry.kind() in {"catch_block", "catch_clause"}]
         if catches:
             expected = self.expected_failure(body, catches)
@@ -706,6 +896,32 @@ class Flow:
         return alternatives(*(
             {reason if exit_kind == "next" else exit_kind: evidence.then(final)} for reason, evidence in tried.items() for exit_kind, final in completed.items()
         ))
+
+    def flush_try_resources(self, try_node, body, resources):
+        known = NORMAL
+        if resources is None or body is None:
+            return known
+        start, end = body.range().start.index, body.range().end.index
+        flush_path = branch_path(try_node)
+        for resource in children(resources):
+            target = resource.field("name") or next(
+                (entry for entry in children(resource) if entry.kind() in {"identifier", "field_access"}), None)
+            rec = self.file.recorder(target)
+            if rec is None:
+                continue
+            remaining = []
+            for check in self.buffered_checks.get(rec, ()):
+                pos = offset(check.node)
+                if start <= pos <= end:
+                    evidence = self.record(check)
+                    checked_path = branch_path(check.node)
+                    if checked_path != flush_path[:len(checked_path)]:
+                        evidence = alternatives(NORMAL, evidence)
+                    known = followed_by(known, evidence)
+                else:
+                    remaining.append(check)
+            self.buffered_checks[rec] = remaining
+        return known
 
     def expected_failure(self, body, catches):
         steps = children(body) if body is not None else []

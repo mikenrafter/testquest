@@ -1,7 +1,11 @@
 """Resolve framework assertion owners from JVM source bindings and imports."""
 
+from functools import lru_cache
+from pathlib import Path
+
 from .ast_grep import children, unwrap
 from .ast_grep_jvm import LAMBDAS, call_of, child, name, node_key
+from .source import project_root
 
 
 OWNERS = {
@@ -14,9 +18,13 @@ OWNERS = {
     "org.assertj.core.api.AssertionsForInterfaceTypes": "assertj",
     "org.assertj.core.api.BDDAssertions": "assertj", "org.assertj.core.api.SoftAssertions": "soft-assertj",
     "org.assertj.core.api.AutoCloseableSoftAssertions": "soft-assertj",
+    "org.assertj.core.api.BDDSoftAssertions": "soft-assertj",
+    "org.assertj.core.api.AutoCloseableBDDSoftAssertions": "soft-assertj",
     "com.google.common.truth.Truth": "truth", "com.google.common.truth.Truth8": "truth",
     "org.mockito.Mockito": "mockito", "org.mockito.BDDMockito": "mockito",
+    "org.mockito.InOrder": "mockito",
     "io.mockk": "mockk",
+    "reactor.test.StepVerifier": "stepverifier",
 }
 ASSERTION_OWNERS = {"junit4", "jupiter", "kotlin"}
 COMMON_ASSERTIONS = {"assertTrue", "assertFalse", "assertEquals", "assertNotEquals", "assertSame",
@@ -29,12 +37,59 @@ JUNIT_METHODS = {
     "kotlin": {"assertFails", "assertFailsWith", "assertIs", "assertIsNot", "assertContains",
                "assertContentEquals", "assertNotContains"},
 }
+API_SOURCE_MARKERS = {
+    "assertj": ("org/assertj/core/api/Assertions.java", "org/assertj/core/api/AbstractAssert.java"),
+    "soft-assertj": ("org/assertj/core/api/SoftAssertions.java", "org/assertj/core/api/AbstractAssert.java"),
+    "jupiter": ("org/junit/jupiter/api/Assertions.java",),
+    "junit4": ("org/junit/Assert.java", "junit/framework/Assert.java"),
+    "truth": ("com/google/common/truth/Truth.java",),
+    "soft-assertj": ("org/assertj/core/api/Assertions.java",),
+}
 
 
 def family(owner):
     if owner.startswith(("io.kotest.matchers", "io.kotest.assertions")):
         return "kotest"
-    return OWNERS.get(owner, "foreign")
+    if owner in OWNERS:
+        return OWNERS[owner]
+    if owner.startswith("org.assertj."):
+        if owner.endswith(("SoftAssertions", "BDDSoftAssertions")):
+            return "soft-assertj"
+        if owner.startswith("org.assertj.core.internal.") or owner.endswith(
+                ("Assertions", "BDDAssertions", "AssertionsForClassTypes", "AssertionsForInterfaceTypes")):
+            return "assertj"
+    if owner.startswith("com.google.common.truth.") and owner.endswith(("Truth", "Truth8")):
+        return "truth"
+    return "foreign"
+
+
+@lru_cache(maxsize=64)
+def _repo_defines_api(repo_root, owner):
+    markers = API_SOURCE_MARKERS.get(owner)
+    if not markers or repo_root is None:
+        return False
+    roots = [repo_root]
+    try:
+        for entry in repo_root.iterdir():
+            if entry.is_dir() and not entry.name.startswith("."):
+                roots.append(entry)
+    except OSError:
+        pass
+    for root in roots:
+        main_java = root / "src" / "main" / "java"
+        if any((main_java / marker).is_file() for marker in markers):
+            return True
+    return False
+
+
+def defines_assertion_api(file, owner):
+    """Return True when the scanned repository's main source defines the given assertion API."""
+    if owner not in API_SOURCE_MARKERS:
+        return False
+    if file.module is not None and _repo_defines_api(file.module, owner):
+        return True
+    repo_root = project_root(file.path, None, {".git"})
+    return repo_root != file.module and _repo_defines_api(repo_root, owner)
 
 
 def accepts(owner, method):
@@ -45,9 +100,13 @@ def accepts(owner, method):
     if owner in {"mockk", "mockito"}:
         return method.startswith(("verify", "coVerify")) or method == "confirmVerified"
     if owner in {"assertj", "soft-assertj", "truth"}:
-        return method.startswith("assertThat") or method in {
-            "then", "assertWithMessage", "assert_", "assertSoftly", "assertAll", "fail",
-        }
+        return (method.startswith("assertThat")
+                or method == "then"
+                or method in {"assertAny", "assertWithMessage", "assert_", "assertSoftly", "assertAll", "fail"}
+                or method.startswith(("thenExceptionOfType", "thenThrownBy", "thenCode", "thenNoException"))
+                or (method.startswith("then") and method.endswith("Exception")))
+    if owner == "stepverifier":
+        return method in {"create", "withVirtualTime"} or method.startswith(("expect", "verify", "consume", "assert"))
     if owner == "kotest":
         return method.startswith(("assert", "should", "fail"))
     return False
@@ -92,25 +151,48 @@ def signature(file, call):
     root = static.split(".", 1)[0]
     if name(receiver) and file.visible_binding(receiver, root)[1] is not None:
         _, binding = file.visible_binding(receiver, root)
+        declared_node = binding.field("type") or (
+            binding.parent().field("type") if binding.parent() is not None else None)
+        declared_type = declared_node.text().split("<", 1)[0] if declared_node is not None else ""
+        if declared_type:
+            owner = family(file.imports.get(declared_type, declared_type))
+            if owner in {"assertj", "soft-assertj", "mockito", "stepverifier"}:
+                return owner, call.method
+            if declared_type in {"BDDSoftAssertions", "AutoCloseableBDDSoftAssertions", "SoftAssertions",
+                                 "AutoCloseableSoftAssertions"}:
+                return "soft-assertj", call.method
+            if declared_type in {"WithAssertions", "WithBDDAssertions", "BDDAssertions"}:
+                return "assertj", call.method
         value = file.initializer(binding)
         if value is not None:
             constructor = value.field("type") if value.kind() == "object_creation_expression" else None
             called = call_of(value)
-            declared = constructor.text() if constructor is not None else called.method if called is not None else ""
-            if family(file.imports.get(declared, declared)) == "soft-assertj":
+            declared = constructor.text().split("<", 1)[0] if constructor is not None else called.method if called is not None else ""
+            owner = family(file.imports.get(declared, declared))
+            if owner == "soft-assertj" or declared in {"SoftAssertions", "AutoCloseableSoftAssertions",
+                                                      "BDDSoftAssertions", "AutoCloseableBDDSoftAssertions"}:
                 return "soft-assertj", call.method
+            if declared in {"WithAssertions", "WithBDDAssertions", "BDDAssertions"}:
+                return "assertj", call.method
+            if declared == "inOrder" or owner == "mockito":
+                return "mockito", call.method
+        if declared_type == "var" and name(receiver) in {"order", "inOrder"} and call.method.startswith("verify"):
+            return "mockito", call.method
         return ("soft-assertj" if soft_callback(file, receiver) else "foreign"), call.method
     if root in file.imports:
         qualified = file.imports[root] + static[len(root):]
         return family(qualified), call.method
-    if static.startswith(("org.", "io.", "kotlin.", "com.", "junit.")):
+    if static.startswith(("org.", "io.", "kotlin.", "com.", "junit.", "reactor.")):
         return family(static), call.method
     if soft_callback(file, receiver):
         return "soft-assertj", call.method
     if root in file.types or static == "this":
         return "foreign", call.method
     return {"Assert": "junit4", "Assertions": "jupiter", "MatcherAssert": "hamcrest",
-            "SoftAssertions": "soft-assertj", "Truth": "truth", "Mockito": "mockito"}.get(
+            "SoftAssertions": "soft-assertj", "AutoCloseableSoftAssertions": "soft-assertj",
+            "BDDSoftAssertions": "soft-assertj", "AutoCloseableBDDSoftAssertions": "soft-assertj",
+            "BDDAssertions": "assertj", "Truth": "truth", "ProtoTruth": "truth",
+            "Mockito": "mockito", "StepVerifier": "stepverifier"}.get(
                 static, ""), call.method
 
 
