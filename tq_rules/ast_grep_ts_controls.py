@@ -5,7 +5,7 @@ from .ast_grep import children, offset, query, shape, split_operands
 from .ast_grep_ts import (
     FUNCTIONS, arguments, chain, const_declaration, expression, formal_parameters, literal, name, span,
 )
-from .ast_grep_ts_effects import returned_value
+from .ast_grep_ts_effects import language_model_reference, returned_value
 from .ast_grep_ts_recorders import fixture_origin, object_member
 
 
@@ -211,3 +211,271 @@ def mock_returns(file):
                 literals.setdefault(value, set()).add(offset(node))
     file.mock_returns = candidates, literals
     return file.mock_returns
+
+
+def control_keys(file, counter, node, *, positive, supplied=None, seen=frozenset()):
+    node = expression(node)
+    if node is None or span(node) in seen:
+        return set()
+    seen = seen | {span(node)}
+    origin = projected_control(file, node, counter) or fixture_origin(file, node) or file.sibling_control(node)
+    keys = {(counter, origin)} if origin is not None else set()
+    if counter == "calls":
+        if (identity := zero_arg_fixture(file, node)) is not None:
+            keys.add(("calls", identity))
+        keys.update(("calls", identity) for identity in injected_slots(file, node))
+        return keys
+    resolved, bindings = file.fixed(node, supplied)
+    if resolved is None:
+        return keys
+    if span(resolved) != span(node):
+        return keys | control_keys(file, counter, resolved, positive=positive, supplied=bindings, seen=seen)
+    declaration, field = file.destructuring(node)
+    if field:
+        source = file.sibling_control(declaration.field("value"))
+        if source is not None:
+            keys.add((counter, ("member", source, field)))
+    if node.kind() == "yield_expression":
+        return keys | control_keys(file, counter, next(iter(children(node)), None),
+                                   positive=positive, supplied=bindings, seen=seen)
+    if (recorder := mock_calls(file, node, bindings)) is not None:
+        identity = recorder_identity(file, *recorder)
+        if positive and identity is not None:
+            keys.add(("calls", identity))
+    if node.kind() != "call_expression":
+        return keys
+    callee = expression(node.field("function"))
+    _, methods = chain(callee)
+    args = arguments(node)
+    if not methods or not args or args[0].kind() not in FUNCTIONS:
+        return keys
+    method = methods[-1]
+    receiver = callee.field("object")
+    if method == "filter":
+        source = fixture_origin(file, receiver) or file.sibling_control(receiver)
+        if source is None and (recorder := mock_calls(file, receiver, bindings)) is not None:
+            source = recorder_identity(file, *recorder)
+        if source is not None:
+            keys.add((counter, ("filter", source, filter_key(file, args[0]))))
+    if positive and method in {"map", "flatMap", "filter"}:
+        keys.update(control_keys(file, counter, receiver, positive=True, supplied=bindings, seen=seen))
+    return keys
+
+
+def filter_key(file, callback):
+    captures = []
+    for use in query(callback, "identifier"):
+        owner = file.parameter_scope(use) or file.binding(use)
+        if owner is not None and offset(owner) < offset(callback):
+            captures.append((name(use), offset(owner)))
+    return shape(callback), tuple(captures)
+
+
+def recorder_identity(file, base, members):
+    origin = fixture_origin(file, base, members)
+    if origin is not None:
+        return origin
+    detector = file.sibling_control(base)
+    for field in members:
+        if detector is None:
+            break
+        detector = "member", detector, field
+    return detector
+
+
+def zero_arg_fixture(file, node):
+    root, fields = chain(node)
+    declaration, field = file.destructuring(root)
+    if declaration is None or not field:
+        return None
+    source = expression(declaration.field("value"))
+    if source is None or source.kind() != "call_expression" or arguments(source):
+        return None
+    helper = file.helper(source.field("function"))
+    return ("fixture member", offset(helper), field, fields) if helper is not None else None
+
+
+def mock_calls(file, node, supplied):
+    base, fields = chain(node)
+    if fields[-2:] != ("mock", "calls"):
+        return None
+    base, _ = file.fixed(base, supplied)
+    if base is None:
+        return None
+    if base.kind() == "call_expression" and file.callee(base.field("function"))[1] in {
+            ("vi", "mocked"), ("jest", "mocked")}:
+        args = arguments(base)
+        base = args[0] if len(args) == 1 else None
+    return (base, fields[:-2]) if base is not None else None
+
+
+def injected_slots(file, node):
+    """Match a fresh mock by the callable and the precise argument slot receiving it."""
+    base, fields = chain(node)
+    binding = file.binding(base)
+    origin = fixture_origin(file, node)
+    if binding is None and origin is None:
+        return set()
+    if file.injections is None:
+        file.injections = injection_sites(file)
+    slots, recorders = file.injections
+    matches = set(recorders.get(origin, ()))
+    if binding is not None:
+        matches.update((identity, (*path, *fields)) for identity, path in slots.get(offset(binding), ()))
+    return matches
+
+
+def injection_sites(file):
+    slots = {}
+    fakes = {}
+    for call in query(file.syntax.root, "call_expression", "new_expression"):
+        fn = call.field("function") or call.field("constructor")
+        base, members = chain(fn)
+        if file.callee(fn)[1] in {("vi", "fn"), ("jest", "fn")}:
+            if (declaration := mock_declaration(call)) is not None:
+                fakes["fixture", offset(call)] = declaration
+            continue
+        source = file.source_imports.get(name(base))
+        target = file.binding(base)
+        if source is not None and target is None:
+            identity = source, members
+        elif target is not None and target.kind() in {"function_declaration", "class_declaration"}:
+            identity = offset(target), members
+        elif members and (receiver := file.sibling_control(base)) is not None:
+            identity = receiver, members
+        else:
+            continue
+        for position, arg in enumerate(arguments(call)):
+            arg = expression(arg)
+            if arg.kind() == "object":
+                candidates = [(entry.field("value") or entry, (name(entry.field("key") or entry),))
+                              for entry in children(arg) if entry.kind() in {"pair", "shorthand_property_identifier"}]
+            else:
+                candidates = [(arg, ())]
+            for candidate, fields in candidates:
+                if (owner := file.binding(candidate)) is not None and owner.kind() == "variable_declarator" and const_declaration(owner):
+                    slots.setdefault(offset(owner), set()).add((("injection", identity, position), fields))
+    recorders = {
+        recorder: {(identity, (*prefix, *fields)) for identity, prefix in slots.get(owner, ())}
+        for recorder, (owner, fields) in fakes.items()
+    }
+    return slots, recorders
+
+
+def mock_declaration(call):
+    fields = []
+    for parent in call.ancestors():
+        if parent.kind() == "pair":
+            fields.append(name(parent.field("key")))
+        elif parent.kind() == "variable_declarator":
+            return offset(parent), tuple(reversed(fields))
+        elif parent.kind() not in {"object", "member_expression", "call_expression"}:
+            return
+    return None
+
+
+def positive_reads(file, check):
+    """A checked index, find result, or derived request witnesses a nonempty input."""
+    expected = literal(check.expected)
+    if check.negated or not (
+        check.method in {"toBeDefined", "toBeTruthy", "toBeGreaterThan"} or
+        check.operator in {"===", "=="} and (
+            expected is not lint.UNKNOWN and expected is not None
+            or check.expected is not None and check.expected.kind() in {"object", "array"}
+        )
+    ):
+        return
+    yield from required_reads(file, check.actual)
+
+
+def required_reads(file, node, supplied=None, seen=frozenset()):
+    node, bindings = file.fixed(node, supplied)
+    if node is None or span(node) in seen:
+        return
+    seen = seen | {span(node)}
+    kind = node.kind()
+    if kind in {"member_expression", "subscript_expression"}:
+        receiver = expression(node.field("object"))
+        if kind == "subscript_expression" and type(index := literal(node.field("index"))) is int and index >= 0:
+            _, fields = chain(receiver)
+            if fields[-2:] == ("mock", "calls"):
+                yield "calls", receiver.field("object").field("object"), bindings
+            else:
+                yield "length", receiver, bindings
+        yield from required_reads(file, receiver, bindings, seen)
+    elif kind == "call_expression":
+        fn = expression(node.field("function"))
+        if name(fn.field("property")) in {"find", "at"}:
+            yield "length", fn.field("object"), bindings
+        else:
+            yield from required_reads(file, fn.field("object"), bindings, seen)
+    elif kind == "new_expression" and name(node.field("constructor")) == "Request" and file.binding(
+            node.field("constructor")) is None:
+        for arg in arguments(node)[:1]:
+            yield from required_reads(file, arg, bindings, seen)
+
+
+def supplied_prompt_part(file, subject, checks, body):
+    """The checked incremental prompt and the sent full prompt share a supplied message fixture."""
+    subject = expression(subject)
+    if subject is None or subject.kind() != "call_expression":
+        return False
+    callee = subject.field("function")
+    args = arguments(subject)
+    if name(callee.field("property")) != "filter" or len(args) != 1 or args[0].kind() not in FUNCTIONS:
+        return False
+    operator, projection, expected = split_operands(expression(returned_value(args[0])))
+    item, fields = chain(projection)
+    part = literal(expected)
+    if operator != "===" or fields != ("type",) or not isinstance(part, str) or (
+            formal_parameters(args[0]) != (name(item),)):
+        return False
+    message, fields = chain(callee.field("object"))
+    if fields != ("content",):
+        return False
+    owner = next((parent for parent in subject.ancestors() if parent.kind() == "for_in_statement"), None)
+    if owner is None or not any(child.kind() == "of" for child in owner.children()) or (
+            name(owner.field("left")) != name(message)):
+        return False
+    captured, fields = chain(owner.field("right"))
+    if not name(captured) or fields != ("prompt", "content"):
+        return False
+    binding = file.binding(captured)
+    if binding is None or binding.kind() != "variable_declarator" or not const_declaration(binding):
+        return False
+    for check in checks:
+        actual, projection = chain(check.actual)
+        if (not check.guarded and check.operator in {"===", "=="} and projection == ("incrementalPrompt",)
+                and file.recorder(actual) == file.recorder(captured)):
+            break
+    else:
+        return False
+    constructor = part.split("-")
+    method = constructor[0] + "".join(word.title() for word in constructor[1:]) + "Part"
+    prior_calls = [call for call in query(body, "call_expression")
+                   if offset(call) < offset(binding) and language_model_reference(file, call.field("function")) in {
+                       ("LanguageModel", "generateText"), ("LanguageModel", "generateObject")
+                   }]
+    if not prior_calls:
+        return False
+    call = max(prior_calls, key=offset)
+    opts = arguments(call)
+    if not opts or opts[0].kind() != "object":
+        return False
+    prompt = object_member(opts[0], "prompt")
+    if prompt is None or prompt.kind() != "call_expression" or language_model_reference(
+            file, prompt.field("function")) != ("Prompt", "fromMessages"):
+        return False
+    args = arguments(prompt)
+    if len(args) != 1:
+        return False
+    fixture, _ = file.fixed(args[0])
+    if fixture is None or fixture.kind() != "array":
+        return False
+    for entry in query(fixture, "call_expression"):
+        reference = language_model_reference(file, entry.field("function"))
+        args = arguments(entry)
+        if reference == ("Prompt", method) or (
+                reference == ("Prompt", "makePart") and args and literal(args[0]) == part):
+            return True
+    return False

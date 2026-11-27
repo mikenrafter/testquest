@@ -1,9 +1,11 @@
 """Advisories for comparisons against rendered output and implementation selectors."""
 
+from functools import lru_cache
+import os
 import re
 
 from . import lint
-from .ast_grep import children, offset, query, shape, split_operands
+from .ast_grep import children, line, offset, query, shape, split_operands
 from .ast_grep_origins import Origin
 from .ast_grep_ts import ASSERT_UNEQUAL, FUNCTIONS, arguments, chain, expression, literal, name, span
 from .ast_grep_ts_recorders import object_member
@@ -14,8 +16,13 @@ QUERY = re.compile(r"(?:get|find|query)(?:All)?By[A-Z]\w*\Z")
 CLASS_SELECTOR = re.compile(r"(?:\.[\w-]+)+\Z")
 VISIBLE_MATCHERS = {"toHaveAccessibleName", "toHaveAccessibleDescription", "toHaveRole", "toHaveTextContent",
                     "toHaveDisplayValue"}
-TEXT_PROPERTIES = {"textContent", "innerText", "innerHTML", "outerHTML"}
+TEXT_PROPERTIES = {"textContent", "innerText", "innerHTML", "outerHTML", "value"}
 DOM_SELECTORS = {"querySelector", "querySelectorAll", "getElementById", "getElementsByClassName"}
+STATE_CLASS = re.compile(r"(?:is-[\w-]+|[\w-]+-active|row-invalid|sort-(?:asc|desc)|selected|connected|dim|semi|done|tablet|[\w-]+-(?:selecting|hovering))")
+CLASS_READ = re.compile(
+    r"(?:\b(?:closest|querySelector(?:All)?|matches)(?:<[^>]+>)?\(\s*['\"`]\.([\w-]+)['\"`]"
+    r"|\bclassList\.contains\(\s*['\"`]([\w-]+)['\"`])"
+)
 EQUALITY = {"toBe", "toEqual", "toStrictEqual", "equal", "strictEqual", "deepEqual", "deepStrictEqual"}
 
 
@@ -147,7 +154,7 @@ class OutputOrigins:
             target = node.field("object")
             prop = name(node.field("property"))
             if prop == "className" or prop == "classList" and fields == ("contains",):
-                return target
+                return node
             return self.selector(target, (name(node.field("property")), *fields), seen)
         operator, left, _ = split_operands(node)
         if operator in {"??", "||"}:
@@ -184,14 +191,19 @@ def visible_element(file, check):
         return subject
     if subject is None:
         return None
-    if subject.kind() == "member_expression" and name(subject.field("property")) in TEXT_PROPERTIES:
-        return subject.field("object")
+    if subject.kind() == "member_expression":
+        prop = name(subject.field("property"))
+        receiver = subject.field("object")
+        if prop in TEXT_PROPERTIES:
+            return receiver
+        if prop in {"display", "visibility"} and name(receiver.field("property")) == "style":
+            return receiver.field("object")
     if subject.kind() != "call_expression":
         return None
     fn = subject.field("function")
     args = arguments(subject)
     method = name(fn.field("property"))
-    if method == "getAttribute" and args and literal(args[0]) in {"role", "aria-label", "aria-labelledby"}:
+    if method == "getAttribute" and args and literal(args[0]) in {"role", "aria-label", "aria-labelledby", "value", "d", "stroke"}:
         return fn.field("object")
     return subject if QUERY.fullmatch(method) and (
         method.endswith(("ByText", "ByLabelText")) or method.endswith("ByRole")
@@ -209,6 +221,10 @@ def element_key(file, node, seen=frozenset()):
             return element_key(file, value, seen | {span(node)})
         return name(node), offset(binding) if binding is not None else None
     if node.kind() == "call_expression":
+        if not arguments(node) and (target := file.helper(node.field("function"))) is not None:
+            value = return_expression(target)
+            if value is not None:
+                return element_key(file, value, seen | {span(node)})
         return (element_key(file, node.field("function"), seen),
                 tuple(shape(expression(arg)) for arg in arguments(node)))
     if node.kind() == "member_expression":
@@ -221,10 +237,107 @@ def capture(file, node):
     return (offset(initializer), field) if initializer is not None else None
 
 
+def class_names(selector, subject, expected):
+    if selector.kind() == "call_expression":
+        return literal(arguments(selector)[0]).strip(".").split(".")
+    subject = expression(subject)
+    observations = [call for call in query(subject, "call_expression") if (
+        name(call.field("function").field("property")) in {"contains", "closest"}
+    )]
+    if observations:
+        names = [literal(args[0]) for call in observations if (args := arguments(call))]
+        return [value.removeprefix(".") for value in names if isinstance(value, str)]
+    value = literal(expected)
+    return value.split() if isinstance(value, str) else []
+
+
+@lru_cache(maxsize=16)
+def product_classes(root):
+    readbacks = {}
+    if root is None:
+        return readbacks
+    for directory, folders, files in os.walk(root):
+        folders[:] = [folder for folder in folders if not folder.startswith(".") and folder not in {
+            "node_modules", "__tests__", "test", "tests", "fixtures", "dist", "coverage", "build",
+        }]
+        for filename in files:
+            path = root / directory / filename
+            if (path.suffix not in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+                    or filename.startswith(("test_", "test-")) or re.search(
+                        r"\.(?:test|spec|browser|e2e|bench)\.", filename)):
+                continue
+            try:
+                if path.stat().st_size > 512_000:
+                    continue
+                for first, second in CLASS_READ.findall(path.read_text()):
+                    readbacks.setdefault(first or second, set()).add(path.resolve())
+            except (OSError, UnicodeError):
+                continue
+    return readbacks
+
+
+def contractual_class(file, test, selector, check):
+    classes = class_names(selector, check.actual, check.expected)
+    named = set(re.findall(r"[\w-]+", test.name.casefold()))
+    if any(STATE_CLASS.fullmatch(css) or "-" in css and css in named for css in classes):
+        return True
+    if not classes:
+        return False
+    readbacks = product_classes(file.scan_root)
+    path = file.path.resolve()
+    return all(readbacks.get(css, set()) - {path} for css in classes)
+
+
+def relative_render(file, check, actual, expected):
+    if actual != expected:
+        return False
+    left = expression(check.actual)
+    right = expression(check.expected)
+    if name(right):
+        right, _ = reaching_initializer(file, right)
+    right = expression(right)
+    if right is None:
+        return False
+    if right.kind() != "template_string" and element_key(file, left) == element_key(file, right):
+        return True
+    operator, baseline, delta = split_operands(right)
+    if operator in {"+", "-"} and type(literal(delta)) in {int, float}:
+        initial, _ = reaching_initializer(file, expression(baseline))
+        return initial is not None and element_key(file, initial) == element_key(file, left)
+    return False
+
+
+def contrasted_limit(file, actual, expected, checks):
+    if actual.kind() != "call_expression" or expected.kind() != "call_expression":
+        return False
+    inputs = arguments(actual)
+    if len(inputs) < 2 or type(literal(inputs[-1])) not in {int, float}:
+        return False
+    prefix = [element_key(file, arg) for arg in inputs[:-1]]
+    if prefix != [element_key(file, arg) for arg in arguments(expected)]:
+        return False
+    callee = element_key(file, actual.field("function"))
+    limit = literal(inputs[-1])
+    for check in checks:
+        candidate = expression(check.actual)
+        if (check.guarded or check.negated or check.method not in {"toBeUndefined", "toBeNull"}
+                or candidate is None or candidate.kind() != "call_expression"
+                or element_key(file, candidate.field("function")) != callee):
+            continue
+        args = arguments(candidate)
+        if (len(args) == len(inputs) and type(other := literal(args[-1])) in {int, float} and other < limit
+                and [element_key(file, arg) for arg in args[:-1]] == prefix):
+            return True
+    return False
+
+
 def ui_issues(file, test, checks):
     origins = OutputOrigins(file)
-    semantic = {element_key(file, element) for check in checks
-                if (element := visible_element(file, check)) is not None and not check.guarded}
+    semantic = [(line(check.node), element_key(file, element)) for check in checks
+                if (element := visible_element(file, check)) is not None]
+    pinned = {element_key(file, operand) for check in checks if not check.guarded and check.operator in {"==", "==="}
+              for operand, value in ((check.actual, check.expected), (check.expected, check.actual))
+              if operand is not None and literal(value) is not lint.UNKNOWN}
     contrasted = {key for check in checks if not check.guarded and (
         check.method in ASSERT_UNEQUAL or check.negated and check.method in {"toBe", "toEqual", "toStrictEqual"})
         for operand in (check.actual, check.expected) if (key := capture(file, operand)) is not None}
@@ -236,11 +349,15 @@ def ui_issues(file, test, checks):
         root, _ = chain(expect)
         if root is not None and root.kind() == "call_expression" and file.expect_origin(root.field("function")):
             element = origins.selector(subject)
-            if element is not None and element_key(file, element) not in semantic:
-                yield check.node, "implementation-selector"
+            if element is not None and not contractual_class(file, test, element, check):
+                selected = element if element.kind() == "call_expression" else element.field("object")
+                key = element_key(file, selected)
+                if not any(other == key and abs(site - line(check.node)) <= 3 for site, other in semantic):
+                    yield check.node, "implementation-selector"
         if check.method not in EQUALITY or check.negated or check.expected is None:
             continue
-        if capture(file, check.expected) in contrasted:
+        if capture(file, check.expected) in contrasted or any(
+                element_key(file, operand) in pinned for operand in (check.actual, check.expected)):
             continue
         expected = origins.origin(check.expected)
         actual = origins.origin(subject)
@@ -250,9 +367,11 @@ def ui_issues(file, test, checks):
         if expected.kind == "production":
             left, right = expression(check.actual), expression(check.expected)
             if (left.kind() == right.kind() == "call_expression" and actual.value[0] == expected.value[0]
-                    and actual.value[1] != expected.value[1] and not describes_relation):
+                    and actual.value[1] != expected.value[1] and not describes_relation
+                    and not contrasted_limit(file, left, right, checks)):
                 yield check.node, "self-derived-expected"
-        elif expected == actual and (not describes_relation or template_or_calculation(file, check.expected)):
+        elif expected == actual and not relative_render(file, check, actual, expected) and (
+                not describes_relation or template_or_calculation(file, check.expected)):
             yield check.node, "self-derived-expected"
 
 

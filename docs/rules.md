@@ -254,7 +254,7 @@ def test_encode_order():
 
 ### `self-derived-expected`
 
-Flags an equality check whose expected value comes from production code or its rendered output. The TypeScript check follows a rendered value through local bindings and helpers. A same-test inequality on the captured value can establish that another render produces different output. A loose bound on a rendered number still leaves that number under the application's control.
+Flags an equality check whose expected value comes from production code or its rendered output. The TypeScript check follows a rendered value through local bindings and helpers. A literal or fixture value pinned elsewhere in the same test can supply an independent expected value. A same-test inequality on the captured value can establish that another render produces different output. A loose bound on a rendered number still leaves that number under the application's control.
 
 **Why it can pass on broken code.** If the shared helper has a bug, both sides of the assertion produce the same wrong value and the test passes.
 
@@ -280,7 +280,7 @@ def test_total_cents():
 
 ### `implementation-selector`
 
-The ast-grep engine flags a TypeScript or JavaScript assertion on a CSS class or a class-only DOM selector when the same test has no role, label, or visible-text check on that element. For example, replace `expect(document.querySelector(".status-active")).toBeTruthy()` with `expect(screen.getByRole("status")).toHaveTextContent("Active")` when the status text is the behavior under test.
+The ast-grep engine flags a TypeScript or JavaScript assertion that relies on a CSS class or class-only selector. Product code that reads the class back, recognized state classes, and nearby role, label, text, or value checks on the same element can establish a contract. For a visible status, use `expect(screen.getByRole("status")).toHaveTextContent("Active")` to pin the text.
 
 Use an allow note when the CSS class itself is a contract, such as a class exposed to consumers of a component library.
 

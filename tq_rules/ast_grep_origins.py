@@ -1,6 +1,8 @@
 """Reaching definitions and value facts for simple local control flow."""
 
+import ast
 from dataclasses import dataclass, field
+import json
 
 from . import lint
 from .ast_grep import CALLS, SCOPES, children, offset, parts, query, unwrap
@@ -384,6 +386,103 @@ def stage_helpers(file, scope):
         args = [name_of(parameter.field("pattern") or parameter) for parameter in children(parameters)]
         return function, args, direct_return(function.field("body"))
     return resolve
+
+
+def oracle_projection(facts, node, site):
+    """Identify the projection of one captured invocation at an assertion."""
+    node = unwrap(node)
+    fields = []
+    while node is not None:
+        kind = node.kind()
+        if kind in {"attribute", "field_expression"}:
+            field = node.field("attribute") or node.field("field")
+            if field is None:
+                return None
+            fields.append(("field", field.text()))
+            node = node.field("object") or node.field("value")
+        elif kind in {"subscript", "index_expression"}:
+            operands = children(node)
+            if len(operands) != 2:
+                return None
+            value = facts.literal(facts.syntax, operands[1])
+            if value is lint.UNKNOWN:
+                return None
+            fields.append(("index", lint.literal_key(value)))
+            node = operands[0]
+        elif kind == "reference_expression":
+            node = node.field("value")
+        elif kind in CALLS:
+            callee, receiver, args = facts.call(node)
+            if callee[-1:] != ("len",):
+                break
+            if receiver is not None and not args:
+                node = receiver
+            elif receiver is None and len(args) == 1:
+                node = args[0]
+            else:
+                return None
+            fields.append(("len",))
+        else:
+            break
+        node = unwrap(node)
+    origin = facts.eventual_origin(node, site) if node is not None else None
+    return (origin, tuple(reversed(fields))) if origin is not None and origin.kind in {"product", "tuple-member"} else None
+
+
+def oracle_pins(facts, checks):
+    pins = set()
+    for check in checks:
+        if check.guarded:
+            continue
+        if check.operator == "==":
+            for subject, expected in ((check.left, check.right), (check.right, check.left)):
+                if (key := oracle_projection(facts, subject, check.location)) is None:
+                    continue
+                pin = facts.eventual_origin(expected, check.location)
+                if pin is not None and pin.kind == "literal":
+                    pins.add(key)
+                elif fixture_literal(facts.syntax, expected):
+                    pins.add(key)
+        elif check.predicate is not None and check.predicate.kind() in CALLS:
+            name, receiver, args = facts.call(check.predicate)
+            if name[-1:] == ("is_empty",) and receiver is not None and not args:
+                if (key := oracle_projection(facts, receiver, check.location)) is not None:
+                    pins.add((key[0], (*key[1], ("len",))))
+    return pins
+
+
+def fixture_literal(syntax, node):
+    if node is None:
+        return False
+    if syntax.language == "python" and node.kind() in {"string", "dictionary"}:
+        try:
+            ast.literal_eval(node.text())
+        except (SyntaxError, ValueError):
+            return False
+        return True
+    if node.kind() != "macro_invocation":
+        return False
+    macro = parts(node.field("macro"))
+    if macro not in {("json",), ("serde_json", "json")}:
+        return False
+    body = next((child for child in children(node) if child.kind() == "token_tree"), None)
+    if body is None:
+        return False
+    try:
+        json.loads(body.text()[1:-1])
+    except ValueError:
+        return False
+    return True
+
+
+def pinned_oracle(facts, check, pins):
+    for operand in (check.left, check.right):
+        projection = oracle_projection(facts, operand, check.location)
+        if projection is not None:
+            origin, fields = projection
+            if any((origin, fields[:length]) in pins for length in range(len(fields) + 1)):
+                return True
+    return False
 
 
 def same_product(facts, check):

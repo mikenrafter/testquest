@@ -281,6 +281,7 @@ class File:
         self.hook_values = None
         self.writes = None
         self.mock_returns = None
+        self.injections = None
         self.helper_summaries = {}
         self.namespace_imports = set()
         self.bindings = defaultdict(list)
@@ -517,7 +518,7 @@ class File:
         if node is None:
             return None
         kind = node.kind()
-        if kind == "await_expression":
+        if kind in {"await_expression", "yield_expression"}:
             return self.sibling_control(next(iter(children(node)), None), seen)
         if kind == "member_expression":
             root = self.sibling_control(node.field("object"), seen)
@@ -528,8 +529,11 @@ class File:
             _, names = self.callee(callee)
             if names in {("vi", "spyOn"), ("jest", "spyOn")} and len(args) >= 2:
                 method = literal(args[1])
-                if name(args[0]) in self.namespace_imports and isinstance(method, str):
-                    return "spy", name(args[0]), method
+                base = name(args[0])
+                if (base in self.namespace_imports | {"console", "window"}
+                        and self.binding(args[0]) is None and self.parameter_scope(args[0]) is None
+                        and isinstance(method, str)):
+                    return "spy", base, method
                 return None
             if names in {("vi", "fn"), ("jest", "fn")}:
                 return None
@@ -537,6 +541,8 @@ class File:
             if method.startswith("mock") and member(callee, method):
                 return self.sibling_control(callee.field("object"), seen)
             detector = self.sibling_control(callee, seen)
+            if detector is None and (helper := self.helper(callee)) is not None:
+                detector = "helper", offset(helper)
             if method in {"querySelectorAll", "getElementsByClassName", "qa", "pw"}:
                 selector = literal(args[-1]) if args else None
                 return ("selector", detector or shape(callee), selector) if isinstance(selector, str) else None
@@ -550,6 +556,10 @@ class File:
         if not name(node):
             return None
         binding = self.binding(node)
+        if self.parameter_scope(node) is not None:
+            return None
+        if binding is None and name(node) in self.source_imports:
+            return "import", self.source_imports[name(node)]
         if (alias := self.recorder_alias(node)) is not None:
             source, key = alias
             root = self.sibling_control(source, seen)
@@ -858,7 +868,12 @@ class File:
         root, _ = chain(callee)
         source, names = self.callee(callee)
         binding = self.binding(root)
-        if self.parameter_scope(root) is not None or name(root) in self.source_imports:
+        if self.parameter_scope(root) is not None:
+            return "", ()
+        if name(root) in self.source_imports:
+            source, imported = self.source_imports[name(root)]
+            if source == "@effect/vitest/utils" and binding is None:
+                return source, (*imported, *chain(callee)[1])
             return "", ()
         if binding is not None and (binding.kind() != "variable_declarator"
                                     or self.require(binding.field("value"))[0] != source or not source):
@@ -885,6 +900,10 @@ class File:
                 return method
         if names and source in {"chai", "vitest", "vite-plus/test", "@alchemy.run/test", "@effect/vitest"} and names[0] in {"assert", "should"}:
             return names[-1] if names != ("should",) else None
+        if source == "@effect/vitest/utils" and len(names) == 1:
+            method = {"assertTrue": "isTrue", "assertFalse": "isFalse"}.get(names[0], names[0])
+            if method in CONTEXT_CHECKS | {"assertDefined", "assertNone", "assertSome"}:
+                return method
         if names in {("expect", "assertions"), ("expect", "hasAssertions"), ("expect", "fail")}:
             return names[-1]
         if names and source == "fast-check" and names[-1] == "assert":
@@ -1127,7 +1146,9 @@ def no_crash_test(flow, test, notes):
 def parse(source, path, language, *, scan_root=None, inventory=False, observe=None):
     from .ast_grep_catches import swallowed_assertions
     from .ast_grep_ts_flow import Flow
-    from .ast_grep_ts_controls import projected_control, returned_mock_control
+    from .ast_grep_ts_controls import (
+        control_keys, positive_reads, returned_mock_control, supplied_prompt_part,
+    )
     from .ast_grep_ts_navigation import navigation_issues
     from .ast_grep_ts_recorders import fixture_origin
     from .ast_grep_ts_ui import ui_issues
@@ -1161,6 +1182,7 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
             test.body_hash = hashlib.sha256(repr(shape(body)).encode()).hexdigest()
         witnesses = set()
         groups = set()
+        extra_witnesses = set()
         absences = []
         for check in flow.checks:
             site = line(check.node)
@@ -1177,12 +1199,17 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
                     witnesses.add(("length", file.recorder(indexed)))
                     if (group := file.control_group(indexed, calls=False)) is not None:
                         groups.add(("length", group))
+            if not check.guarded:
+                for witness_counter, witness, bindings in positive_reads(file, check):
+                    witnesses.add((witness_counter, file.recorder(witness)))
+                    keys = control_keys(file, witness_counter, witness, positive=True, supplied=bindings)
+                    extra_witnesses.update(keys)
+                    if not test.conditional:
+                        sibling_witnesses.update(keys)
             if presence is None:
                 continue
             local = counter, file.recorder(subject)
-            sibling = (projected_control(file, subject, counter) or fixture_origin(file, subject)
-                       or file.sibling_control(subject))
-            sibling = (counter, sibling) if sibling is not None else None
+            siblings = control_keys(file, counter, subject, positive=presence)
             group = file.control_group(subject, calls=counter == "calls")
             if presence is True and not check.guarded:
                 if counter == "calls" and (collection := file.indexed_collection(subject)) is not None:
@@ -1190,18 +1217,21 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
                     if not test.conditional and (origin := fixture_origin(file, collection)) is not None:
                         sibling_witnesses.add(("length", origin))
                 witnesses.add(local)
-                if sibling is not None and not test.conditional:
-                    sibling_witnesses.add(sibling)
+                extra_witnesses.update(siblings)
+                if not test.conditional:
+                    sibling_witnesses.update(siblings)
                 if group is not None:
                     groups.add((counter, group))
             elif presence is False:
-                absences.append((local, sibling, group, site, subject, check))
-        for local, sibling, group, site, subject, check in absences:
-            if (local not in witnesses and (group is None or (local[0], group) not in groups)
-                    and not (local[0] == "calls" and returned_mock_control(file, subject, check, flow.checks))):
-                test_absences.append((test, sibling, site))
-    for test, sibling, site in test_absences:
-        if sibling not in sibling_witnesses:
+                absences.append((local, siblings, group, site, subject, check))
+        for local, siblings, group, site, subject, check in absences:
+            if (local not in witnesses and not siblings.intersection(extra_witnesses)
+                    and (group is None or (local[0], group) not in groups)
+                    and not (local[0] == "calls" and returned_mock_control(file, subject, check, flow.checks))
+                    and not (local[0] == "length" and supplied_prompt_part(file, subject, flow.checks, body))):
+                test_absences.append((test, siblings, site))
+    for test, siblings, site in test_absences:
+        if not siblings.intersection(sibling_witnesses):
             test.issues.append((site, "absence-no-control"))
     if observe is not None:
         observe(path, tests, syntax_errors(syntax.root, missing=True), [])

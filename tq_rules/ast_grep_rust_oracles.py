@@ -6,7 +6,7 @@ import re
 from . import lint
 from .ast_grep import CALLS, children, namespace, parts, query, shape, unwrap
 from .ast_grep_lint import direct_statements, literal
-from .ast_grep_origins import name_of
+from .ast_grep_origins import name_of, pinned_oracle
 
 
 IMPORT_FREE = re.compile(r"\s*function\s+\{\}\(\)\s*\{\{\s*(?:\{\}\(\);\s*)?\}\}\s*")
@@ -239,11 +239,12 @@ class Oracles:
             supplied.kind == "empty" or supplied.kind == "import-free" and IMPORT_FIELDS.intersection(first.projections)
         )
 
-    def issues(self):
+    def issues(self, projection_pins):
         comparisons = [(check, *self.observations(check)) for check in self.flow.checks if check.operator == "=="]
         pins = {result for check, first, second in comparisons if not check.guarded
                 for result, pin in ((first, second), (second, first))
                 if isinstance(result, Result) and isinstance(pin, Input) and pin.kind in {"literal", "empty"}}
         for check, first, second in comparisons:
-            if self.duplicate_call(check) or self.coupled(check, first, second, pins):
+            if (self.duplicate_call(check) or self.coupled(check, first, second, pins)) and (
+                    not projection_pins or not pinned_oracle(self.facts, check, projection_pins)):
                 yield check.location

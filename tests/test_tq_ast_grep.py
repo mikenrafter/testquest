@@ -560,3 +560,36 @@ class AstGrepLint(TqCase):
             }
         """)
         self.assertEqual(self.lint_rows(path.name), [(20, "guarded-assert")])
+
+    def test_same_test_pins_the_derived_expected_projection(self):
+        # WHY: entrypoint pins emptiness after parity, and workq pins the restored text before comparing.
+        # catches: overlooking a neighboring pin, or treating an unrelated field as the pin
+        rust = self.write("entry.rs", """
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn empty_inputs() {
+                    let ep = detect_entrypoints(&[]);
+                    let ei = detect_entrypoints_ir(&[]);
+                    assert_eq!(ep.len(), ei.len());
+                    assert!(ep.is_empty());
+                }
+            }
+        """)
+        python = self.write("test_restore.py", """
+            from workq.restore import decode, inspect
+
+            def test_restore():
+                result = inspect("fixture")
+                restored = decode("fixture")
+                assert result["changes"] == "workq done 1"
+                assert restored["changes"] == result["changes"]
+
+            def test_unpinned():
+                result = inspect("fixture")
+                restored = decode("fixture")
+                assert result["count"] == 1
+                assert restored["changes"] == result["changes"]
+        """)
+        self.assertEqual(self.lint_rows(rust.name), [])
+        self.assertEqual(self.lint_rows(python.name), [(13, "self-derived-expected")])

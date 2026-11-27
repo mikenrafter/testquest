@@ -2,7 +2,7 @@
 
 import re
 
-from .ast_grep_ts_effects import effect_program, effect_reference
+from .ast_grep_ts_effects import effect_program, effect_reference, returned_value
 from .ast_grep_ts_imports import imported_helper
 
 from . import lint
@@ -54,6 +54,7 @@ class Flow:
         self.runs_effect = runs_effect or offset(callback) in file.effect_callbacks
         self.checks = []
         self.references = None
+        self.defined = {}
 
     def sequence(self, nodes, conditional=False, catches=False):
         remaining = NEXT
@@ -101,7 +102,9 @@ class Flow:
                     and right.text() == "undefined" and consequent.kind() == "throw_statement"
                     and shape(left) == shape(next(iter(children(consequent)), None))):
                 return followed_by(leading, self.record(Check(node, "throw"), conditional))
-            known = self.condition(condition)
+            known = self.find_condition(condition)
+            if known is lint.UNKNOWN:
+                known = self.condition(condition)
             if known is not lint.UNKNOWN:
                 branch = consequent if known else alternate
                 return followed_by(leading, self.visit(branch, conditional, catches))
@@ -197,6 +200,12 @@ class Flow:
         result = self.sequence([callee, *args], conditional, catches)
         optional = self.optional(node)
         guarded = conditional or optional
+        if self.file.assertion_call(callee, self.context) == "assertDefined" and (
+                self.file.assertion_target(callee)[0] == "@effect/vitest/utils"):
+            binding = self.file.binding(args[0]) if len(args) == 1 else None
+            if binding is not None and not guarded and not catches:
+                self.defined[offset(binding)] = offset(node)
+            return result
         if (check := self.file.check(node, self.context)) is not None:
             detached = check.asynchronous and not self.completed(node)
             coverage = self.record(check, guarded, optional or detached)
@@ -302,6 +311,36 @@ class Flow:
                         del self.checks[count:]
         return result
 
+    def find_condition(self, condition):
+        operator, left, right = split_operands(expression(condition))
+        if operator not in {"===", "!=="}:
+            return lint.UNKNOWN
+        value = literal(right)
+        base, fields = chain(left)
+        binding = self.file.binding(base)
+        if not fields or not isinstance(value, str) or binding is None or binding.kind() != "variable_declarator":
+            return lint.UNKNOWN
+        defined = self.defined.get(offset(binding))
+        if defined is None or defined >= offset(condition):
+            return lint.UNKNOWN
+        if any(offset(binding) < offset(write) < offset(condition) and
+               same(self.file.binding(chain(write.field("left") or write.field("argument"))[0]), binding)
+               for write in query(self.body, "assignment_expression", "augmented_assignment_expression",
+                                  "update_expression")):
+            return lint.UNKNOWN
+        call = expression(binding.field("value"))
+        if call is None or call.kind() != "call_expression" or name(call.field("function").field("property")) != "find":
+            return lint.UNKNOWN
+        args = arguments(call)
+        if len(args) != 1 or args[0].kind() not in FUNCTIONS:
+            return lint.UNKNOWN
+        predicate, first, second = split_operands(expression(returned_value(args[0])))
+        receiver, selected = chain(first)
+        if predicate == "===" and selected == fields and formal_parameters(args[0]) == (name(receiver),):
+            if literal(second) == value:
+                return operator == "==="
+        return lint.UNKNOWN
+
     def condition(self, node):
         node = expression(node)
         known = truth(node)
@@ -333,6 +372,13 @@ class Flow:
 
     def run_effect_program(self, program, conditional, catches):
         if program.kind() == "call_expression":
+            if effect_reference(self.file, program.field("function")) == ("Deferred", "await"):
+                parent = program.parent()
+                if parent.kind() == "yield_expression" and parent.parent().kind() == "expression_statement":
+                    statement = parent.parent()
+                    if same(statement.parent(), self.body) and same(statement, children(self.body)[-1]):
+                        return self.record(Check(program, "deferred await"), conditional)
+                return NEXT
             return THROW if catches else self.record(Check(program, "fail"), conditional)
         return self.invoke(program, conditional, catches, detached=False, runs_effect=True)
 

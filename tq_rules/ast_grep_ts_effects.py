@@ -1,8 +1,9 @@
 """Follow Effect programs when a test returns, awaits or yields their execution."""
 
-from .ast_grep import children, offset
+from .ast_grep import children, offset, query
 from .ast_grep_ts import FUNCTIONS, arguments, chain, expression, formal_parameters, literal, name, span
 from .ast_grep_ts_imports import imported_helper
+from .ast_grep_ts_recorders import object_member
 
 
 # These wrappers retain the input Effect and propagate its failures.
@@ -18,7 +19,7 @@ def effect_reference(file, node):
         return ()
     if source in {"effect", "effect/Function"}:
         return (*imported, *members)
-    if source in {"effect/Effect", "effect/Predicate"}:
+    if source in {"effect/Effect", "effect/Predicate", "effect/Deferred"}:
         return (source.split("/")[-1], *imported, *members)
     return ()
 
@@ -62,8 +63,12 @@ def effect_program(file, node, supplied, *, runtime=False, seen=frozenset()):
         if reference in {("Effect", "sync"), ("Effect", "promise"), ("Effect", "tryPromise")} and args:
             if (callback := expression(args[0])) is not None and callback.kind() in FUNCTIONS:
                 return callback
-        if reference == ("Effect", "fail"):
+        if reference in {("Effect", "fail"), ("Deferred", "await")}:
+            if reference == ("Deferred", "await") and len(args) != 1:
+                return None
             return node
+        if args and sql_transaction(file, fn):
+            return effect_program(file, args[0], supplied, seen=seen)
         if reference[:1] == ("Effect",) and len(reference) == 2 and reference[1] in WRAPPERS and args:
             return effect_program(file, args[0], supplied, seen=seen)
         if reference == ("pipe",) and args:
@@ -99,10 +104,97 @@ def effect_function(file, node):
     return None
 
 
+def sql_transaction(file, fn):
+    if fn is None or name(fn.field("property")) != "withTransaction":
+        return False
+    receiver = fn.field("object")
+    binding = file.binding(receiver)
+    if binding is None or binding.kind() != "variable_declarator":
+        return False
+    value = expression(binding.field("value"))
+    if value is None or value.kind() != "yield_expression":
+        return False
+    client = expression(next(iter(children(value)), None))
+    if client is None:
+        return False
+    if client.kind() == "call_expression":
+        client = client.field("function").field("object")
+    source, _ = file.source_imports.get(name(client), ("", ()))
+    if source.startswith(("effect/sql/", "effect/unstable/sql/")):
+        return True
+    declaration, _ = file.destructuring(client)
+    if declaration is None or declaration.field("value") is None:
+        return False
+    initializer = expression(declaration.field("value"))
+    if initializer.kind() != "yield_expression":
+        return False
+    return any(
+        call.field("function").kind() == "import" and len(args := arguments(call)) == 1
+        and isinstance(package := literal(args[0]), str) and package.startswith("@effect/sql-")
+        for call in query(initializer, "call_expression")
+    )
+
+
+def language_model_reference(file, node):
+    base, members = chain(node)
+    if file.binding(base) is not None or file.parameter_scope(base) is not None:
+        return ()
+    source, imported = file.source_imports.get(name(base), ("", ()))
+    return (*imported, *members) if source == "effect/ai" else ()
+
+
+def provider_callback(file, source, operators, supplied):
+    if source.kind() != "call_expression":
+        return None
+    operation = language_model_reference(file, source.field("function"))
+    if operation not in {("LanguageModel", "generateText"), ("LanguageModel", "generateObject")}:
+        return None
+    for operator in reversed(operators):
+        if operator.kind() != "call_expression" or len(args := arguments(operator)) != 1:
+            continue
+        imported = imported_helper(file, operator.field("function"))
+        if imported is None or imported[0] is None:
+            continue
+        module, wrapper = imported
+        if wrapper is None or wrapper.kind() != "call_expression" or (
+                effect_reference(module, wrapper.field("function")) != ("dual",)):
+            continue
+        definition = arguments(wrapper)
+        if len(definition) != 2 or definition[1].kind() not in FUNCTIONS:
+            continue
+        body = returned_value(definition[1])
+        parameters = formal_parameters(definition[1])
+        if body is None or body.kind() != "call_expression" or len(parameters) != 2 or (
+                effect_reference(module, body.field("function")) != ("Effect", "provideServiceEffect")):
+            continue
+        service = arguments(body)
+        if len(service) != 3 or name(service[0]) != parameters[0] or (
+                language_model_reference(module, service[1]) != ("LanguageModel", "LanguageModel")):
+            continue
+        model = service[2]
+        if model.kind() != "call_expression" or (
+                language_model_reference(module, model.field("function")) != ("LanguageModel", "make")):
+            continue
+        fields = arguments(model)
+        fake = object_member(fields[0], "generateText") if fields and fields[0].kind() == "object" else None
+        if fake is None or fake.kind() not in FUNCTIONS:
+            continue
+        calls = query(fake.field("body"), "call_expression")
+        if not any((name(base), members) == (parameters[1], ("generateText",))
+                   for call in calls for base, members in [chain(call.field("function"))]):
+            continue
+        options, _ = file.fixed(args[0], supplied)
+        callback = object_member(options, "generateText") if options is not None and options.kind() == "object" else None
+        return callback if callback is not None and callback.kind() in FUNCTIONS else None
+    return None
+
+
 def piped_program(file, source, operators, supplied, seen):
     if all(preserves_effect(file, operator) for operator in operators):
         if (program := effect_program(file, source, supplied, seen=seen)) is not None:
             return program
+        if (callback := provider_callback(file, source, operators, supplied)) is not None:
+            return callback
     for operator in reversed(operators):
         if operator.kind() == "call_expression":
             args = arguments(operator)

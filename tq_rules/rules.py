@@ -495,7 +495,7 @@ RULES = {
     ),
     "self-derived-expected": Rule(
         "The expected value comes from production code or an observation of its output.",
-        "The test checks repeatability, a before-and-after observation, or a declared relation between different inputs or entry points.",
+        "The test pins a compared value independently or checks a declared relation between inputs, entry points, or observations.",
         Recipe(
             (
                 "Work out the expected value from the specification, a trusted fixture, or an independent calculation.",
@@ -558,7 +558,7 @@ RULES = {
                 "ts": ("""
                     test("shows the active status", () => {
                       mountStatus();
-                      expect(document.querySelector(".status-active")).toBeTruthy();
+                      expect(document.querySelector(".status-chip")).toBeTruthy();
                     });
                     """, """
                     import { screen } from "@testing-library/react";

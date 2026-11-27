@@ -2292,7 +2292,9 @@ def no_crash_test(flow, test, comments, missing):
 
 def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
     from .ast_grep_catches import swallowed_assertions
-    from .ast_grep_origins import ReachingFacts, different_python_products, same_product, stage_helpers
+    from .ast_grep_origins import (
+        ReachingFacts, different_python_products, oracle_pins, pinned_oracle, same_product, stage_helpers,
+    )
     from . import ast_grep_literals as literals
     from .ast_grep_languages import ECMASCRIPT_LANGUAGES, JVM_LANGUAGES
 
@@ -2356,12 +2358,15 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
         if not (should_panic or ignored):
             missing = not flow.verifies_outcome(test.name)
             lint.record_completion(test, missing, no_crash_test(flow, test, comments, missing))
+        pins = oracle_pins(flow.reaching_facts, flow.checks) if syntax.language in {"python", "rust"} else set()
         for check in flow.checks:
             check_line = file.line_at(check.location)
             if check.truth(lambda node: flow.reaching_facts.branch_boolean(node, check.location)) is True:
                 test.issues.append((check_line, "const-truth"))
             compares_itself = flow.compares_itself(check, test.name, line_comments)
             if check.operator == "==" and not compares_itself and (
+                not pins or not pinned_oracle(flow.reaching_facts, check, pins)
+            ) and (
                 same_product(flow.reaching_facts, check)
                 or syntax.language == "python" and different_python_products(file, flow, check)
             ):
@@ -2371,7 +2376,7 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
         if file.syntax.language == "rust":
             from .ast_grep_rust_oracles import Oracles
 
-            test.issues.extend((file.line_at(site), "self-derived-expected") for site in Oracles(file, flow).issues())
+            test.issues.extend((file.line_at(site), "self-derived-expected") for site in Oracles(file, flow).issues(pins))
         if not ignored:
             control_helpers.update(target for _, call in flow.calls if not call.macro
                                    and (target := file.resolve_function(call.name, flow.scope)) is not None)

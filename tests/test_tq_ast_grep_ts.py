@@ -683,3 +683,158 @@ class AstGrepTypeScript(TqCase):
         self.assertEqual(self.locations(path.name), [
             (line, "self-derived-expected") for line in (35, 36, 45)
         ])
+
+    def test_extended_absence_witnesses(self):
+        # WHY: logging uses separate console.info spies, and httpLayer checks a later request.
+        # catches: splitting a global target or overlooking the call needed for a checked property
+        path = self.write("controls.test.ts", """
+            it("does not log by default", () => {
+              const info = vi.spyOn(console, "info").mockImplementation(() => {});
+              expect(info).not.toHaveBeenCalled();
+            });
+            it("logs when enabled", () => {
+              const info = vi.spyOn(console, "info").mockImplementation(() => {});
+              expect(info).toHaveBeenCalled();
+            });
+            it("waits for the token", () => {
+              const fetchMock = vi.fn();
+              const unrelated = vi.fn();
+              expect(fetchMock).not.toHaveBeenCalled();
+              expect(unrelated).not.toHaveBeenCalled();
+              const request = new Request(fetchMock.mock.calls[0]?.[0]);
+              expect(request.headers.get("authorization")).toBe("Bearer token");
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(13, "absence-no-control")])
+
+    def test_effect_transaction_and_deferred_are_executed_checks(self):
+        # WHY: SQLite checks run inside the transaction, and a continuation must release its latch.
+        # catches: counting only top-level checks, or crediting an Effect that was never run
+        path = self.write("effect-runtime.test.ts", """
+            import { Deferred, Effect } from "effect";
+            import { it } from "@effect/vitest";
+            import { SqlClient } from "effect/unstable/sql/SqlClient";
+            it.effect("checks the transaction", () => Effect.gen(function* () {
+              const client = yield* SqlClient;
+              yield* client.withTransaction(Effect.gen(function* () {
+                expect(yield* read()).toBe(3);
+              }));
+            }));
+            it.effect("waits for the continuation to clear", () => Effect.gen(function* () {
+              const cleared = yield* Deferred.make();
+              yield* start(() => Deferred.succeed(cleared, undefined));
+              yield* Deferred.await(cleared);
+            }));
+            it.effect("does not wait", () => Effect.gen(function* () {
+              const cleared = yield* Deferred.make();
+              Deferred.await(cleared);
+            }));
+        """)
+        self.assertEqual(self.locations(path.name), [(15, "no-assert")])
+
+    def test_defined_find_proves_the_same_role_guard(self):
+        # WHY: streamText asserts existence of the exact role it filtered before narrowing.
+        # catches: crediting a different discriminant or leaving a proven guard conditional
+        path = self.write("roles.test.ts", """
+            import { assertDefined, strictEqual } from "@effect/vitest/utils";
+            it("checks the assistant parts", () => {
+              const assistant = captured.find(msg => msg.role === "assistant");
+              assertDefined(assistant);
+              if (assistant.role === "assistant") strictEqual(assistant.content.length, 1);
+            });
+            it("can omit the assistant", () => {
+              const assistant = captured.find(msg => msg.role === "assistant");
+              if (assistant?.role === "assistant") strictEqual(assistant.content.length, 1);
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(7, "guarded-assert")])
+
+    def test_class_checks_distinguish_state_readbacks_and_utility_absence(self):
+        # WHY: the matrix exposes sort state and the preview uses a class as a product hook.
+        # catches: missing either exemption or crediting a utility negative as a semantic assertion
+        self.write("preview.ts", """
+            export const scrollParent = (row) => row.closest(".file-preview-virtualizer");
+        """)
+        path = self.write("preview.test.ts", """
+            it("sorts by force", () => {
+              expect(header.classList.contains("sort-asc")).toBe(true);
+            });
+            it("checks preview scroll state", () => {
+              expect(document.querySelector(".file-preview-virtualizer")).toBeTruthy();
+              expect(document.querySelector(".scrollbar-gutter-both")).toBeNull();
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(6, "implementation-selector")])
+
+    def test_relative_dom_assertions_allow_deltas_and_render_identity(self):
+        # WHY: forms adds one column and landscape preserves the same SVG during a filter change.
+        # catches: treating the before observation as an implementation-derived baseline for an absolute check
+        path = self.write("relative.test.ts", """
+            it("adds a column", () => {
+              const before = document.querySelectorAll("th").length;
+              addComponentColumn();
+              expect(document.querySelectorAll("th").length).toBe(before + 1);
+            });
+            it("updates the active view instead of recreating the svg", () => {
+              const before = document.querySelector("svg");
+              updateFilter();
+              expect(document.querySelector("svg")).toBe(before);
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [])
+
+    def test_effect_provider_checks_are_run_for_the_requested_operation(self):
+        # WHY: LanguageModel.generateObject needs the fake generateText response to decode its result.
+        # catches: losing checks run by the fake provider or crediting its unused stream callback
+        self.write("provider.ts", """
+            import { Effect } from "effect";
+            import { LanguageModel } from "effect/ai";
+            import { dual } from "effect/Function";
+            export const withLanguageModel = dual(2, (effect, options) =>
+              Effect.provideServiceEffect(effect, LanguageModel.LanguageModel, LanguageModel.make({
+                generateText: opts => Effect.succeed(options.generateText(opts)),
+                streamText: opts => options.streamText(opts)
+              })));
+        """)
+        path = self.write("provider.test.ts", """
+            import { it } from "@effect/vitest";
+            import { LanguageModel } from "effect/ai";
+            import { withLanguageModel } from "./provider";
+            it.effect("checks the request", () =>
+              LanguageModel.generateObject({ prompt: "hi", schema }).pipe(
+                withLanguageModel({ generateText: opts => {
+                  expect(opts.prompt).toBeDefined();
+                  return [{ type: "text", text: "{}" }];
+                } })
+              ));
+            it.effect("has a check in the wrong provider method", () =>
+              LanguageModel.generateText({ prompt: "hi" }).pipe(
+                withLanguageModel({ streamText: opts => {
+                  expect(opts.prompt).toBeDefined();
+                  return [];
+                } })
+              ));
+        """)
+        self.assertEqual(self.locations(path.name), [(11, "no-assert")])
+
+    def test_prompt_absence_uses_the_parts_supplied_to_the_model(self):
+        # WHY: the lifecycle test supplies approval parts and pins the incremental prompt.
+        # catches: requiring a second call to prove the input, or crediting an unrelated part tag
+        path = self.write("prompt.test.ts", """
+            import { assert, it } from "@effect/vitest";
+            import { Effect } from "effect";
+            import { LanguageModel, Prompt } from "effect/ai";
+            it.effect("drops approval parts", () => Effect.gen(function* () {
+              const prompts = [Prompt.assistantMessage({
+                content: [Prompt.makePart("tool-approval-request", { approvalId: "1" })]
+              })];
+              yield* LanguageModel.generateText({ prompt: Prompt.fromMessages(prompts) }).pipe(provideModel);
+              const sent = providerOptions[0];
+              assert.deepStrictEqual(sent.incrementalPrompt, expected);
+              for (const message of sent.prompt.content) {
+                assert.strictEqual(message.content.filter(part => part.type === "tool-approval-request").length, 0);
+                assert.strictEqual(message.content.filter(part => part.type === "different-type").length, 0);
+              }
+            }));
+        """)
+        self.assertEqual(self.locations(path.name), [(13, "absence-no-control")])
