@@ -17,6 +17,7 @@ SUITES = {"describe", "suite", "context"}
 TESTS = {"test", "it", "specify"}
 MODIFIERS = {"each", "only", "skip", "todo", "concurrent", "serial", "parallel", "failing", "fixme", "skipIf", "runIf", "fails"}
 FACTORIES = {"each", "skipIf", "runIf"}
+EFFECT_TESTS = {"effect", "scoped", "live"}
 FRAMEWORKS = {"vitest", "jest", "@jest/globals", "node:test", "mocha", "@playwright/test", "playwright/test",
               "bun:test", "ava", "chai", "fast-check", "vite-plus/test", "@alchemy.run/test", "@effect/vitest"}
 ASSERT_MODULES = {"assert", "assert/strict", "node:assert", "node:assert/strict"}
@@ -50,6 +51,10 @@ def expression(node):
         elements = children(node)
         node = elements[-1] if node.kind() == "type_assertion" else elements[0]
     return unwrap(node)
+
+
+def span(node):
+    return offset(node), node.range().end.index
 
 
 def name(node):
@@ -219,8 +224,7 @@ class Check:
                 counter, subject = observation_subject(counter, subject)
                 return counter, subject, True if type(value) in {int, float} and value >= minimum and not negated else None
             negated = self.operator in {"!==", "!="}
-        elif (self.operator in {"===", "=="} and expected is not None
-              and expected.kind() == "array" and plain_array(expected) and children(expected)):
+        elif self.operator in {"===", "=="} and nonempty_array(expected):
             counter, subject = observation_subject("length", subject)
             return counter, subject, True
         else:
@@ -232,6 +236,14 @@ class Check:
         if value == 0:
             return counter, subject, negated
         return counter, subject, True if value > 0 and not negated else None
+
+
+def nonempty_array(node):
+    if node is not None and node.kind() == "call_expression" and not arguments(node):
+        callee = expression(node.field("function"))
+        if member(callee, "sort") and not any(child.kind() == "optional_chain" for child in callee.children()):
+            node = expression(callee.field("object"))
+    return node is not None and node.kind() == "array" and plain_array(node) and bool(children(node))
 
 
 def observation_subject(counter, subject):
@@ -254,6 +266,7 @@ class Registration:
     ignored: bool
     conditional: bool
     context_call: bool
+    runs_effect: bool
 
 
 class File:
@@ -266,12 +279,15 @@ class File:
         self.imports = {}
         self.source_imports = {}
         self.hook_values = None
+        self.writes = None
+        self.mock_returns = None
         self.helper_summaries = {}
         self.namespace_imports = set()
         self.bindings = defaultdict(list)
         self.fixture_references = None
         self.destructured = defaultdict(list)
         self.registrations = {}
+        self.effect_callbacks = set()
         self.index_imports()
         for node in query(syntax.root, "variable_declarator", "function_declaration", "generator_function_declaration"):
             key = name(node.field("name"))
@@ -762,7 +778,10 @@ class File:
         factory = callee is not None and callee.kind() == "call_expression"
         if factory:
             callee = callee.field("function")
-        _, names = self.callee(callee)
+        source, names = self.callee(callee)
+        runs_effect = source == "@effect/vitest" and len(names) > 1 and names[1] in EFFECT_TESTS
+        if runs_effect:
+            names = (names[0], *names[2:])
         if names[:2] == ("test", "describe"):
             names = names[1:]
         context_call = len(names) >= 2 and names[0] in context and names[1] == "test"
@@ -787,6 +806,13 @@ class File:
                 callback = candidate.field("value") if candidate.kind() == "variable_declarator" else candidate
                 if callback is not None and callback.kind() not in FUNCTIONS:
                     callback = None
+        if callback is None and runs_effect and args:
+            from .ast_grep_ts_effects import effect_function
+            supplied = expression(args[-1])
+            binding = self.binding(supplied)
+            if binding is not None and binding.kind() == "variable_declarator":
+                supplied = expression(binding.field("value"))
+            callback = effect_function(self, supplied)
         ignored = bool({"skip", "todo", "fixme"}.intersection(modifiers))
         for arg in args:
             if arg.kind() == "object":
@@ -795,7 +821,7 @@ class File:
         if title is None or callback is None and not ignored:
             return None
         return Registration(kind, title, callback, ignored, bool({"runIf", "skipIf"}.intersection(modifiers)),
-                            context_call)
+                            context_call, runs_effect)
 
     def inventory(self):
         for node in query(self.syntax.root, "call_expression"):
@@ -812,6 +838,8 @@ class File:
             if registration is None:
                 continue
             self.registrations[offset(node)] = registration
+            if registration.runs_effect and registration.callback is not None:
+                self.effect_callbacks.add(offset(registration.callback))
             if registration.kind in SUITES:
                 continue
             callback = registration.callback
@@ -1099,7 +1127,10 @@ def no_crash_test(flow, test, notes):
 def parse(source, path, language, *, scan_root=None, inventory=False, observe=None):
     from .ast_grep_catches import swallowed_assertions
     from .ast_grep_ts_flow import Flow
+    from .ast_grep_ts_controls import projected_control, returned_mock_control
+    from .ast_grep_ts_navigation import navigation_issues
     from .ast_grep_ts_recorders import fixture_origin
+    from .ast_grep_ts_ui import ui_issues
 
     syntax = Syntax.parse(source, language)
     file = File(syntax, path, scan_root)
@@ -1121,6 +1152,8 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
         test.issues.extend((site, "swallowed-assertion") for site in
                            swallowed_assertions(body, language, (check.node for check in flow.checks)))
         micro_snapshot(file, test, flow.checks)
+        test.issues.extend((line(node), rule) for node, rule in ui_issues(file, test, flow.checks))
+        test.issues.extend((line(node), rule) for node, rule in navigation_issues(file, flow.checks))
         test.checks = len(flow.checks)
         lint.record_completion(test, not flow.checks, no_crash_test(flow, test, notes))
         test.guarded = bool(flow.checks) and bool(incomplete)
@@ -1147,7 +1180,8 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
             if presence is None:
                 continue
             local = counter, file.recorder(subject)
-            sibling = fixture_origin(file, subject) or file.sibling_control(subject)
+            sibling = (projected_control(file, subject, counter) or fixture_origin(file, subject)
+                       or file.sibling_control(subject))
             sibling = (counter, sibling) if sibling is not None else None
             group = file.control_group(subject, calls=counter == "calls")
             if presence is True and not check.guarded:
@@ -1161,9 +1195,10 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
                 if group is not None:
                     groups.add((counter, group))
             elif presence is False:
-                absences.append((local, sibling, group, site))
-        for local, sibling, group, site in absences:
-            if local not in witnesses and (group is None or (local[0], group) not in groups):
+                absences.append((local, sibling, group, site, subject, check))
+        for local, sibling, group, site, subject, check in absences:
+            if (local not in witnesses and (group is None or (local[0], group) not in groups)
+                    and not (local[0] == "calls" and returned_mock_control(file, subject, check, flow.checks))):
                 test_absences.append((test, sibling, site))
     for test, sibling, site in test_absences:
         if sibling not in sibling_witnesses:

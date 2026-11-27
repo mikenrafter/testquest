@@ -474,3 +474,194 @@ class AstGrepTypeScript(TqCase):
             test("checks two fields", () => Checks.Compare.schema.fields.equal(out(), expected));
         """)
         self.assertEqual(self.locations(path.name), [])
+
+    def test_helper_validates_both_sides_of_type_guard(self):
+        # WHY: toStandardSchemaV1 passes either a callback or issue array through an assertion helper.
+        # catches: treating a throw as optional or accepting an unchecked callback
+        self.write("assertions.ts", """
+            import { strictEqual } from "node:assert";
+            export function check(value, expected) { strictEqual(value, expected); }
+        """)
+        path = self.write("branch.test.ts", """
+            import { Predicate } from "effect";
+            import { check } from "./assertions";
+            function verify(result, expected) {
+              if (result.ok) {
+                if (Predicate.isFunction(expected)) expected(result.value);
+                else check(result.value, expected);
+              } else throw new Error("missing result");
+            }
+            function checkResult(expected) { verify(read(), expected); }
+            it("compares a fixture", () => checkResult([3]));
+            it("runs the comparison callback", () => checkResult(value => check(value, 3)));
+            it("empty callback can pass", () => checkResult(() => {}));
+        """)
+        self.assertEqual(self.locations(path.name), [(12, "no-assert")])
+
+    def test_effect_checks_require_the_generator_to_execute(self):
+        # WHY: BetterAuth and PrerenderCache return Effect programs through runtime and pipe wrappers.
+        # catches: ignoring a connected generator or crediting an unrun or replaced effect
+        self.write("provide.ts", """
+            import { Effect } from "effect";
+            import { dual } from "effect/Function";
+            export const provide = dual(2, (effect, fixture) => Effect.provide(effect, fixture));
+        """)
+        path = self.write("effect.test.ts", """
+            import { Effect, pipe } from "effect";
+            import { it } from "@effect/vitest";
+            const run = program => Effect.runPromise(program.pipe(Effect.scoped));
+            const build = Effect.fn("check value")(function* () {
+              expect(yield* read()).toBe(3);
+            });
+            it.effect("runs a generator", () => Effect.gen(function* () { expect(yield* read()).toBe(3); }));
+            it.scoped("runs the function's effect", () => pipe(build(), Effect.scoped));
+            it.live("runs a named generator", () => {
+              const program = Effect.gen(function* () { expect(yield* read()).toBe(3); });
+              return pipe(program, Effect.scoped);
+            });
+            it("awaits a wrapper", async () => { await run(Effect.gen(function* () { expect(yield* read()).toBe(3); })); });
+            it("discards an effect", () => { Effect.gen(function* () { expect(yield* read()).toBe(3); }); });
+            it("discards a promise", () => { run(build()); });
+            it.effect("replaces an effect", () => pipe(build(), () => Effect.succeed(3)));
+            it.effect("can skip the check", () => Effect.gen(function* () {
+              if (enabled()) expect(yield* read()).toBe(3);
+            }));
+            it.effect("runs Effect.fn directly", Effect.fn(function* () { expect(yield* read()).toBe(3); }));
+            it.effect("runs a promise effect", () => Effect.promise(async () => {
+              expect(await read()).toBe(3);
+            }));
+            it.effect("fails on the other branch", () => Effect.gen(function* () {
+              if (enabled()) expect(yield* read()).toBe(3);
+              else yield* Effect.fail(new Error("missing result"));
+            }));
+            it.effect("discarded failure does not cover the branch", () => Effect.gen(function* () {
+              if (enabled()) expect(yield* read()).toBe(3);
+              else Effect.fail(new Error("missing result"));
+            }));
+            it.effect("runs through a provider", () => Effect.gen(function* () {
+              expect(yield* read()).toBe(3);
+            }).pipe(provide(fixture)));
+            it.effect("runs after a service resolves", () => Effect.gen(function* () {
+              expect(yield* read()).toBe(3);
+            }).pipe(effect => Effect.flatMap(service, env => effect.pipe(Effect.provide(env)))));
+            import { provide } from "./provide";
+        """)
+        self.assertEqual(self.locations(path.name), [
+            (14, "no-assert"), (15, "no-assert"), (16, "no-assert"), (17, "guarded-assert"), (28, "guarded-assert"),
+        ])
+
+    def test_sibling_controls_use_the_same_projected_recorder(self):
+        # WHY: menuHandler checks prefixed calls, and stream.test checks a peer recorder selected by index.
+        # catches: losing projections or equating distinct filter captures and indexes
+        path = self.write("projected.test.ts", """
+            const prefix = "main-";
+            const records = vi.fn().mock.calls;
+            const entries = () => records.map(([entry]) => entry);
+            const ids = (rows, label) => rows.filter(row => row.id.startsWith(label)).map(row => row.id);
+            const setup = () => ({ peers: [] });
+            it("observes both detectors", () => {
+              const { peers } = setup();
+              expect(ids(entries(), prefix).sort()).toEqual(["main-a"]);
+              expect(peers[0]?.close).toHaveBeenCalled();
+            });
+            it("no matching calls or closes", () => {
+              const { peers } = setup();
+              const selected = entries().filter(entry => entry.id.startsWith(prefix));
+              expect(selected).toHaveLength(0);
+              expect(peers[0]?.close).not.toHaveBeenCalled();
+              expect(peers[1]?.close).not.toHaveBeenCalled();
+              expect(ids(entries(), "spare-")).toHaveLength(0);
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(16, "absence-no-control"), (17, "absence-no-control")])
+
+    def test_later_assertion_observes_the_exact_mock_result(self):
+        # WHY: CaptureShortcutConfig asserts the ID carried from a preview into a later write.
+        # catches: crediting a configured return without a unique asserted downstream use
+        path = self.write("result-control.test.ts", """
+            const preview = { id: "unique-review" };
+            const other = vi.fn().mockResolvedValue({ id: "different-review" });
+            const bridge = { read: vi.fn().mockResolvedValue(preview), save: vi.fn(), unused: vi.fn() };
+            it("shows and then saves preview", async () => {
+              expect(bridge.read).not.toHaveBeenCalled();
+              expect(bridge.unused).not.toHaveBeenCalled();
+              await click("Review");
+              await click("Save");
+              expect(bridge.save).toHaveBeenCalledExactlyOnceWith(preview.id);
+            });
+            it("configuration alone", () => expect(other).not.toHaveBeenCalled());
+        """)
+        self.assertEqual(self.locations(path.name), [(6, "absence-no-control"), (11, "absence-no-control")])
+
+    def test_expected_value_reaches_rendered_output(self):
+        # WHY: v4-04 derives the countdown baseline from a helper that reads rendered text.
+        # catches: crediting a weak bound, ignoring formatting, or ignoring a new literal definition
+        path = self.write("countdown.test.tsx", """
+            import { render } from "@testing-library/react";
+            function chipAfter(time) {
+              const { container } = render(<Timer time={time} />);
+              return { caption: container.querySelector(".caption")?.textContent ?? "" };
+            }
+            it("reads its own baseline", () => {
+              const fresh = chipAfter(0);
+              const total = Number(/^(\\d+) still open$/.exec(fresh.caption ?? "")?.[1]);
+              expect(total).toBeGreaterThanOrEqual(20);
+              expect(chipAfter(10).caption).toBe(`${total - 10} still open`);
+              assert.equal(chipAfter(10).caption, `${total - 10} still open`);
+              expect(chipAfter(10).caption).toEqual(`${total - 10} still open`);
+              let expected = fresh.caption;
+              expected = "10 still open";
+              expect(chipAfter(10).caption).toBe(expected);
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(10, "self-derived-expected"), (11, "self-derived-expected"),
+                                                    (12, "self-derived-expected")])
+
+    def test_selector_advisory_requires_a_semantic_check_on_the_element(self):
+        # WHY: v4-04 checks button styling and the presence of a class-selected chip.
+        # catches: using an unrelated text check as evidence for a different element
+        path = self.write("selectors.test.tsx", """
+            import { screen } from "@testing-library/react";
+            it("checks styling only", () => {
+              const button = screen.queryByRole("button", { name: "Open" });
+              expect(button).toBeTruthy();
+              expect(button!.classList.contains("primary")).toBe(true);
+              expect(button!.className).toBe("primary");
+              expect(button!.className.split(" ")).toContain("primary");
+              expect(document.querySelector(".caption")).toBeNull();
+              expect(screen.getByText("Toolbar")).toBeVisible();
+            });
+            it("also checks its label", () => {
+              const button = screen.getByRole("button");
+              expect(button).toHaveAccessibleName("Open");
+              expect(button.classList.contains("primary")).toBe(true);
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(5, "implementation-selector"), (6, "implementation-selector"),
+                                                    (7, "implementation-selector"), (8, "implementation-selector")])
+
+    def test_navigation_advisory_tracks_waits_and_component_imports(self):
+        # WHY: v4-01 and v4-02 triggered native Back before asserting the hash.
+        # catches: skipping a click helper or an imported router, or treating a wait as synchronous
+        self.write("router.ts", "export const close = () => window.history.back();")
+        self.write("Panel.tsx", """
+            import { close } from "./router";
+            export const Panel = () => <button onClick={close}>Close</button>;
+        """)
+        path = self.write("navigation.test.tsx", """
+            import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+            import { Panel } from "./Panel";
+            const closePanel = () => fireEvent.click(screen.getByText("Close"));
+            it("reads stale history", () => {
+              render(<Panel />);
+              closePanel();
+              expect(window.location.hash).toBe("#home");
+            });
+            it("waits for history", async () => {
+              render(<Panel />);
+              closePanel();
+              await waitFor(() => expect(location.hash).toBe("#home"));
+              expect(history.state).toEqual(null);
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(7, "unawaited-navigation")])

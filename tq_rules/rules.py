@@ -494,7 +494,7 @@ RULES = {
         level="advisory",
     ),
     "self-derived-expected": Rule(
-        "The expected value reuses production code from the module under test.",
+        "The expected value comes from production code or an observation of its output.",
         "The test checks repeatability, a before-and-after observation, or a declared relation between different inputs or entry points.",
         Recipe(
             (
@@ -540,6 +540,64 @@ RULES = {
                     test("computes total cents", () => {
                       // Eight percent of 1000 cents is 80 cents.
                       expect(billing.totalCents(1000, 8)).toBe(1080);
+                    });
+                    """),
+            },
+        ),
+        command="lint",
+        level="advisory",
+    ),
+    "implementation-selector": Rule(
+        "The check observes a CSS class without a role, label, or visible-text check on the same element.",
+        "The CSS class is an explicit contract, or the test also checks what the user sees on that element.",
+        Recipe(
+            ("Find the element by its role, accessible name, or visible text.",
+             "Assert the behavior or content a user can observe."),
+            "Reject changing the selector while leaving the element's behavior unchecked.",
+            {
+                "ts": ("""
+                    test("shows the active status", () => {
+                      mountStatus();
+                      expect(document.querySelector(".status-active")).toBeTruthy();
+                    });
+                    """, """
+                    import { screen } from "@testing-library/react";
+
+                    test("shows the active status", () => {
+                      mountStatus();
+                      expect(screen.getByRole("status")).toHaveTextContent("Active");
+                    });
+                    """),
+            },
+        ),
+        command="lint",
+        level="advisory",
+    ),
+    "unawaited-navigation": Rule(
+        "The check reads location or history immediately after an event that can start native history traversal.",
+        "The test waits for the resulting screen, state, or popstate before reading location or history.",
+        Recipe(
+            ("Trigger the event that starts navigation.",
+             "Wait for the rendered destination or retry the history assertion with waitFor."),
+            "Reject an unrelated await that leaves native Back pending.",
+            {
+                "ts": ("""
+                    import { fireEvent } from "@testing-library/react";
+
+                    test("Back returns home", () => {
+                      const back = document.createElement("button");
+                      back.onclick = () => window.history.back();
+                      fireEvent.click(back);
+                      expect(window.location.hash).toBe("#/home");
+                    });
+                    """, """
+                    import { fireEvent, waitFor } from "@testing-library/react";
+
+                    test("Back returns home", async () => {
+                      const back = document.createElement("button");
+                      back.onclick = () => window.history.back();
+                      fireEvent.click(back);
+                      await waitFor(() => expect(window.location.hash).toBe("#/home"));
                     });
                     """),
             },
