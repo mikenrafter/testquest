@@ -54,7 +54,7 @@ def read_blobs(repository, blobs):
     return result
 
 
-def scan_blobs(repository, files, *, require_parse=True):
+def scan_blobs(repository, files, *, require_parse=True, parser=None):
     """Read Git blobs into an isolated scan directory and return tests with their source."""
     blobs = read_blobs(repository, list(files.values()))
     with tempfile.TemporaryDirectory(prefix="tq-history-") as directory:
@@ -64,7 +64,7 @@ def scan_blobs(repository, files, *, require_parse=True):
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(blobs[blob])
         errors = []
-        for path, tests, comments in scan_paths([base / path for path in files], errors, inventory=True):
+        for path, tests, comments in scan_paths([base / path for path in files], errors, inventory=True, parser=parser):
             if tests:
                 yield path.relative_to(base), tests, comments, read_source(path).splitlines()
         if errors and require_parse:
@@ -80,8 +80,9 @@ def overlaps(test, start, count):
 class ChangedTests:
     """Select current tests intersected by Git hunks, including removals in the old span."""
 
-    def __init__(self, repository, ref):
+    def __init__(self, repository, ref, *, parser=None):
         self.repository = repository
+        self.parser = parser
         self.ref = repo.resolve(repository, ref)
         self.untracked = repo.untracked(repository)
         self.changed = {
@@ -105,7 +106,7 @@ class ChangedTests:
                                                  for _, _, start, count in hunks)]
         old_hunks = [(start, count) for start, count, _, _ in hunks if count]
         if old_hunks and blob and len(selected) < len(tests):
-            previous_files = scan_blobs(self.repository, {old: blob}, require_parse=False)
+            previous_files = scan_blobs(self.repository, {old: blob}, require_parse=False, parser=self.parser)
             previous = {test.qualified for _, old_tests, _, _ in previous_files for test in old_tests
                         if any(overlaps(test, start, count) for start, count in old_hunks)}
             selected.extend(test for test in tests if test not in selected and test.qualified in previous)

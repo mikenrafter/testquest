@@ -266,11 +266,11 @@ def helper(name):
     return name.lower().startswith(("assert", "check", "expect")) or name in {"raises", "fail"}
 
 
-def find(paths, *, select=None, owners=None):
+def find(paths, *, select=None, owners=None, parser=None):
     rows = []
     controls = CollectionControls()
     files = list(scan_paths(paths, rows, refine_guards=True, collection_controls=controls,
-                            inventory=select is not None))
+                            inventory=select is not None, parser=parser))
     if select is not None:
         rows.clear()
     controls.finish()
@@ -278,10 +278,17 @@ def find(paths, *, select=None, owners=None):
         file_rows = []
         allows = {}
         for comment in comments:
-            match = re.fullmatch(r"tq:\s*allow\s+([\w-]+)(?:\s+(.*))?", comment.text)
-            if not match:
+            if not comment.text.startswith("tq:"):
                 continue
-            rule, reason = match.groups()
+            words = comment.text[3:].split(maxsplit=2)
+            if len(words) < 2 or words[0] != "allow":
+                continue
+            rule = words[1]
+            if any(not (char.isalnum() or char in "_-") for char in rule):
+                continue
+            reason = words[2] if len(words) == 3 else ""
+            if "\n" in reason:
+                continue
             if not reason:
                 file_rows.append(finding(path, comment.line, "invalid-suppression",
                                     f"Suppression for {rule} needs a reason."))

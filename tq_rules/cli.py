@@ -3,7 +3,7 @@ import json
 import subprocess
 import sys
 
-from . import catches, history, ledger, ledger_config, ledger_report, lint, props, repo, risk, witness
+from . import catches, history, ledger, ledger_config, ledger_report, lint, props, repo, witness
 
 
 DIAGNOSTIC_RULES = {
@@ -45,6 +45,7 @@ def main():
         scan.add_argument("paths", nargs="*" if name == "lint" else "+")
         if name == "lint":
             scan.add_argument("--since")
+            scan.add_argument("--engine", choices=("legacy", "ast-grep"), default="legacy")
         scan.add_argument("--json", action="store_true")
     ledger.add_commands(commands.add_parser("log", help="Record and report test evidence."))
     commands.add_parser("rules", help="Show finding rules and exceptions.")
@@ -71,8 +72,17 @@ def main():
         parser.error("lint requires paths or --since")
     try:
         if options.command == "lint":
-            select = history.ChangedTests(repo.root("."), options.since) if options.since else None
-            return print_findings(lint.find(options.paths or ["."], select=select), options.json)
+            parse = None
+            if options.engine == "ast-grep":
+                try:
+                    from .ast_grep_lint import parse
+                except ModuleNotFoundError as error:
+                    if error.name != "ast_grep_py":
+                        raise
+                    raise ValueError("--engine ast-grep requires the ast-grep-py package") from error
+            select = (history.ChangedTests(repo.root("."), options.since, parser=parse)
+                      if options.since else None)
+            return print_findings(lint.find(options.paths or ["."], select=select, parser=parse), options.json)
         if options.command == "log":
             return run_log(options)
         if options.command == "witness":
@@ -81,6 +91,8 @@ def main():
             rows = catches.run(options.repo, options.worktree, options.cmd)
             return print_replays(rows, options.json)
         if options.command == "risk":
+            from . import risk
+
             snapshot = risk.map_risk(options.repo, options.budget)
             if options.html:
                 risk.write_html(snapshot, options.html)

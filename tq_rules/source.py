@@ -71,9 +71,10 @@ class CollectionControls:
 IGNORED = {".git", "__pycache__", ".venv", "node_modules", "target"}
 
 
-def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None, inventory=False):
+def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None, inventory=False, parser=None):
     """Yield parsed files and append a diagnostic for each skipped file."""
-    from . import python, rust
+    if parser is None:
+        from . import python, rust
 
     paths = {}
     cwd = Path.cwd()
@@ -99,11 +100,13 @@ def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None,
             try:
                 if path.suffix == ".py":
                     with tokenize.open(path) as stream:
-                        parsed = python.parse(stream.read(), path, scan_root=paths[path],
-                                              collection_controls=controls, inventory=inventory)
+                        source = stream.read()
+                    parse = parser or python.parse
                 else:
-                    parsed = rust.parse(path.read_text(encoding="utf-8"), path, scan_root=paths[path],
-                                        collection_controls=controls, inventory=inventory)
+                    source = path.read_text(encoding="utf-8")
+                    parse = parser or rust.parse
+                parsed = parse(source, path, scan_root=paths[path],
+                               collection_controls=controls, inventory=inventory)
             except (RecursionError, MemoryError):
                 errors.append(finding(path, 1, "too-deep",
                                       "advisory: Scan skipped after exceeding parser limits.", "advisory"))
@@ -116,7 +119,8 @@ def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None,
                 collection_controls.merge(controls)
             yield path, *parsed
     finally:
-        python.parse_imported_module.cache_clear()
+        if parser is None:
+            python.parse_imported_module.cache_clear()
 
 
 def finding(path, line, rule, message, level="error"):
