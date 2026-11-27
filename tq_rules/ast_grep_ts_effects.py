@@ -119,6 +119,8 @@ def sql_transaction(file, fn):
         return False
     if client.kind() == "call_expression":
         client = client.field("function").field("object")
+    if client is None:
+        return False
     source, _ = file.source_imports.get(name(client), ("", ()))
     if source.startswith(("effect/sql/", "effect/unstable/sql/")):
         return True

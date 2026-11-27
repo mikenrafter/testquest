@@ -241,21 +241,29 @@ class Flow:
         self.collection_growth = defaultdict(list)
         strategy_entries = []
         param_values = {}
+        param_sizes = {}
         for key, val in initial:
             if key == "__params__":
                 param_values = val
+            elif key == "__sizes__":
+                param_sizes = val
             else:
                 strategy_entries.append((key, val))
         self.strategies = dict(strategy_entries)
         self.param_values = param_values
+        self.param_sizes = param_sizes
         self.loop_values = {}
         self.loop_ranges = {}
+        self.loop_bounds = {}
+        self.false_unless_checked = set()
+        self.some_unless_checked = set()
         self.checked_collections = {}
         self.vector_collections = set()
         self.active_closures = set()
         self.reaching_facts = None
 
     def record(self, check):
+        check.loop_values = dict(self.loop_values)
         self.checks.append(check)
         if check.reachability and not check.guarded:
             predicate = unwrap(check.predicate)
@@ -318,6 +326,63 @@ class Flow:
                 return {"+": first + second, "-": first - second, "*": first * second}[operator]
         return None
 
+    def _is_nonneg_rust(self, node):
+        node = unwrap(node)
+        if node is None or self.syntax.language != "rust":
+            return False
+        if (val := integer(self.syntax, node)) is not None:
+            return val >= 0
+        if node.kind() in CALLS and self.syntax.call(node).method == "len":
+            return True
+        name = parts(node)
+        if name in self.loop_bounds and self.loop_bounds[name][0] >= 0:
+            return True
+        return False
+
+    def _inclusive_range_nonempty(self, low_node, high_node, lower):
+        if self.syntax.language != "rust":
+            return False
+        if lower is not None and lower >= 0 and self._is_nonneg_rust(high_node):
+            return True
+        lname = parts(low_node)
+        if lname in self.loop_bounds:
+            _, upper_shape = self.loop_bounds[lname]
+            if upper_shape is not None and upper_shape == shape(high_node):
+                return True
+        return False
+
+    def _infinite_iterator(self, node, *, before=None, seen=frozenset()):
+        node = unwrap(node)
+        if node is None or self.syntax.language != "rust":
+            return False
+        if node.kind() == "range_expression":
+            bounds = children(node)
+            return len(bounds) == 1 and any(c.kind() == ".." for c in node.children())
+        if node.kind() in CALLS:
+            call = self.syntax.call(node)
+            if call.method in {"sample_iter", "repeat", "repeat_with"}:
+                return True
+            if call.method == "cycle":
+                return bool(self.size(call.receiver, before=before, seen=seen))
+        return False
+
+    def _helper_param_sizes(self, function, args, *, before=None, seen=frozenset(), exact=False):
+        parameters = function.field("parameters")
+        if parameters is None or not args:
+            return {}
+        names = []
+        for param in children(parameters):
+            pattern = param.field("pattern") or param
+            pname = parts(pattern)
+            names.append(pname[0] if len(pname) == 1 else None)
+        sizes = {}
+        for pname, arg in zip(names, args):
+            if pname is not None:
+                val = self.size(arg, before=before, exact=exact, seen=seen)
+                if val is not None:
+                    sizes[pname] = val
+        return sizes
+
     def resolve(self, name, before):
         entries = self.bindings.get(name, ())
         if entries:
@@ -333,6 +398,8 @@ class Flow:
             before = self.syntax.absolute(node)
         kind = node.kind()
         elements = children(node)
+        if kind in {"reference_expression", "dereference_expression"} and elements:
+            return self.size(elements[-1], before=before, seen=seen, exact=exact)
         if kind in {"list", "tuple", "set", "dictionary", "array_expression", "tuple_expression"}:
             if any(child.kind() in {"list_splat", "dictionary_splat"} for child in elements):
                 return None if exact else sum(
@@ -425,9 +492,11 @@ class Flow:
                 ends = [lower, self.known_value(elements[1], minimum=not exact)]
                 if ends[1] is None and not exact and len(name := parts(elements[1])) == 1 and name[0] in self.strategies:
                     ends[1] = self.strategy_minimum(self.strategies[name[0]])
+                inclusive = any(child.kind() == "..=" for child in node.children())
                 if None not in ends:
-                    return range_size(ends[0], ends[1] + int(any(child.kind() == "..="
-                                                                     for child in node.children())))
+                    return range_size(ends[0], ends[1] + int(inclusive))
+                if not exact and inclusive and self._inclusive_range_nonempty(elements[0], elements[1], lower):
+                    return 1
         if kind in CALLS:
             call = self.syntax.call(node)
             args = call.arguments
@@ -477,7 +546,9 @@ class Flow:
                 file, target, function = helper
                 identity = file.path, target
                 if identity not in seen:
-                    helper_flow = Flow(file, file.syntax, body_of(function), target)
+                    arg_sizes = self._helper_param_sizes(function, args, before=before, seen=seen, exact=exact)
+                    helper_flow = Flow(file, file.syntax, body_of(function), target,
+                                       initial=(("__sizes__", arg_sizes),) if arg_sizes else ())
                     returned = helper_flow.fixture_return(function)
                     if returned is not None:
                         return helper_flow.size(returned, seen=seen | {identity}, exact=exact)
@@ -505,10 +576,13 @@ class Flow:
                               "clone", "iter_rows", "by_ref", "cycle", "values_mut", "into_values"}:
                     return self.size(call.receiver, before=before, exact=exact, seen=seen)
                 size = self.size(call.receiver, before=before, exact=exact, seen=seen)
+                if method == "flat_map" and size is not None and args and args[0].kind() == "closure_expression":
+                    closure_size = self.size(body_of(args[0]), before=before, exact=exact, seen=seen)
+                    return size * closure_size if closure_size is not None else None
                 first = self.known_value(args[0]) if args else None
                 if method == "take" and first is not None and call.receiver.kind() in CALLS:
                     base = self.syntax.call(call.receiver)
-                    if base.method == "cycle" and self.size(base.receiver, before=before, seen=seen):
+                    if base.method == "sample_iter" or (base.method == "cycle" and self.size(base.receiver, before=before, seen=seen)):
                         return first
                 if method in {"take", "skip", "step_by", "chunks", "chunks_exact", "windows"} and size is not None and first is not None:
                     if method == "take":
@@ -524,12 +598,19 @@ class Flow:
                 if method == "chain" and args:
                     other = self.size(args[0], before=before, exact=exact, seen=seen)
                     return None if exact and None in (size, other) else (size or 0) + (other or 0)
-                if method == "zip" and args and size is not None:
-                    other = self.size(args[0], before=before, exact=exact, seen=seen)
-                    return min(size, other) if other is not None else None
+                if method == "zip" and args:
+                    if size is not None:
+                        if not exact and self._infinite_iterator(args[0], before=before, seen=seen):
+                            return size
+                        other = self.size(args[0], before=before, exact=exact, seen=seen)
+                        return min(size, other) if other is not None else None
+                    if not exact and self._infinite_iterator(call.receiver, before=before, seen=seen):
+                        return self.size(args[0], before=before, exact=exact, seen=seen)
         name = parts(node)
         if not name or name in seen:
             return None
+        if len(name) == 1 and name[0] in self.param_sizes:
+            return self.param_sizes[name[0]]
         if self.reaching_facts is not None and len(name) == 1:
             joined, minimum = self.reaching_facts.path_minimum(name[0], before)
             if joined:
@@ -758,10 +839,115 @@ class Flow:
                    and (any(part.kind() == "async" for part in child.children())
                         or not self.size(child.field("right"))) for child in children(generator))
 
+    def _track_match_false_witness(self, node):
+        parent = node.parent()
+        while parent is not None and parent.kind() not in {"let_declaration", "assignment_expression"}:
+            kind = parent.kind()
+            if kind in {"block", "closure_expression", "arguments", "argument_list", "call_expression",
+                        "await_expression", "parenthesized_expression", "expression_statement"}:
+                if kind == "closure_expression" and len(list(direct_statements(parent.field("body")))) > 1:
+                    tail = list(direct_statements(parent.field("body")))[-1]
+                    if offset(node) < offset(tail):
+                        return
+                parent = parent.parent()
+                continue
+            return
+        if parent is not None:
+            target, _ = binding(parent)
+            if len(target) == 1:
+                self.false_unless_checked.add(target)
+
+    def _track_branch_some_witness(self, node, alt):
+        if parts(node.field("condition")) not in self.false_unless_checked or alt is None:
+            return
+        conseq_val = self._tail_expr(node.field("consequence"))
+        alt_val = self._tail_expr(alt.field("body") or next(iter(children(alt)), None))
+        if conseq_val is None or parts(conseq_val) != ("None",):
+            return
+        before = self.syntax.absolute(node.parent() if node.parent() is not None else node)
+        if not self._is_some_expr(alt_val, before):
+            return
+        parent = node.parent()
+        while parent is not None and parent.kind() not in {"let_declaration", "assignment_expression"}:
+            kind = parent.kind()
+            if kind in {"block", "closure_expression", "arguments", "argument_list", "call_expression",
+                        "field_expression", "await_expression", "parenthesized_expression", "expression_statement"}:
+                parent = parent.parent()
+                continue
+            return
+        if parent is not None:
+            target, _ = binding(parent)
+            if len(target) == 1:
+                self.some_unless_checked.add(target)
+
+    def _tail_expr(self, node):
+        if node is None:
+            return None
+        if node.kind() == "block":
+            stmts = list(direct_statements(node))
+            if not stmts:
+                return None
+            node = stmts[-1]
+            if node.kind() == "expression_statement":
+                node = next(iter(children(node)), None)
+        return unwrap(node)
+
+    def _is_some_expr(self, node, before=None):
+        node = unwrap(node)
+        if node is None:
+            return False
+        if node.kind() in CALLS and self.syntax.call(node).method == "Some":
+            return True
+        name = parts(node)
+        site = before if before is not None else self.syntax.absolute(node)
+        if name and (val := self.resolve(name, site)) is not None:
+            val = unwrap(val)
+            return val is not None and val.kind() in CALLS and self.syntax.call(val).method == "Some"
+        return False
+
+    def _arm_false_literal(self, arm):
+        val = self._tail_expr(arm.field("value"))
+        if val is None:
+            return False
+        if literal(self.syntax, val) is False:
+            return True
+        if val.kind() in CALLS:
+            call = self.syntax.call(val)
+            if call.method in {"Ready", "Ok"} and len(call.arguments) == 1 and literal(self.syntax, call.arguments[0]) is False:
+                return True
+        return False
+
+    def _select_macro_check(self, node):
+        targets = RUST_ASSERTIONS | FAILURES
+        for tree in query(node, "token_tree"):
+            tokens = list(tree.children())
+            for cur, nxt in zip(tokens, tokens[1:]):
+                if cur.kind() == "identifier" and nxt.kind() == "!" and cur.text() in targets:
+                    return cur
+        return None
+
+    def _arm_continues(self, arm):
+        val = arm.field("value")
+        if val is None:
+            return False
+        if val.kind() == "continue_expression":
+            return True
+        tail = self._tail_expr(val)
+        return tail is not None and tail.kind() == "continue_expression"
+
     def branch(self, node):
         before = len(self.checks)
         condition = node.field("condition")
         primary = self.visit(condition)
+        if (self.syntax.language == "rust" and condition is not None and condition.kind() == "let_condition"
+                and (pat := condition.field("pattern")) is not None and pat.text().startswith("Some(")
+                and parts(condition.field("value")) in self.some_unless_checked):
+            checked = self.isolated(node.field("consequence"))
+            for arm in children(node):
+                if arm.kind() in {"elif_clause", "else_clause"}:
+                    self.conditional(arm)
+            if checked:
+                return True
         if self.reaching_facts is not None and tri_truth(self.syntax, condition) is UNKNOWN:
             site = self.syntax.absolute(node)
             decision = tri_truth(self.syntax, condition, lambda value: self.reaching_facts.branch_boolean(value, site))
@@ -802,6 +988,8 @@ class Flow:
                 and self._parametrized_raises_dual(condition, branches, node.field("consequence"), alternatives[-1])):
             exhaustive = True
         if not exhaustive:
+            if self.syntax.language == "rust" and len(alternatives) == 1 and alternatives[0].kind() == "else_clause":
+                self._track_branch_some_witness(node, alternatives[0])
             for check in self.checks[before:]:
                 check.guarded = True
         return exhaustive
@@ -900,6 +1088,15 @@ class Flow:
                     not checked or checks and all(check.kind in FAILURES and not check.guarded for check in checks)
                     for checked, checks in covered):
                 return True
+            in_loop = any(parent.kind() == "loop_expression" for parent in node.ancestors()
+                          if not any(s.kind() in SCOPES and offset(s) > offset(parent) for s in node.ancestors()))
+            if in_loop and any(
+                    any(not c.guarded and c.kind not in FAILURES for c in checks) for _, checks in covered
+            ) and all(checked or self._arm_continues(arm) for arm, (checked, _) in zip(arms, covered)):
+                return True
+            if any(checked for checked, _ in covered) and all(
+                    checked or self._arm_false_literal(arm) for arm, (checked, _) in zip(arms, covered)):
+                self._track_match_false_witness(node)
             if self.strategies and any(check.predicate is not None and
                                        literal(self.syntax, check.predicate) is False
                                        for _, checks in covered for check in checks) and all(
@@ -927,8 +1124,26 @@ class Flow:
                     continue
             if jump.kind() == "continue_statement" and self.prune_continued_rows(statement, jump):
                 continue
+            if jump.kind() == "continue_expression" and self._static_let_continue(statement, jump):
+                continue
             return True
         return False
+
+    def _static_let_continue(self, statement, jump):
+        if self.syntax.language != "rust" or statement.kind() != "let_declaration":
+            return False
+        alternative = statement.field("alternative")
+        if alternative is None or not self.loops or not self.loops[-1][3]:
+            return False
+        if self._tail_expr(alternative) != jump:
+            return False
+        iterator = unwrap(self.loops[-1][0])
+        if iterator is not None and iterator.kind() in CALLS:
+            iterator = self.syntax.call(iterator).receiver or iterator
+        if iterator is not None and iterator.kind() == "array_expression":
+            return True
+        name = parts(iterator)
+        return bool(name and self.file.constant(name, self.scope) is not None)
 
     def checked_return(self, jump):
         statement = jump.parent()
@@ -1050,14 +1265,34 @@ class Flow:
             self.loops.append((iterator, pattern, body, runs))
             outer_values = self.loop_values
             outer_ranges = self.loop_ranges
+            outer_bounds = self.loop_bounds
             if runs:
                 self.loop_values = {**outer_values, **self.project_rows(pattern, self.fixture_rows(iterator))}
             if (domain := self.loop_range(iterator)) is not None and domain.start < domain.stop and (
                     len(name := parts(pattern)) == 1):
                 self.loop_ranges = {**outer_ranges, name: domain}
+            if (self.syntax.language == "rust" and iterator is not None
+                    and iterator.kind() == "range_expression"
+                    and any(c.kind() == "..=" for c in iterator.children())
+                    and len(rbounds := children(iterator)) == 2
+                    and len(name := parts(pattern)) == 1):
+                min_lo = self.known_value(rbounds[0], minimum=True)
+                if min_lo is None and parts(rbounds[0]) in self.loop_bounds:
+                    min_lo = self.loop_bounds[parts(rbounds[0])][0]
+                if min_lo is not None:
+                    self.loop_bounds = {**outer_bounds, name: (min_lo, shape(rbounds[1]))}
             before = self.collection_growth.copy()
             self.collection_growth = defaultdict(list, {name: sites.copy() for name, sites in before.items()})
+            checks_before = len(self.checks)
             checked = self.visit(body) if runs else self.conditional(body)
+            loop_invariant = (
+                self.syntax.language == "rust" and kind == "while_expression" and not runs
+                and len(self.checks) > checks_before
+                and all(c.kind in FAILURES for c in self.checks[checks_before:])
+            )
+            if loop_invariant:
+                for c in self.checks[checks_before:]:
+                    c.guarded = False
             if runs and size and size > 1:
                 for name, sites in self.collection_growth.items():
                     old = len(before.get(name, ()))
@@ -1066,8 +1301,9 @@ class Flow:
                 self.collection_growth = defaultdict(list, before)
             self.loop_values = outer_values
             self.loop_ranges = outer_ranges
+            self.loop_bounds = outer_bounds
             alternate = self.visit(node.field("alternative"))
-            return evaluated or runs and checked or alternate
+            return evaluated or runs and checked or loop_invariant or alternate
         if kind == "assert_statement":
             predicate = next(iter(children(node)), None)
             check = Check(node, self.syntax, "assert", predicate, *split_operands(predicate))
@@ -1142,6 +1378,11 @@ class Flow:
                     recognized, outcome = self.file.check_call(call, self.scope)
             else:
                 recognized, outcome = self.file.check_call(call, self.scope)
+                if (not recognized and self.syntax.language == "rust" and not call.macro
+                        and call.receiver is None and len(call.name) == 1
+                        and (alias := self.resolve(call.name, site)) is not None
+                        and (alias_name := parts(unwrap(alias))) and alias_name != call.name):
+                    recognized, outcome = self.file.check_call(Call(alias_name, call.arguments, None), self.scope)
             if self.syntax.language == "rust" and call.method in {"unwrap", "expect"} and call.receiver is not None:
                 inner = unwrap(call.receiver)
                 if inner.kind() in CALLS and self.syntax.call(inner).method.startswith(("validate", "verify", "check")):
@@ -1149,6 +1390,16 @@ class Flow:
                 if (call.method == "expect" and self.scope[-1].endswith("_request_format")
                         and call.arguments and integer(self.syntax, call.arguments[0]) is not None):
                     recognized = outcome = False
+            if self.syntax.language == "rust" and call.method in {"unwrap_err", "expect_err"} and call.receiver is not None:
+                recognized = outcome = True
+            if self.syntax.language == "rust" and call.macro and (
+                    call.method.endswith(("_select", "_select_biased"))
+                    or call.method in {"select", "select_biased", "join", "try_join"}):
+                token = self._select_macro_check(node)
+                if token is not None:
+                    check = Check(token, self.syntax, token.text())
+                    check.outcome = True
+                    return self.record(check)
             checked_callback = False
             if self.syntax.language == "rust" and not call.macro:
                 local = self.resolve(call.name, site) if len(call.name) == 1 else None
@@ -1175,14 +1426,21 @@ class Flow:
                     for argument in call.arguments:
                         for borrow in query(argument, "reference_expression"):
                             self.record_mutable_borrow(borrow, site)
+                        for inner in query(argument, "call_expression"):
+                            icall = self.syntax.call(inner)
+                            if (irec := parts(icall.receiver)) and icall.method not in {
+                                    "clone", "len", "as_ref", "is_empty", "as_str", "as_slice",
+                                    "to_vec", "to_owned", "iter", "contains", "get", "is_none", "is_some"}:
+                                self.alias_changes[irec[0]].append(site)
+                                if icall.method in SHRINKING:
+                                    self.writes[irec].append(site)
                 check = check_call(self.syntax, node, call)
                 check.outcome = outcome
                 check.guarded = self.comprehension_guard(check)
                 if self.syntax.language == "rust" and not call.macro:
                     check.reachability = (
                         lint.helper(call.method) or call.method.startswith("debug_assert")
-                        or call.receiver is None and len(call.name) == 1
-                        and (*self.scope[:-1], call.method) in self.file.functions
+                        or call.receiver is None and self.file.is_rust_test_helper(call.name, self.scope)
                     )
                 checked = self.record(check)
                 if not call.macro:
@@ -1340,7 +1598,10 @@ class Flow:
         rhs = shape(right)
         if lhs != rhs:
             alias = self.resolve_alias(left, check.location)
-            return bool(alias) and alias == self.resolve_alias(right, check.location)
+            if not (bool(alias) and alias == self.resolve_alias(right, check.location)):
+                return False
+            tokens = {part for part in name.lower().replace("-", "_").split("_") if part}
+            return not (("clone" in tokens or "cloned" in tokens) and bool(tokens & {"equal", "equality", "considered"}))
         if self.syntax.language == "python":
             if operator in {"!=", "is not"}:
                 return not query(left, *self.call_kinds)
@@ -1431,6 +1692,15 @@ class Flow:
         return False
 
     def observations(self, check):
+        saved_loop_values = self.loop_values
+        if hasattr(check, "loop_values"):
+            self.loop_values = check.loop_values
+        try:
+            yield from self._check_observations(check)
+        finally:
+            self.loop_values = saved_loop_values
+
+    def _check_observations(self, check):
         predicate = unwrap(check.predicate)
         negated = opposite(predicate)
         subject = negated or predicate
@@ -1474,10 +1744,18 @@ class Flow:
             known = literal(self.syntax, other)
             if isinstance(known, lint.SuffixedNumber):
                 known = known.value
-            if known is UNKNOWN and (other.kind() in {"list", "tuple", "set", "dictionary",
-                                                      "array_expression", "tuple_expression"}
-                                     or other.kind() == "macro_invocation" and macro_name(other) == ("vec",)):
-                known = self.size(other, before=check.location, exact=True)
+            if known is UNKNOWN:
+                exact_size = self.size(other, before=check.location, exact=True)
+                if exact_size is not None and (
+                        other.kind() in {"list", "tuple", "set", "dictionary", "array_expression", "tuple_expression"}
+                        or other.kind() == "macro_invocation" and macro_name(other) == ("vec",)):
+                    known = exact_size
+                elif exact_size is not None and exact_size > 0:
+                    known = exact_size
+                else:
+                    min_size = self.size(other, before=check.location, exact=False)
+                    if min_size is not None and min_size > 0:
+                        known = min_size
             if operand is None or known is UNKNOWN or known is None:
                 continue
             value = known
@@ -1962,7 +2240,8 @@ class File:
         definitions = getattr(self, table)
         if absolute[:len(module)] == module and (local := absolute[len(module):]) in definitions:
             return self, local, definitions[local]
-        if self.scan_root is None:
+        root = project_root(self.path.resolve(), self.scan_root, {"Cargo.toml", ".git"})
+        if self.scan_root is None and not ((root / "Cargo.toml").is_file() or (root / ".git").exists()):
             return None
         for depth in range(len(absolute) - 1, -1, -1):
             stem = source_root.joinpath(*absolute[:depth])
@@ -1979,7 +2258,7 @@ class File:
         if self.module_context is None:
             path = self.path.resolve()
             root = project_root(path, self.scan_root, {"Cargo.toml", ".git"})
-            source = next((directory for directory in path.parents if directory.is_relative_to(root / "src")
+            source = next((directory for directory in path.parents if directory.is_relative_to(root)
                            and ((directory / "lib.rs").is_file() or (directory / "main.rs").is_file())),
                           root / "src")
             module = path.relative_to(source).with_suffix("").parts if path.is_relative_to(source) else ()
@@ -2158,24 +2437,77 @@ class File:
         finally:
             self.pending_helpers.remove(key)
 
+    _RUST_SETUP_PREFIXES = (
+        "build_", "make_", "create_", "setup_", "layout_", "menu_", "generic_",
+        "load_", "read_", "open_", "run_", "new_", "init_",
+    )
+
+    def is_rust_test_helper(self, name, scope):
+        if not name:
+            return False
+        method = name[-1]
+        if len(name) == 1 and (*scope[:-1], method) in self.functions:
+            return True
+        if (target := self.resolve_function(name, scope, macro=False)) is not None:
+            return (
+                lint.helper(target[-1])
+                or target[-1].startswith(("assert", "check", "verify"))
+                or (
+                    any(owner.kind() == "impl_item" for owner in self.functions[target].ancestors())
+                    and not method.startswith(self._RUST_SETUP_PREFIXES)
+                    and ("tests" in self.path.parts or "src" not in self.path.parts)
+                )
+            )
+        if (helper := self.fixture_function(name, scope)) is not None:
+            owner_file, _, _ = helper
+            return (
+                ("tests" in owner_file.path.parts or lint.helper(method)
+                 or method.startswith(("assert", "check", "verify")))
+                and not method.startswith(self._RUST_SETUP_PREFIXES)
+            )
+        return False
+
+    def _rust_helper_verifies(self, target, method, caller_scope, macro):
+        definition = self.functions[target]
+        associated = any(owner.kind() == "impl_item" for owner in definition.ancestors())
+        constructor = method in {"new", "default", "from", "try_from", "into", "parse", "build", "clone"}
+        same_file = caller_scope is not None
+        if method.startswith(self._RUST_SETUP_PREFIXES) and not lint.helper(method):
+            return False, False
+        if not same_file and "tests" not in self.path.parts and not (
+                lint.helper(method) or method.startswith(("assert", "check", "verify"))):
+            return False, False
+        if associated:
+            in_tests = "tests" in self.path.parts or "src" not in self.path.parts
+            if constructor or (same_file and not in_tests and target[:-2] != caller_scope[:-1]):
+                return False, False
+        elif same_file and not lint.helper(method) and (
+                len(target) > 1 or target[:-1] != caller_scope[:-1]) and target[:-1] != caller_scope:
+            return False, False
+        parameters = definition.field("type_parameters")
+        has_bounds = (
+            parameters is not None and bool(query(parameters, "trait_bounds"))
+            or any(child.kind() == "where_clause" and bool(query(child, "trait_bounds"))
+                   for child in definition.children())
+        )
+        if method.startswith(("assert", "check")) and has_bounds:
+            return True, True
+        verifies = self.checks_in_helper(target, macro)
+        return verifies or lint.helper(method) and not macro, verifies
+
     def check_call(self, call, scope):
         method = call.method
         if call.macro and method in RUST_ASSERTIONS | FAILURES:
             return True, True
         if (target := self.resolve_function(call.name, scope, macro=call.macro)) is not None:
-            if self.syntax.language == "rust" and not call.macro:
-                definition = self.functions[target]
-                associated = any(owner.kind() == "impl_item" for owner in definition.ancestors())
-                if call.receiver is None and not lint.helper(method) and (
-                        associated or (len(call.name) > 1 or target[:-1] != scope[:-1])
-                        and target[:-1] != scope):
-                    return False, False
-                parameters = definition.field("type_parameters")
-                if method.startswith(("assert", "check")) and parameters is not None and query(
-                        parameters, "trait_bounds"):
-                    return True, True
+            if self.syntax.language == "rust" and not call.macro and call.receiver is None:
+                return self._rust_helper_verifies(target, method, scope, False)
             verifies = self.checks_in_helper(target, call.macro)
             return verifies or lint.helper(method) and not call.macro, verifies
+        if self.syntax.language == "rust" and not call.macro and call.receiver is None:
+            if (helper := self.fixture_function(call.name, scope)) is not None:
+                owner_file, target, _ = helper
+                return owner_file._rust_helper_verifies(target, method, None, False)
         if method in {"check_returncode", "assert_that"} or lint.helper(method) or (
                 self.syntax.language == "python" and call.receiver is not None
                 and method in {"fnmatch_lines", "fnmatch_lines_random", "re_match_lines", "re_match_lines_random"}) or (

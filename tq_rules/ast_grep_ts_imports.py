@@ -4,28 +4,152 @@ from collections import defaultdict
 from functools import lru_cache
 import json
 import os
+import re
 
 from .ast_grep import Syntax, children
 from .ast_grep_languages import ECMASCRIPT_LANGUAGES
-from .ast_grep_ts import ASSERT_MODULES, FRAMEWORKS, File, chain, expression, name, text_literal
+from .ast_grep_ts import ASSERT_MODULES, EXPECT_MODULES, FRAMEWORKS, File, arguments, chain, expression, name, text_literal
 from .ast_grep_ts_recorders import object_member
+
+
+def _import_root(file, source):
+    importer = file.path.resolve()
+    if file.scan_root is not None:
+        root = file.scan_root.resolve()
+        for parent in importer.parents:
+            if not parent.is_relative_to(root):
+                break
+            if (parent / ".git").exists():
+                return parent
+        return root
+    if not source.startswith((".", "~")):
+        return None
+    for parent in importer.parents:
+        if (parent / ".git").exists():
+            return parent
+    pkg_root = None
+    for parent in importer.parents:
+        if (parent / "package.json").is_file():
+            pkg_root = parent
+    return pkg_root or importer.parent
 
 
 def imported_helper(file, fn):
     base, members = chain(fn)
-    if (file.scan_root is None or name(base) not in file.source_imports
+    if (name(base) not in file.source_imports
             or file.binding(base) is not None or file.parameter_scope(base) is not None):
         return None
-    root = file.scan_root.resolve()
-    importer = file.path.resolve()
-    for parent in importer.parents:
-        if not parent.is_relative_to(root):
-            break
-        if (parent / ".git").exists():
-            root = parent
-            break
     source, names = file.source_imports[name(base)]
-    return resolve_export(root, importer, source, (*names, *members))
+    root = _import_root(file, source)
+    if root is None:
+        return None
+    return resolve_export(root, file.path.resolve(), source, (*names, *members))
+
+
+def imported_expect_origin(file, fn):
+    base, members = chain(fn)
+    if (name(base) not in file.source_imports
+            or file.binding(base) is not None or file.parameter_scope(base) is not None):
+        return None
+    source, names = file.source_imports[name(base)]
+    root = _import_root(file, source)
+    if root is None:
+        return None
+    return resolve_origin(root, file.path.resolve(), source, (*names, *members))
+
+
+def _commonjs_require(module):
+    for statement in children(module.syntax.root):
+        if statement.kind() != "expression_statement":
+            continue
+        expr = next(iter(children(statement)), None)
+        if expr is None or expr.kind() != "assignment_expression":
+            continue
+        left, members = chain(expr.field("left"))
+        if name(left) == "module" and members == ("exports",):
+            right = expression(expr.field("right"))
+            if (right is not None and right.kind() == "call_expression"
+                    and name(right.field("function")) == "require"):
+                for arg in arguments(right):
+                    if req := text_literal(arg):
+                        if "node_modules/" in req:
+                            req = req.split("node_modules/", 1)[1]
+                        return req
+    return None
+
+
+def _unwrap_expect_extension(node):
+    node = expression(node)
+    while node is not None and node.kind() == "call_expression":
+        fn = expression(node.field("function"))
+        if fn is not None and fn.kind() == "member_expression" and name(fn.field("property")) in {"extend", "configure"}:
+            node = expression(fn.field("object"))
+            continue
+        break
+    return node
+
+
+@lru_cache(maxsize=1024)
+def resolve_origin(root, importer, source, names, active=frozenset()):
+    if not names:
+        return None
+    if source in EXPECT_MODULES | ASSERT_MODULES:
+        return source, names
+    target = module_path(root, importer, source)
+    if target is None or target in active:
+        return None
+    module = read_module(root, target)
+    if module is None:
+        return None
+    active = active | {target}
+    if (req := _commonjs_require(module)) is not None:
+        return resolve_origin(root, target, req, names, active)
+    key, *members = names
+    bound = None
+    for statement in children(module.syntax.root):
+        if statement.kind() != "export_statement" or any(part.kind() == "type" for part in statement.children()):
+            continue
+        declaration = statement.field("declaration")
+        if declaration is not None:
+            if declaration.kind() == "function_signature":
+                continue
+            if declaration.kind() in {"lexical_declaration", "variable_declaration"}:
+                declaration = next((entry for entry in children(declaration)
+                                    if name(entry.field("name")) == key), None)
+            if declaration is not None and declaration.field("name") is not None and declaration.field("name").text() == key:
+                bound = declaration.field("value") if declaration.kind() == "variable_declarator" else declaration
+                break
+        clause = next((entry for entry in children(statement) if entry.kind() == "export_clause"), None)
+        reexport = text_literal(statement.field("source"))
+        if clause is not None:
+            for entry in children(clause):
+                original = entry.field("name")
+                if (name(entry.field("alias")) or name(original)) == key:
+                    if reexport:
+                        return resolve_origin(root, target, reexport, (name(original), *members), active)
+                    binding = module.binding(original)
+                    if binding is not None:
+                        bound = binding.field("value") if binding.kind() == "variable_declarator" else binding
+                        break
+            if bound is not None:
+                break
+        elif reexport and not any(c.kind() == "namespace_export" for c in children(statement)) and any(
+                c.kind() == "*" for c in statement.children()):
+            res = resolve_origin(root, target, reexport, names, active)
+            if res is not None:
+                return res
+    base_node = _unwrap_expect_extension(bound)
+    if base_node is None:
+        return None
+    base, base_members = chain(base_node)
+    base_key = name(base)
+    if base_key in module.imports:
+        src, orig = module.imports[base_key]
+        return src, (*orig, *base_members, *members)
+    if base_key in module.source_imports:
+        src, orig = module.source_imports[base_key]
+        return resolve_origin(root, target, src, (*orig, *base_members, *members), active)
+    return None
 
 
 @lru_cache(maxsize=1024)
@@ -50,6 +174,8 @@ def resolve_export(root, importer, source, names, active=frozenset()):
         if key == "default" and is_default and declaration is None:
             return module, select_member(statement.field("value"), members)
         if declaration is not None:
+            if declaration.kind() == "function_signature":
+                continue
             if declaration.kind() in {"lexical_declaration", "variable_declaration"}:
                 declaration = next((entry for entry in children(declaration)
                                     if name(entry.field("name")) == key), None)
@@ -90,6 +216,19 @@ def select_member(node, members):
             node = next((entry.field("value") or entry for entry in children(node.field("body"))
                          if name(entry.field("name")) == member and any(part.kind() == "static"
                                                                         for part in entry.children())), None)
+        elif node.kind() == "internal_module":
+            body = node.field("body")
+            found = None
+            for stmt in children(body) if body is not None else ():
+                if stmt.kind() != "export_statement":
+                    continue
+                decl = stmt.field("declaration")
+                if decl is not None and decl.kind() in {"lexical_declaration", "variable_declaration"}:
+                    decl = next((e for e in children(decl) if name(e.field("name")) == member), None)
+                if decl is not None and decl.field("name") is not None and name(decl.field("name")) == member:
+                    found = decl.field("value") if decl.kind() == "variable_declarator" else decl
+                    break
+            node = found
         elif node.kind() == "object":
             node = object_member(node, member)
         else:
@@ -98,9 +237,58 @@ def select_member(node, members):
     return node
 
 
+@lru_cache(maxsize=64)
+def _tsconfig_mapping(tsconfig_path):
+    try:
+        text = tsconfig_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    cleaned = re.sub(r"//[^\n]*|/\*.*?\*/", "", text, flags=re.S)
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+    try:
+        data = json.loads(cleaned)
+    except ValueError:
+        return None
+    opts = data.get("compilerOptions") if isinstance(data, dict) else None
+    if not isinstance(opts, dict) or not isinstance(opts.get("paths"), dict):
+        return None
+    base_url = opts.get("baseUrl", ".")
+    base = (tsconfig_path.parent / base_url).resolve() if isinstance(base_url, str) else tsconfig_path.parent
+    return base, opts["paths"]
+
+
+def _tsconfig_path(root, importer, source):
+    for parent in importer.parents:
+        if not parent.is_relative_to(root):
+            break
+        cfg = parent / "tsconfig.json"
+        if cfg.is_file():
+            loaded = _tsconfig_mapping(cfg)
+            if loaded is None:
+                continue
+            base, paths = loaded
+            for pattern, targets in paths.items():
+                if not isinstance(targets, list) or not targets:
+                    continue
+                if pattern == source:
+                    resolved = source_path(root, base / targets[0])
+                    if resolved is not None:
+                        return resolved
+                elif pattern.count("*") == 1:
+                    pre, suf = pattern.split("*")
+                    if source.startswith(pre) and source.endswith(suf) and len(source) >= len(pre) + len(suf):
+                        mid = source[len(pre):len(source) - len(suf)] if suf else source[len(pre):]
+                        resolved = source_path(root, base / targets[0].replace("*", mid))
+                        if resolved is not None:
+                            return resolved
+    return None
+
+
 def module_path(root, importer, source):
     if source.startswith("."):
         return source_path(root, importer.parent / source)
+    if (aliased := _tsconfig_path(root, importer, source)) is not None:
+        return aliased
     parts = source.split("/")
     package_parts = 2 if source.startswith("@") else 1
     package = "/".join(parts[:package_parts])

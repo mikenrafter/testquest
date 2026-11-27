@@ -55,6 +55,7 @@ class Flow:
         self.checks = []
         self.references = None
         self.defined = {}
+        self.loop_vars = {}
 
     def sequence(self, nodes, conditional=False, catches=False):
         remaining = NEXT
@@ -91,6 +92,19 @@ class Flow:
             args = arguments(node)
             callback = self.callback_target(args[0]) if args else None
             return self.invoke(callback, conditional, catches, detached=not self.completed(node))
+        if kind == "variable_declarator" and not conditional:
+            rhs = expression(node.field("value"))
+            if rhs is not None and rhs.kind() == "ternary_expression":
+                cond = self.condition(rhs.field("condition"))
+                if cond is not lint.UNKNOWN:
+                    taken = expression(rhs.field("consequence") if cond else rhs.field("alternative"))
+                    target_key = name(node.field("name"))
+                    if target_key and taken is not None:
+                        if name(taken) in self.callbacks and self.file.binding(taken) is None:
+                            self.callbacks[target_key] = self.callbacks[name(taken)]
+                        elif literal(taken) is not lint.UNKNOWN:
+                            owner = next((p for p in node.ancestors() if p.kind() in FUNCTIONS), self.callback)
+                            self.supplied[(offset(owner), target_key)] = (taken, self.supplied)
         if kind in {"if_statement", "ternary_expression"}:
             condition = node.field("condition")
             consequent = node.field("consequence")
@@ -167,6 +181,7 @@ class Flow:
         body = node.field("body")
         condition = node.field("condition")
         leading = self.sequence((node.field("initializer"), node.field("right"), condition), conditional, catches)
+        outer_loop_vars = self.loop_vars
         if kind == "for_in_statement":
             iterable = node.field("right")
             is_of = any(child.kind() == "of" for child in node.children())
@@ -176,15 +191,32 @@ class Flow:
             declarations = children(initializer) if initializer is not None else []
             declaration = declarations[0] if len(declarations) == 1 and declarations[0].kind() == "variable_declarator" else None
             op, left, right = split_operands(condition)
-            lower = self.file.fixture_number(declaration.field("value")) if declaration is not None else lint.UNKNOWN
+            init_val = declaration.field("value") if declaration is not None else None
+            lower = self.file.fixture_number(init_val) if init_val is not None else lint.UNKNOWN
+            lower_bounds = None
+            if lower is lint.UNKNOWN and init_val is not None and name(init_val) in self.loop_vars:
+                lower_bounds = self.loop_vars[name(init_val)]
+                lower = lower_bounds[1]
             upper = self.file.fixture_number(right)
             nonempty = (declaration is not None and bool(name(left)) and name(left) == name(declaration.field("name"))
                         and lower is not lint.UNKNOWN and upper is not lint.UNKNOWN
                         and compare(op, lower, upper) is True) or truth(condition) is True
+            if (nonempty and op in {"<", "<="} and declaration is not None
+                    and lower is not lint.UNKNOWN and upper is not lint.UNKNOWN):
+                lo = lower_bounds[0] if lower_bounds is not None else lower
+                hi = upper - int(op == "<")
+                self.loop_vars = {**outer_loop_vars, name(declaration.field("name")): (lo, hi)}
         else:
             nonempty = kind == "do_statement" or truth(condition) is True
+        checks_before = len(self.checks)
         checked = self.visit(body, conditional or not nonempty, catches)
         self.visit(node.field("increment"), True, catches)
+        self.loop_vars = outer_loop_vars
+        if (kind == "while_statement" and not nonempty and len(self.checks) > checks_before
+                and all(c.method == "throw" for c in self.checks[checks_before:])):
+            for c in self.checks[checks_before:]:
+                c.guarded = False
+            return followed_by(leading, 0)
         if not nonempty or checked & (NEXT | BREAK | CONTINUE):
             checked = (checked & (RETURN | THROW)) | NEXT
         return followed_by(leading, checked)
@@ -224,6 +256,12 @@ class Flow:
         receiver, members = chain(callee)
         method = members[-1] if members else ""
         receiver = callee.field("object") if method else receiver
+        if not optional and self.completed(node) and receiver is not None and (
+                method == "waitForSelector" and not self._has_unasserted_locator()
+                or method == "waitFor" and (not args or expression(args[0]) is not None and expression(args[0]).kind() == "object")):
+            return followed_by(result, self.record(Check(node, method), guarded, False))
+        if self.file.is_throwing_test_fixture(callee):
+            return followed_by(result, self.record(Check(node, "helper"), guarded, optional or not self.completed(node)))
         if method in ITERATORS | CHAINS:
             threaded = method in CHAINS and self.completed(node)
             for index, callback in enumerate(args[:2] if method == "then" else args[:1]):
@@ -284,6 +322,8 @@ class Flow:
                 if not failure_helper or not callbacks:
                     return followed_by(result, self.record(Check(node, "helper"), guarded,
                                                            optional or detached or bool(incomplete) and not failure_helper))
+            if _has_timeout_reject(self.file, target, seen=set()):
+                return followed_by(result, self.record(Check(node, "helper"), guarded, optional or not joined))
             return result
 
         if self.follow_imports and target is None and (imported := imported_helper(self.file, callee)) is not None:
@@ -291,6 +331,30 @@ class Flow:
             if module is None:
                 return followed_by(result, self.record(Check(node, "helper"), guarded, optional))
             if helper is not None and helper.kind() in FUNCTIONS and helper.field("body") is not None:
+                imp_callbacks = {key: cb for key, arg in zip(formal_parameters(helper), args)
+                                 if key and (cb := self.callback_target(arg)) is not None}
+                if imp_callbacks or any(literal(expression(arg)) is not lint.UNKNOWN or expression(arg).kind() in {"array", "object"} for arg in args):
+                    supplied = {**self.supplied, **self.file.fixture_arguments(helper, args, self.supplied)}
+                    nested = Flow(module, helper, (), self.active, imp_callbacks, supplied, True)
+                    incomplete = nested.visit(nested.body)
+                    detached = is_async(helper) and not joined
+                    forwarded = [check for check in nested.checks
+                                 if any(within(check.node, callback) for callback in imp_callbacks.values())]
+                    for check in forwarded:
+                        self.record(check, guarded or check.guarded, optional or detached)
+                    if forwarded:
+                        return followed_by(result, NEXT if optional or detached or incomplete else 0)
+                    checks = [check for check in nested.checks if check.method != "result helper"]
+                    if checks:
+                        failure_helper = all(check.method in {"throw", "fail"} for check in checks)
+                        is_wait = _has_timeout_reject(module, helper)
+                        if not failure_helper or not imp_callbacks:
+                            returns_value = _helper_returns_value(nested.body, nested.checks)
+                            detached = (optional or detached
+                                        or (bool(incomplete) and not failure_helper and not is_wait))
+                            coverage = (self.result_helper(node, guarded, detached) if returns_value else
+                                        self.record(Check(node, "helper"), guarded, detached))
+                            return followed_by(result, coverage)
                 summary = imported_check_summary(module, helper)
                 if summary is not None:
                     returns_value, unchecked = summary
@@ -343,6 +407,58 @@ class Flow:
 
     def condition(self, node):
         node = expression(node)
+        if node is not None and node.kind() == "identifier":
+            if name(node) in self.callbacks and self.file.binding(node) is None:
+                return True
+            if self.supplied:
+                resolved, _ = self.file.fixed(node, self.supplied)
+                if resolved is None or same(resolved, node):
+                    val = self.supplied.get((offset(self.callback), name(node)))
+                    if val is None and (owner := next((p for p in node.ancestors() if p.kind() in FUNCTIONS), None)):
+                        val = self.supplied.get((offset(owner), name(node)))
+                    if val is not None and val[0] is not None:
+                        resolved = expression(val[0])
+                if resolved is not None:
+                    if resolved.kind() in {"array", "object"} | FUNCTIONS:
+                        return True
+                    lit = literal(resolved)
+                    if lit is not lint.UNKNOWN:
+                        return bool(lit)
+        op, left, right = split_operands(node)
+        if op in {"===", "!==", "==", "!="}:
+            for tnode, snode in ((expression(left), expression(right)), (expression(right), expression(left))):
+                if tnode is not None and tnode.kind() == "unary_expression" and tnode.children()[0].kind() == "typeof":
+                    operand = expression(tnode.field("argument") or next(iter(children(tnode)), None))
+                    expected_type = literal(snode)
+                    if isinstance(expected_type, str):
+                        actual_type = None
+                        if operand is not None and name(operand) in self.callbacks and self.file.binding(operand) is None:
+                            actual_type = "function"
+                        elif operand is not None and self.supplied:
+                            val = None
+                            for owner in (self.callback, *(p for p in operand.ancestors() if p.kind() in FUNCTIONS)):
+                                if (entry := self.supplied.get((offset(owner), name(operand)))) is not None:
+                                    val = entry[0]
+                                    break
+                            if val is not None:
+                                lit = literal(val)
+                                if type(lit) is bool:
+                                    actual_type = "boolean"
+                                elif type(lit) in {int, float}:
+                                    actual_type = "number"
+                                elif isinstance(lit, str):
+                                    actual_type = "string"
+                        if actual_type is not None:
+                            return (actual_type == expected_type) if op in {"===", "=="} else (actual_type != expected_type)
+            expected_val = literal(right)
+            if expected_val is not lint.UNKNOWN and left is not None:
+                left_shape = shape(expression(left))
+                for check in self.checks:
+                    if not check.guarded and not check.negated and check.operator in {"===", "=="}:
+                        for s, o in ((check.actual, check.expected), (check.expected, check.actual)):
+                            if shape(expression(s)) == left_shape and literal(o) != lint.UNKNOWN:
+                                matched = literal(o) == expected_val
+                                return matched if op in {"===", "=="} else not matched
         known = truth(node)
         if known is not lint.UNKNOWN or node is None or node.kind() != "call_expression":
             return known
@@ -418,6 +534,19 @@ class Flow:
         if self.file.parameter_scope(node) is not None:
             return self.callbacks.get(name(node))
         return self.file.helper(node)
+
+    def _has_unasserted_locator(self):
+        locator_factories = {"getByText", "getByRole", "getByLabel", "getByPlaceholder",
+                             "getByTestId", "getByAltText", "getByTitle", "locator"}
+        for stmt in query(self.body, "expression_statement"):
+            expr = expression(next(iter(children(stmt)), None))
+            if expr is not None and expr.kind() == "await_expression":
+                expr = expression(next(iter(children(expr)), None))
+            if expr is not None and expr.kind() == "call_expression":
+                _, members = chain(expr.field("function"))
+                if len(members) == 1 and members[0] in locator_factories:
+                    return True
+        return False
 
     def optional(self, node):
         current = node
@@ -582,6 +711,35 @@ class Flow:
         return True
 
 
+def _has_timeout_reject(module, helper, seen=None):
+    seen = seen if seen is not None else set()
+    if helper is None or offset(helper) in seen:
+        return False
+    seen.add(offset(helper))
+    body = helper.field("body")
+    if body is None:
+        return False
+    if (any(name(call.field("function")) == "reject" for call in query(body, "call_expression"))
+            and query(body, "await_expression")):
+        return True
+    for call in query(body, "call_expression"):
+        callee = call.field("function")
+        if (target := module.helper(callee)) is not None and _has_timeout_reject(module, target, seen):
+            return True
+    return False
+
+
+def _helper_returns_value(body, checks):
+    checked = {offset(check.node) for check in checks if check.method != "result helper"}
+    returned = [body] if body.kind() != "statement_block" else [
+        next(iter(children(statement)), None) for statement in query(body, "return_statement")
+        if not any(parent.kind() in FUNCTIONS and within(parent, body)
+                   for parent in statement.ancestors())
+    ]
+    return any(value is not None and value.text() != "undefined"
+               and offset(expression(value)) not in checked for value in returned)
+
+
 def imported_check_summary(module, helper):
     site = offset(helper)
     if site not in module.helper_summaries:
@@ -589,16 +747,11 @@ def imported_check_summary(module, helper):
         incomplete = flow.visit(flow.body)
         summary = None
         if flow.checks:
-            checked = {offset(check.node) for check in flow.checks if check.method != "result helper"}
-            returned = [flow.body] if flow.body.kind() != "statement_block" else [
-                next(iter(children(statement)), None) for statement in query(flow.body, "return_statement")
-                if not any(parent.kind() in FUNCTIONS and within(parent, flow.body)
-                           for parent in statement.ancestors())
-            ]
-            returns_value = any(value is not None and value.text() != "undefined"
-                                and offset(expression(value)) not in checked for value in returned)
+            returns_value = _helper_returns_value(flow.body, flow.checks)
             failure_helper = all(check.method in {"throw", "fail"} for check in flow.checks)
-            summary = returns_value, bool(incomplete) and not failure_helper
+            summary = returns_value, bool(incomplete) and not failure_helper and not _has_timeout_reject(module, helper)
+        elif _has_timeout_reject(module, helper):
+            summary = False, False
         module.helper_summaries[site] = summary
     return module.helper_summaries[site]
 

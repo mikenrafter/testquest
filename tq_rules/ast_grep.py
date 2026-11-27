@@ -230,7 +230,8 @@ class Syntax:
 
 def shape(node):
     """Compare syntax without layout, comments or grouping parentheses."""
-    node = unwrap(node)
+    while node is not None and node.kind() == "parenthesized_expression":
+        node = next(iter(children(node)), None)
     if node is None:
         return None
     components = [child for child in node.children() if child.kind() not in COMMENTS]
