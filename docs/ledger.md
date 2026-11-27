@@ -35,11 +35,11 @@ To keep using a ledger at the old sibling research path, set `path` as shown abo
 
 Each test is identified by its repository name, qualified name (`path::Class::method` or `path::module::fn`), and a SHA-256 hash of its body. When a commit moves a file or renames a test whose body hash matches uniquely, `tq log record` preserves the test's identity.
 
-In `kill` events, a fault patch (the unified diff named in a `# catches:` comment) is stored in the `mutant` field as the SHA-256 hash of its contents.
+In `kill` events from `tq log kill`, `mutant` is the SHA-256 of the fault patch named in the `catches:` comment. In `revert-check` events, it is the pinned mutant ID or the reverted commit SHA. Revert-check includes the outcome, runner results, reasons for failure, and the live worktree fingerprints. Only a verified assertion failure with a passing restored run counts as a kill.
 
 ## Events
 
-Six event types are recorded today. Three more (`run`, `escape`, and `cost`) are part of the ledger design and are not yet recorded by `tq log`.
+Seven event types are recorded today. Three more (`run`, `escape`, and `cost`) are part of the ledger design and are not yet recorded by `tq log`.
 
 | Event | Status | Written by | Key fields |
 | --- | --- | --- | --- |
@@ -48,7 +48,8 @@ Six event types are recorded today. Three more (`run`, `escape`, and `cost`) are
 | `died` | recorded | `tq log record` | `commit`, `date`, `phase`, `reason`, `lifetime_seconds`, `kills` |
 | `lint` | recorded | `tq log lint` | `run`, `row`, `path`, `line`, `rule`, `rule_version`, `level`, `test`, `hash`, `offset`, optional `reason` |
 | `verdict` | recorded | `tq log verdict`, `tq log import-verdicts` | `row`, `rule`, `rule_version`, `verdict` (`real`, `intended`, `false`), `why`, `pattern`, `judge` |
-| `kill` | recorded | `tq log kill` | `run`, `commit`, `mutant`, `operator`, `worktree`, `red`, `green`, `bodies` |
+| `kill` | recorded | `tq log kill`, `tq revert-check` | `run`, `commit`, `mutant`, `operator`, `worktree`, `red`, `green`, `bodies` |
+| `mutant` | recorded | `tq mutants check`, `tq slice check --after-green` | `commit`, `mutant`, `assumption`, `flip`, `file`, `outcome`, `detail`, `tests` |
 | `run` | not yet recorded | none yet | per-test duration, peak memory, status (`passed`, `failed`, `flaky`) |
 | `escape` | not yet recorded | none yet | fix commit, file and line, covering tests, phase that should have caught it |
 | `cost` | not yet recorded | none yet | phase, tokens, wall time, review rounds |
@@ -61,7 +62,7 @@ The ledger tracks four properties of a test suite and of `tq` itself:
 
 | Measure | How it is computed | Current status |
 | --- | --- | --- |
-| Efficacy | Faults caught (`kill` events), unique kills (faults caught by only one test), and escapes caught | Faults and unique kills from `# catches:` replays are reported; `escape` events are not yet recorded |
+| Efficacy | Faults caught (`kill` events), unique kills (faults caught by only one test), and escapes caught | Reports aggregate `kill` events from fault-patch replays and revert-check. Pinned mutant results remain in the event log. |
 | Necessity | Deletion candidates: living tests observed in a `kill` event that have zero unique kills and have never failed in a `run` event | Reported under `Deletion candidates` in `tq log report` |
 | Accuracy | Per-rule precision by rule version: `strict = real / (real + intended + false + unjudged)` and `loose = real / (real + false)` | Reported in `tq log report` from `lint` and `verdict` events |
 | Cost | Runtime, memory, flaky rate, and authoring cost per phase | Not yet recorded |

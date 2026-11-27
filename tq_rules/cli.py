@@ -4,6 +4,7 @@ import subprocess
 import sys
 
 from . import catches, history, ledger, ledger_config, ledger_report, lint, props, repo, rules, witness
+from . import slice_commands
 
 
 def print_findings(rows, as_json, *, suppressed=None, no_crash=0):
@@ -60,6 +61,7 @@ def main():
     query.add_argument("family", nargs="?")
     query.add_argument("--search")
     lookup.add_argument("--json", action="store_true")
+    slice_commands.add_commands(commands)
     options = parser.parse_args()
     if options.command == "risk" and options.budget < 0:
         parser.error("--budget must be nonnegative")
@@ -68,6 +70,8 @@ def main():
     if options.command == "rules" and options.lang and not options.rule:
         parser.error("--lang requires a rule")
     try:
+        if hasattr(options, "slice_command"):
+            return options.slice_command(options)
         parse = select_parser(getattr(options, "engine", "legacy"))
         if options.command == "lint":
             select = (history.ChangedTests(repo.root("."), options.since, parser=parse)

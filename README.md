@@ -56,11 +56,16 @@ tq --help
 | `tq witness paths ...` | Find conditional checks without a witness test or coverage check |
 | `tq rules` | Print every rule, its level, and when suppression is allowed |
 | `tq catches [--repo PATH] [--worktree] [--cmd CMD]` | Apply each `# catches:` fault patch to a temporary copy of `HEAD` (`--worktree`: working tree) and run its test |
+| `tq mutants check [--since BASE] [--cmd CMD]` | Replay pinned faults and record whether their named tests catch them |
+| `tq slice check N [--feature NAME] --base BASE --cmd CMD [--after-green]` | Gate changed tests on lint, test notes, and assertion failures or mutant kills |
+| `tq revert-check TEST (--mutant ID \| --revert COMMIT) --cmd CMD` | Verify one test fails with a fault and passes with HEAD restored |
 | `tq risk [--repo PATH] [--html FILE] [--budget N]` | Rank source files by churn, fixes, importers, and test references |
 | `tq props [family \| --search TEXT]` | Look up cited test properties in `props/` |
 | `tq log <subcommand>` | Record test history, lint rows, verdicts, and fault kills; print a report |
 
 `lint`, `witness`, `catches`, `risk`, `props`, `log lint`, and `log report` accept `--json`.
+
+The slice commands require `ast-grep-py`. [Slice checks and pinned mutants](docs/slices.md)
 
 ### Walk-through
 
