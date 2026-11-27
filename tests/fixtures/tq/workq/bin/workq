@@ -1,0 +1,507 @@
+#!/usr/bin/env -S python3 -I
+"""Opt-in owner inbox and ordered work items. See workq-pilot-spec.md v2.
+
+CLAIM(replay): events are append-only; broken rows are skipped [v2 State;
+ test_fixture_age_bad_line_and_append_recovery]. The CLI and workq-hook share
+ Queue under one events-file lock, including inbox numbering.
+CLI errors: bad references/arguments exit 2, unreadable/absent queue exit 1.
+"""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+
+class BadNumber(ValueError):
+    pass
+
+
+def session_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise BadNumber("a session id must contain only letters, digits, _ or -")
+    return value
+
+
+def number(value, message=False):
+    pattern = r"m([1-9][0-9]*)" if message else r"([1-9][0-9]*)"
+    match = re.fullmatch(pattern, str(value))
+    if not match:
+        raise BadNumber(f"bad {'message' if message else 'item'} number: {value}")
+    return int(match[1])
+
+
+def state_path(sid):
+    root = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    return root / "workq" / session_id(sid)
+
+
+def private_file(path):
+    descriptor = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.fchmod(descriptor, 0o600)
+    return os.fdopen(descriptor, "a+", encoding="utf-8")
+
+
+def rows(stream):
+    stream.seek(0)
+    for line in stream:
+        try:
+            row = json.loads(line)
+            if isinstance(row, dict):
+                yield row
+        except ValueError:
+            continue
+
+
+def append(stream, row):
+    # A torn final row stays in history but cannot swallow the next valid row.
+    stream.seek(0)
+    content = stream.read()
+    if content and not content.endswith("\n"):
+        stream.write("\n")
+    stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+    stream.flush()
+
+
+class Queue:
+    def __init__(self, path, events):
+        self.path, self.events = path, events
+        self.enabled = self.exists = False
+        self.items, self.order, self.messages, self.filed = {}, [], {}, set()
+        for event in rows(events):
+            self.replay(event)
+        inbox = path / "inbox.jsonl"
+        if inbox.exists():
+            with inbox.open(encoding="utf-8") as stream:
+                for row in rows(stream):
+                    try:
+                        number(row.get("m"), message=True)
+                        if isinstance(row.get("text"), str):
+                            self.messages[row["m"]] = row
+                    except BadNumber:
+                        continue
+
+    def replay(self, event):
+        op = event.get("op")
+        if op in ("on", "off"):
+            self.enabled = op == "on"
+            self.exists |= self.enabled
+            return
+        try:
+            timestamp = event["t"]
+            if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
+                return
+            if op == "nothing":
+                number(event.get("m"), message=True)
+                self.filed.add(event["m"])
+                return
+            n = number(event.get("n"))
+            if op == "add" and n not in self.items and isinstance(event.get("text"), str):
+                source = event.get("m")
+                if source is not None:
+                    number(source, message=True)
+                self.items[n] = {"n": n, "t": timestamp, "text": event["text"],
+                                 "m": source, "status": "open", "note": None, "why": None}
+                self.order.append(n)
+                if source:
+                    self.filed.add(source)
+            elif n in self.items:
+                if op in ("start", "done", "drop", "reopen"):
+                    item = self.items[n]
+                    item["status"] = {"start": "running", "done": "done",
+                                      "drop": "dropped", "reopen": "open"}[op]
+                    # The closing reason belongs to the closing event only.
+                    note, why = event.get("note"), event.get("why")
+                    item["note"] = note if op == "done" and isinstance(note, str) else None
+                    item["why"] = why if op == "drop" and isinstance(why, str) else None
+                elif op == "move":
+                    after = event.get("after")
+                    if after != n and (after == 0 or after in self.items):
+                        self.order.remove(n)
+                        self.order.insert(self.order.index(after) + 1 if after else 0, n)
+        except (BadNumber, KeyError, TypeError, ValueError):
+            return
+
+    def record(self, op, **fields):
+        event = {"t": time.time(), "op": op, **fields}
+        append(self.events, event)
+        self.replay(event)
+
+    def capture(self, text):
+        n = max((number(m, message=True) for m in self.messages), default=0) + 1
+        message = {"m": f"m{n}", "t": time.time(), "chars": len(text), "text": text}
+        with private_file(self.path / "inbox.jsonl") as stream:
+            append(stream, message)
+        self.messages[message["m"]] = message
+        return message
+
+    def open_items(self):
+        return [self.items[n] for n in self.order if self.items[n]["status"] in ("open", "running")]
+
+    def unfiled(self):
+        return sorted((row for m, row in self.messages.items() if m not in self.filed),
+                      key=lambda row: number(row["m"], message=True))
+
+    def item_number(self, value):
+        n = number(value)
+        if n not in self.items:
+            raise BadNumber(f"unknown item: {value}")
+        return n
+
+    def message_number(self, value):
+        number(value, message=True)
+        if value not in self.messages:
+            raise BadNumber(f"unknown message: {value}")
+        return value
+
+
+@contextmanager
+def queue_for(sid, create=False):
+    path = state_path(sid)
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.parent.chmod(0o700)
+        path.mkdir(exist_ok=True, mode=0o700)
+        path.chmod(0o700)
+    elif not (path / "events.jsonl").is_file():
+        raise OSError("no queue for this session; opt in with workq on")
+    with private_file(path / "events.jsonl") as events:
+        fcntl.flock(events, fcntl.LOCK_EX)
+        queue = Queue(path, events)
+        if not queue.exists and not create:
+            raise OSError("no queue for this session; opt in with workq on")
+        yield queue
+
+
+def age(timestamp):
+    seconds = max(0, int(time.time() - timestamp))
+    for unit, divisor in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= divisor:
+            return f"{seconds // divisor}{unit}"
+    return f"{seconds}s"
+
+
+def one_line(text, limit=None):
+    text = " ".join(text.split())
+    return text if limit is None or len(text) <= limit else text[:limit - 1] + "…"
+
+
+def item_line(item, limit=None):
+    source = f" ({item['m']})" if item["m"] else ""
+    return one_line(f"#{item['n']} [{item['status']} {age(item['t'])}] {item['text']}{source}", limit)
+
+
+def message_line(message):
+    return f"{message['m']} ({len(message['text'])} chars) {one_line(message['text'], 80)}"
+
+
+BOARD_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>workq board</title>
+<style>
+:root{--s-bg:var(--background,#fafafa);--s-card:var(--card,#fff);--s-border:var(--border,#d9d9de);--s-text:var(--foreground,#18181b);--s-muted:var(--muted-foreground,#62626b);--s-radius:var(--radius,10px);
+--open:var(--chart-1,#2563eb);--run:var(--chart-2,#0d9488);--done:var(--muted-foreground,#71717a);--drop:var(--destructive,#dc2626);--accent:var(--primary,#2563eb)}
+@media (prefers-color-scheme:dark){:root{--s-bg:var(--background,#121214);--s-card:var(--card,#1c1c21);--s-border:var(--border,#34343c);--s-text:var(--foreground,#f4f4f5);--s-muted:var(--muted-foreground,#a1a1aa)}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--s-bg);font-family:var(--font-sans,system-ui,sans-serif);color:var(--s-text);line-height:1.45;font-size:14.5px}
+main{display:grid;grid-template-columns:minmax(0,1fr);gap:.75rem;padding-block:.5rem 6rem}
+#view{min-width:0}
+.item .row button{padding:.05rem .45rem;font-size:.8rem}
+button{font:inherit;color:inherit;background:transparent;border:1px solid var(--s-border);border-radius:999px;padding:.2rem .7rem;cursor:pointer}
+button.primary{border-color:var(--accent);color:var(--accent)}
+.card{background:var(--s-card);border:1px solid var(--s-border);border-radius:var(--s-radius);padding:1rem;min-width:0}
+h1{font-size:1.1rem;margin:0}h3{font-size:.95rem;margin:0;font-weight:600}p{margin:0}
+.muted{color:var(--s-muted);font-size:.85rem}
+.row{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center}
+.spread{justify-content:space-between}
+.strip{display:flex;height:10px;border-radius:5px;overflow:hidden;margin:.6rem 0 .3rem;background:var(--s-border)}
+.strip span{display:block}
+.chip{display:inline-flex;align-items:center;gap:.25rem;border:1px solid var(--s-border);border-radius:999px;padding:.02rem .55rem;font-size:.76rem;color:var(--s-muted);white-space:nowrap}
+.chip.s-open{border-color:var(--open);color:var(--open)}.chip.s-running{border-color:var(--run);color:var(--run)}
+.chip.s-done{border-color:var(--done);color:var(--done)}.chip.s-dropped{border-color:var(--drop);color:var(--drop)}
+.chip .dot{width:.45rem;height:.45rem;border-radius:50%;background:currentColor}
+.list{display:grid;gap:.5rem}
+.item{background:var(--s-card);border:1px solid var(--s-border);border-left:4px solid var(--c,var(--open));border-radius:var(--s-radius);padding:.7rem .8rem;min-width:0}
+.item.dragging{opacity:.5}
+.item .text{margin:.35rem 0 .45rem;overflow-wrap:anywhere}
+.handle{cursor:grab;touch-action:none;user-select:none;color:var(--s-muted);padding:0 .2rem;font-size:1.1rem;line-height:1}
+.tabs{display:flex;gap:.9rem;border-bottom:1px solid var(--s-border);margin-top:.4rem;font-size:.82rem}
+.tabs button{border:0;border-radius:0;padding:.3rem 0;color:var(--s-muted)}
+.tabs button[aria-selected=true]{color:var(--s-text);box-shadow:inset 0 -2px 0 var(--accent)}
+.pane{padding-top:.5rem;font-size:.86rem;overflow-wrap:anywhere}
+.comment{border-left:2px solid var(--s-border);padding:.1rem .5rem;margin:.3rem 0}
+.compose{display:flex;gap:.4rem;margin-top:.4rem}
+.compose input{flex:1;min-width:0;font:inherit;color:inherit;background:transparent;border:1px solid var(--s-border);border-radius:8px;padding:.3rem .5rem}
+.stepper{display:flex;gap:.25rem;margin:.2rem 0}
+.stepper button{flex:1;border-radius:6px;font-size:.78rem;padding:.25rem 0}
+.stepper button.on{border-color:var(--c);color:var(--c);background:color-mix(in srgb,var(--c) 12%,transparent)}
+.lane-title{font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;color:var(--s-muted);margin:.4rem 0 .2rem}
+textarea{width:100%;min-height:7rem;font-family:var(--font-mono,monospace);font-size:.78rem;color:inherit;background:transparent;border:1px solid var(--s-border);border-radius:8px;padding:.5rem}
+.toast{font-size:.8rem;color:var(--run)}
+</style></head><body><main>
+
+<section class="card">
+ <div class="row spread"><h1>workq · this session</h1><span class="muted" id="counts"></span></div>
+ <div class="strip" id="strip" aria-label="progress"></div>
+ <p class="muted" id="asof"></p>
+</section>
+
+<section id="view"><noscript><p class="card muted">This board needs JavaScript. The queue is in the workq-state block of this file.</p></noscript></section>
+
+<section class="card">
+ <div class="row spread"><h3>Hand back to the agent</h3><span class="toast" id="toast"></span></div>
+ <p class="muted" style="margin:.3rem 0 .5rem">Copy changes gives the agent workq commands plus your comments. Copy state gives the whole board as JSON; paste one back to restore it. Comments live on this page only; workq does not store them.</p>
+ <div class="row"><button class="primary" id="copyChanges">Copy changes</button><button id="copyState">Copy state</button><button id="pasteState">Paste state</button></div>
+ <textarea id="out" style="margin-top:.6rem" placeholder="Copied text shows here too, in case the clipboard is blocked. Paste state here and press Paste state."></textarea>
+</section>
+</main>
+<script id="workq-state" type="application/json">__WORKQ_STATE__</script>
+<script id="workq-board">
+/* This page is interactive by design: the HTML-state contract's "no script but the data block"
+   does not apply. It only reads workq-state; nothing here writes to workq. The pure functions
+   are exported on globalThis.workqBoard so test_workq_board.py can run them under node. */
+(function(){
+const STATUSES=["open","running","done","dropped"];
+const COLOUR={open:"var(--open)",running:"var(--run)",done:"var(--done)",dropped:"var(--drop)"};
+const VERB={open:"reopen",running:"start",done:"done",dropped:"drop"};
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const oneLine=s=>String(s).replace(/\s+/g," ").trim();
+const chip=s=>`<span class="chip s-${s}"><span class="dot"></span>${s}</span>`;
+function ageText(seconds){seconds=Math.max(0,Math.floor(seconds));
+ for(const [unit,size] of [["d",86400],["h",3600],["m",60]])if(seconds>=size)return `${Math.floor(seconds/size)}${unit}`;
+ return `${seconds}s`;}
+function initialState(snapshot){
+ return {order:snapshot.items.map(i=>i.n),status:Object.fromEntries(snapshot.items.map(i=>[i.n,i.status])),comments:{}};}
+function resolve(snapshot,edited){
+ const byN=new Map(snapshot.items.map(i=>[i.n,i]));
+ return edited.order.map(n=>({...byN.get(n),was:byN.get(n).status,status:edited.status[n]}));}
+function itemHTML(it,position,comments,tab,generatedAt){
+ const age=ageText(generatedAt-it.t);
+ const reason=it.was!==it.status?"":it.note?`Done note: ${esc(it.note)}`:it.why?`Dropped: ${esc(it.why)}`:"";
+ const pane={
+  details:`${reason||`Position ${position} in the queue.`}`,
+  comments:comments.map(c=>`<div class="comment">${esc(c)}</div>`).join("")+`<div class="compose"><input placeholder="Comment for the agent" aria-label="Comment on #${it.n}" data-cin="${it.n}"><button data-cadd="${it.n}">Add</button></div>`,
+  history:`<span class="muted">added ${age} ago${it.m?` from ${esc(it.m)}`:""}${it.status!=="open"?` · ${it.status}`:""}</span>`}[tab];
+ return `<article class="item" style="--c:${COLOUR[it.status]}" data-n="${it.n}">
+  <div class="row spread"><div class="row"><span class="handle" title="drag to reorder" data-drag="${it.n}">⠿</span><b>#${it.n}</b>${chip(it.status)}${it.m?`<span class="chip">from ${esc(it.m)}</span>`:""}<span class="chip">${age}</span>${comments.length?`<span class="chip">💬 ${comments.length}</span>`:""}</div>
+   <div class="row"><button data-up="${it.n}" aria-label="move #${it.n} up">↑</button><button data-down="${it.n}" aria-label="move #${it.n} down">↓</button></div></div>
+  <p class="text">${esc(it.text)}</p>
+  <div class="stepper">${STATUSES.map(s=>`<button class="${it.status===s?"on":""}" data-set="${it.n}" data-s="${s}">${s}</button>`).join("")}</div>
+  <div class="tabs" role="tablist">${["details","comments","history"].map(t=>`<button role="tab" aria-selected="${tab===t}" data-tab="${it.n}" data-t="${t}">${t[0].toUpperCase()+t.slice(1)}${t==="comments"&&comments.length?` (${comments.length})`:""}</button>`).join("")}</div>
+  <div class="pane">${pane}</div>
+ </article>`;}
+function viewHTML(snapshot,edited=initialState(snapshot),tabs={}){
+ const items=resolve(snapshot,edited);
+ const live=items.filter(i=>i.status==="open"||i.status==="running"),closed=items.filter(i=>i.status==="done"||i.status==="dropped");
+ const card=it=>itemHTML(it,items.indexOf(it)+1,edited.comments[it.n]||[],tabs[it.n]||"details",snapshot.generated_at);
+ const lane=(title,list)=>`<p class="lane-title">${title}</p><div class="list">${list.map(card).join("")||'<p class="muted">—</p>'}</div>`;
+ return `<div class="card">${lane("Now",live.slice(0,1))}${lane("Next",live.slice(1,3))}${lane("Later",live.slice(3))}<details style="margin-top:.6rem"><summary class="muted">Closed (${closed.length})</summary><div class="list" style="margin-top:.5rem">${closed.map(card).join("")}</div></details></div>`;}
+/* Fewest `workq move` commands that turn the original order into the edited one: items on a
+   longest increasing subsequence keep their place; every other item is re-anchored after its
+   new predecessor, walking the edited order front to back. */
+function moveCommands(original,order){
+ const rank=new Map(order.map((n,i)=>[n,i])),ranks=original.map(n=>rank.get(n));
+ const length=ranks.map(()=>1),previous=ranks.map(()=>-1);let best=-1;
+ ranks.forEach((r,i)=>{for(let j=0;j<i;j++)if(ranks[j]<r&&length[j]+1>length[i]){length[i]=length[j]+1;previous[i]=j;}
+  if(best<0||length[i]>length[best])best=i;});
+ const keep=new Set();for(let i=best;i>=0;i=previous[i])keep.add(original[i]);
+ return order.flatMap((n,i)=>keep.has(n)?[]:[`workq move ${n} --after ${i?order[i-1]:0}`]);}
+function changeCommands(snapshot,edited){
+ const lines=[];
+ snapshot.items.forEach(it=>{const now=edited.status[it.n];
+  if(now!==it.status)lines.push(`workq ${VERB[now]} ${it.n}${now==="dropped"?" --why 'dropped on the board'":""}`);});
+ lines.push(...moveCommands(snapshot.items.map(i=>i.n),edited.order));
+ /* One physical line per comment: a newline would let the next line run as a command. */
+ Object.keys(edited.comments).forEach(n=>edited.comments[n].forEach(c=>{const text=oneLine(c);if(text)lines.push(`# comment on #${n}: ${text}`);}));
+ return lines.length?lines:["# no changes"];}
+function stateText(snapshot,edited){return JSON.stringify({workq:1,order:edited.order,status:edited.status,comments:edited.comments},null,1);}
+/* Takes order, status and comments from a pasted state; never item text. Null when the state
+   is not a copy of this queue. */
+function restoreState(snapshot,text){
+ try{const s=JSON.parse(text),known=snapshot.items.map(i=>i.n);
+  if(!s||s.workq!==1||!Array.isArray(s.order))return null;
+  if(new Set(s.order).size!==known.length||!s.order.every(n=>known.includes(n)))return null;
+  if(!known.every(n=>s.status&&STATUSES.includes(s.status[n])))return null;
+  const comments={};
+  Object.entries(s.comments||{}).forEach(([n,list])=>{if(known.includes(+n)&&Array.isArray(list))comments[n]=list.map(String);});
+  return {order:s.order.slice(),status:Object.fromEntries(known.map(n=>[n,s.status[n]])),comments};
+ }catch(error){return null;}}
+globalThis.workqBoard={viewHTML,initialState,changeCommands,stateText,restoreState};
+if(typeof document==="undefined")return;
+
+const snapshot=JSON.parse(document.getElementById("workq-state").textContent);
+let edited=initialState(snapshot),tabs={};
+const $=id=>document.getElementById(id);
+function render(){
+ const drafts=[...document.querySelectorAll("[data-cin]")].map(i=>[i.dataset.cin,i.value]);
+ const items=resolve(snapshot,edited),by=s=>items.filter(i=>i.status===s);
+ $("counts").textContent=STATUSES.map(s=>`${by(s).length} ${s}`).join(" · ");
+ $("strip").innerHTML=items.length?["done","running","open","dropped"].map(s=>`<span style="width:${100*by(s).length/items.length}%;background:${COLOUR[s]}"></span>`).join(""):"";
+ $("asof").textContent=`As of ${new Date(snapshot.generated_at*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}. Edits stay on this page until you hand them back.`;
+ $("view").innerHTML=items.length?viewHTML(snapshot,edited,tabs):'<p class="card muted">The queue is empty.</p>';
+ drafts.forEach(([n,value])=>{const input=document.querySelector(`[data-cin="${n}"]`);if(input)input.value=value;});}
+function isLive(n){return edited.status[n]==="open"||edited.status[n]==="running";}
+function move(n,step){
+ const group=m=>isLive(m)===isLive(n),order=edited.order;
+ for(let j=order.indexOf(n)+step;j>=0&&j<order.length;j+=step)if(group(order[j])){
+  order.splice(order.indexOf(n),1);order.splice(j,0,n);break;}
+ render();}
+document.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const d=b.dataset;
+ if(d.tab){tabs[d.tab]=d.t;render();}
+ else if(d.up)move(+d.up,-1);else if(d.down)move(+d.down,1);
+ else if(d.set){edited.status[d.set]=d.s;render();}
+ else if(d.cadd){const input=document.querySelector(`[data-cin="${d.cadd}"]`),text=oneLine(input.value);
+  if(text){(edited.comments[d.cadd]=edited.comments[d.cadd]||[]).push(text);tabs[d.cadd]="comments";render();}}});
+document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.dataset.cin)document.querySelector(`[data-cadd="${e.target.dataset.cin}"]`).click();});
+/* pointer drag: works with touch, unlike HTML5 drag and drop. The dragged item takes the target's slot. */
+let drag=null;
+document.addEventListener("pointerdown",e=>{const h=e.target.closest("[data-drag]");if(!h)return;
+ drag={n:+h.dataset.drag,el:h.closest(".item")};drag.el.classList.add("dragging");h.setPointerCapture(e.pointerId);});
+function endDrag(e,drop){if(!drag)return;drag.el.classList.remove("dragging");
+ const target=drop&&document.elementsFromPoint(e.clientX,e.clientY).map(x=>x.closest&&x.closest(".item")).find(x=>x&&+x.dataset.n!==drag.n);
+ if(target){const order=edited.order,slot=order.indexOf(+target.dataset.n);order.splice(order.indexOf(drag.n),1);order.splice(slot,0,drag.n);}
+ drag=null;render();}
+document.addEventListener("pointerup",e=>endDrag(e,true));
+document.addEventListener("pointercancel",e=>endDrag(e,false));
+function flash(text){$("toast").textContent=text;setTimeout(()=>$("toast").textContent="",3000);}
+function show(text,label){const out=$("out");out.value=text;out.select();
+ let copied=null;try{copied=navigator.clipboard&&navigator.clipboard.writeText(text);}catch(error){}
+ if(copied)copied.then(()=>flash(`${label} (copied)`),()=>flash(`${label}: clipboard blocked, copy the text below`));
+ else flash(`${label}: copy the text below`);}
+$("copyChanges").onclick=()=>show(changeCommands(snapshot,edited).join("\n"),"Changes");
+$("copyState").onclick=()=>show(stateText(snapshot,edited),"State");
+$("pasteState").onclick=()=>{const restored=restoreState(snapshot,$("out").value);
+ if(restored){edited=restored;render();flash("State restored");}else flash("That is not a copied state of this queue");};
+render();
+})();
+</script>
+<script>
+(function(){var last=0;function send(){var h=Math.ceil(document.documentElement.getBoundingClientRect().height);
+if(h!==last){last=h;parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/size-changed",params:{height:h}},"*");}}
+new ResizeObserver(send).observe(document.documentElement);document.addEventListener("toggle",send,true);send();})();
+</script>
+</body></html>
+"""
+
+
+def snapshot(queue, now):
+    """CLAIM(board-snapshot): every item in queue order, closing reasons included [test_workq_board]."""
+    items = [{"n": n, "order": position, **{key: queue.items[n][key] for key in
+              ("text", "m", "status", "note", "why", "t")}}
+             for position, n in enumerate(queue.order, 1)]
+    return {"workq": 1, "generated_at": now, "items": items}
+
+
+def state_block(value):
+    """JSON safe inside a <script>: no raw '<' can open '</script>' or '<!--'."""
+    return (json.dumps(value, ensure_ascii=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
+
+
+def board_summary(board):
+    counts = {status: 0 for status in ("open", "running", "done", "dropped")}
+    for item in board["items"]:
+        counts[item["status"]] += 1
+    lines = [" · ".join(f"{counts[status]} {status}" for status in counts)]
+    return lines + [item_line(item) for item in board["items"]]
+
+
+def write_board_page(path, board):
+    page = BOARD_PAGE.replace("__WORKQ_STATE__", state_block(board))
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(page)
+
+
+def parser():
+    arguments = argparse.ArgumentParser(description=__doc__)
+    arguments.add_argument("-s", "--session")
+    commands = arguments.add_subparsers(dest="command", required=True)
+    for command in ("on", "off"):
+        commands.add_parser(command)
+    add = commands.add_parser("add")
+    add.add_argument("--from", dest="source")
+    add.add_argument("text", nargs="+")
+    listing = commands.add_parser("list")
+    listing.add_argument("--all", action="store_true")
+    board = commands.add_parser("board", help="read-only snapshot of the queue, optionally as a page")
+    board.add_argument("--json", action="store_true")
+    board.add_argument("--html", metavar="PATH")
+    for command in ("start", "done", "drop", "reopen", "move", "nothing"):
+        sub = commands.add_parser(command)
+        sub.add_argument("number")
+        if command == "done":
+            sub.add_argument("--note")
+        if command in ("drop", "nothing"):
+            sub.add_argument("--why", required=True)
+        if command == "move":
+            sub.add_argument("--after", required=True)
+    return arguments
+
+
+def main():
+    args = parser().parse_args()
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or args.session or os.environ.get("WORKQ_SESSION")
+    try:
+        if not sid:
+            raise OSError("set CLAUDE_CODE_SESSION_ID, -s, or WORKQ_SESSION")
+        with queue_for(sid, create=args.command == "on") as queue:
+            command = args.command
+            if command in ("on", "off"):
+                queue.record(command)
+            elif command == "list":
+                for n in queue.order:
+                    if args.all or queue.items[n]["status"] in ("open", "running"):
+                        print(item_line(queue.items[n]))
+                for message in queue.unfiled():
+                    print(message_line(message))
+            elif command == "board":
+                board = snapshot(queue, time.time())
+                if args.html:
+                    write_board_page(args.html, board)
+                if args.json:
+                    print(json.dumps(board, ensure_ascii=False))
+                elif args.html:
+                    print(f"workq: wrote {args.html}")
+                else:
+                    print("\n".join(board_summary(board)))
+            elif command == "add":
+                source = queue.message_number(args.source) if args.source else None
+                n = max(queue.items, default=0)
+                for text in args.text:
+                    n += 1
+                    queue.record("add", n=n, text=text, m=source)
+                    print(n)
+            elif command == "nothing":
+                queue.record(command, m=queue.message_number(args.number), why=args.why)
+            else:
+                n = queue.item_number(args.number)
+                fields = {"n": n}
+                if command == "move":
+                    fields["after"] = 0 if args.after == "0" else queue.item_number(args.after)
+                    if fields["after"] == n:
+                        raise BadNumber("cannot move an item after itself")
+                if command == "done" and args.note is not None:
+                    fields["note"] = args.note
+                if command == "drop":
+                    fields["why"] = args.why
+                queue.record(command, **fields)
+                if command == "done":
+                    pending = queue.open_items()
+                    print(item_line(pending[0]) if pending else "workq: no open items")
+    except BadNumber as error:
+        print(f"workq: {error}", file=sys.stderr)
+        return 2
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"workq: unreadable state: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

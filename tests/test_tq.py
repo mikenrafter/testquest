@@ -12,7 +12,7 @@ import unittest
 from html.parser import HTMLParser
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "tq"
 RULES = {
     "absence-no-control",
@@ -50,7 +50,7 @@ class TqCase(unittest.TestCase):
 
     def tq(self, *args, code=(0,), env=None):
         result = subprocess.run(
-            [sys.executable, "-I", str(ROOT / "bin/tq"), *map(str, args)],
+            [sys.executable, "-I", str(ROOT / "tq"), *map(str, args)],
             cwd=self.scratch if "--repo" in args else self.repo,
             env=env,
             capture_output=True,
@@ -624,7 +624,7 @@ class CatchesTests(TqCase):
         # WHY: the audited workq suite uses serial processes, so it cannot detect lost exclusion.
         # catches: missing the real lock-removal survivor or treating it as a killed fault
         for name in ("bin/workq", "bin/workq-hook", "skills/build-loop/scripts/tests/test_workq.py"):
-            self.copy(ROOT / name, name)
+            self.copy(FIXTURES / "workq" / name, name)
         self.copy(FIXTURES / "workq-no-lock.patch")
         self.copy(FIXTURES / "workq_fault.py", "test_fault.py")
         self.commit("Snapshot audited workq and lock deletion")
@@ -916,7 +916,7 @@ class PropsTests(TqCase):
     def test_family_returns_cited_schema_records(self):
         # WHY: each of four families needs actionable records from the corpus directory.
         # catches: serving inline summaries or loading records from a missing pilot family
-        directory = ROOT / "skills/test-quality/props"
+        directory = ROOT / "props"
         fields = {
             "id", "schema_version", "family", "variant", "applicability", "kind",
             "law", "input_strategy", "edge_cases", "oracle", "known_wrong_implementations",

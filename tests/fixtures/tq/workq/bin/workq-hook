@@ -1,0 +1,105 @@
+#!/usr/bin/env -S python3 -I
+"""Claude Code workq v2 capture/compaction hook; any fault exits 0 silently.
+
+CLAIM(owner-only): delegated and machine prompts stay silent [v2 Hook;
+ test_machine_prompts_not_captured, test_opted_out_and_delegates_silent].
+CLAIM(bounded): prompt context <=6 lines/600 chars; compact <=6000 UTF-8
+ bytes [v2 Hook; test_prompt_budget_with_long_queue_and_older_unfiled,
+ test_compact_budget_marks_truncation]. Token budgets are approximations.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import sys
+
+
+def machine_prompt(prompt):
+    return bool(re.match(
+        r"(?:Delegated task |<task-notification|<system-reminder>|"
+        r"<cross-session|\[Cross.session message\]|"
+        r"(?:Report from|From) the .{0,100} (?:orchestrator|session)\b|"
+        r"(?:FYI|Follow-up) from the .{0,100} session\b|"
+        r"User-authorized addition from the |MCP augmentation details requested by the owner\.)",
+        prompt))
+
+
+def bounded(text, budget):
+    encoded = text.encode("utf-8")
+    marker = "\n[truncated; use workq list and inbox.jsonl for the rest]"
+    if len(encoded) <= budget:
+        return text
+    return encoded[:budget - len(marker.encode())].decode("utf-8", errors="ignore") + marker
+
+
+def prompt_context(queue, message, helpers):
+    lines = [f"workq: {message['m']} captured. File its requests: workq add --from {message['m']} '<req>' ..."]
+    pending = queue.open_items()
+    older = [row for row in queue.unfiled() if row["m"] != message["m"]]
+    # Keep both kinds visible when a long queue would otherwise crowd out inbox nags.
+    for item in pending[:3 if older else 4]:
+        lines.append(helpers["item_line"](item, 95))
+    if older:
+        lines.append("unfiled: " + helpers["one_line"](helpers["message_line"](older[-1]), 95))
+    omitted = len(pending) + len(older) - (len(lines) - 1)
+    if omitted:
+        lines.append(f"workq: {omitted} more; workq list")
+    return "\n".join(lines)
+
+
+def compact_context(queue, helpers):
+    pending, unfiled = queue.open_items(), queue.unfiled()
+    if not pending and not unfiled:
+        return ""
+    lines = ["workq: this survived compaction; resume in order."]
+    # Leave most of the budget for unfiled owner text, including when the queue is large.
+    for item in pending[:6]:
+        lines.append(helpers["item_line"](item, 120))
+    if len(pending) > 6:
+        lines.append(f"workq: {len(pending) - 6} more open items; workq list")
+    for message in reversed(unfiled):
+        lines.append(f"Owner inbox {message['m']} ({len(message['text'])} chars), unfiled:")
+        lines.append(message["text"])
+    return bounded("\n".join(lines), 6000)
+
+
+def main():
+    if os.environ.get("T3CODE_THREAD_ID", "").startswith("thread:delegated-task:"):
+        return
+    payload = json.load(sys.stdin)
+    if not isinstance(payload, dict):
+        return
+    sid, event = payload.get("session_id"), payload.get("hook_event_name")
+    if event not in ("UserPromptSubmit", "SessionStart"):
+        return
+    if event == "SessionStart" and payload.get("source") != "compact":
+        return
+    prompt = payload.get("prompt")
+    if event == "UserPromptSubmit" and (not isinstance(prompt, str) or machine_prompt(prompt)):
+        return
+    script = os.environ.get("WORKQ_SCRIPT") or str(Path(__file__).with_name("workq"))
+    helpers = runpy.run_path(script, run_name="workq_library")
+    toggle = event == "UserPromptSubmit" and prompt in ("workq on", "workq off")
+    with helpers["queue_for"](sid, create=toggle and prompt == "workq on") as queue:
+        if toggle:
+            queue.record(prompt.split()[1])
+            return
+        if not queue.enabled:
+            return
+        if event == "UserPromptSubmit":
+            quiet = len(prompt) < 120 and not queue.open_items() and not queue.unfiled()
+            message = queue.capture(prompt)
+            context = "" if quiet else prompt_context(queue, message, helpers)
+        else:
+            context = compact_context(queue, helpers)
+    if context:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}},
+                         ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass

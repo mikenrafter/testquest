@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 
-DIRECTORY = Path(__file__).resolve().parents[2] / "skills/test-quality/props"
+DIRECTORY = Path(__file__).resolve().parents[1] / "props"
 
 
 def find(family, search):
