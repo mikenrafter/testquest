@@ -9,3 +9,5 @@ ECMASCRIPT_LANGUAGES = {
     ".cjs": "javascript",
 }
 ECMASCRIPT_OUTPUT = {"node_modules", "dist", "build", "coverage"}
+
+CALLBACK_SUFFIXES = frozenset(ECMASCRIPT_LANGUAGES) | {".dart"}

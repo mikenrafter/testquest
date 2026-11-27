@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 import tokenize
 
-from .ast_grep_languages import ECMASCRIPT_LANGUAGES, ECMASCRIPT_OUTPUT
+from .ast_grep_languages import CALLBACK_SUFFIXES, ECMASCRIPT_OUTPUT
 
 
 @dataclass(frozen=True)
@@ -44,12 +44,12 @@ class Test:
 
 
 def note_owners(path, tests, comment, *, inventory=False):
-    ecmascript = path.suffix in ECMASCRIPT_LANGUAGES
-    if inventory or ecmascript:
+    callback_source = path.suffix in CALLBACK_SUFFIXES
+    if inventory or callback_source:
         owners = [test for test in tests if test.owns_inventory_comment(comment)]
     else:
         owners = [test for test in tests if test.owns(comment)]
-    if ecmascript and owners:
+    if callback_source and owners:
         return [max(owners, key=lambda test: (test.start, test.column, -test.end))]
     return owners
 
@@ -93,7 +93,7 @@ def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None,
     paths = {}
     cwd = Path.cwd()
     legacy_suffixes = {".py", ".rs"}
-    suffixes = legacy_suffixes | ECMASCRIPT_LANGUAGES.keys() if parser else legacy_suffixes
+    suffixes = legacy_suffixes | CALLBACK_SUFFIXES if parser else legacy_suffixes
     for item in inputs:
         path = Path(item)
         if not path.exists():
@@ -145,7 +145,7 @@ def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None,
 
 
 def unignored_scripts(root, paths):
-    """Apply the repository's Git ignore rules to discovered JavaScript sources."""
+    """Apply the repository's Git ignore rules to discovered callback sources."""
     if not paths:
         return []
     relatives = {os.fsencode(path.relative_to(root)): path for path in paths}
