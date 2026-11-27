@@ -9,3 +9,6 @@ ECMASCRIPT_LANGUAGES = {
     ".cjs": "javascript",
 }
 ECMASCRIPT_OUTPUT = {"node_modules", "dist", "build", "coverage"}
+
+JVM_LANGUAGES = {".kt": "kotlin", ".kts": "kotlin", ".java": "java"}
+EXTENDED_LANGUAGES = ECMASCRIPT_LANGUAGES | JVM_LANGUAGES

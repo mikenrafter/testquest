@@ -1,6 +1,6 @@
 import re
 
-from .ast_grep_languages import ECMASCRIPT_LANGUAGES
+from .ast_grep_languages import EXTENDED_LANGUAGES
 from .source import finding, note_owners, scan_paths
 
 
@@ -14,16 +14,16 @@ def find(paths, *, parser=None):
     for path, tests, _ in files:
         for test in tests:
             labels = {test.name, test.identifier}
-            if path.suffix in ECMASCRIPT_LANGUAGES:
+            if path.suffix in EXTENDED_LANGUAGES:
                 labels.add(test.qualified)
             for label in labels:
                 names.setdefault(label, set()).add(id(test))
 
     for path, tests, comments in files:
-        ecmascript = path.suffix in ECMASCRIPT_LANGUAGES
+        extended = path.suffix in EXTENDED_LANGUAGES
         witnessed = set()
         for comment in comments:
-            if ecmascript and comment.text.startswith("reaches:"):
+            if extended and comment.text.startswith("reaches:"):
                 label = comment.text.removeprefix("reaches:").strip()
             elif match := REACHES.fullmatch(comment.text):
                 label = match[1]

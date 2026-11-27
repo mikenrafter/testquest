@@ -1,0 +1,444 @@
+"""JVM assertion operands, literal proofs and recorder observations."""
+
+from dataclasses import dataclass
+
+from . import lint
+from .ast_grep import children, line, query, shape, unwrap
+from .ast_grep_jvm import call_of, child, member, name, string_title
+from .ast_grep_lint import COMPARISONS, literal as stage_literal, range_size
+
+
+UNKNOWN = lint.UNKNOWN
+EQUAL = {"assertEquals", "assertArrayEquals", "assertIterableEquals", "isEqualTo", "shouldBe", "equalTo"}
+UNEQUAL = {"assertNotEquals", "isNotEqualTo", "shouldNotBe", "notEqualTo"}
+IDENTITY = {"assertSame", "isSameAs", "assertNotSame", "isNotSameAs"}
+BOOLEANS = {"assertTrue", "assertFalse", "isTrue", "isFalse", "shouldBeTrue", "shouldBeFalse"}
+FLUENT_ROOTS = {"assertThat", "assertThatThrownBy", "assertThatCode", "assertThatExceptionOfType",
+                "assertThatNullPointerException", "assertThatIllegalArgumentException",
+                "assertThatIllegalStateException", "assertThatIOException", "then"}
+FLUENT_OPTIONS = {"as", "describedAs", "named", "overridingErrorMessage", "withFailMessage",
+                  "because", "usingComparator", "usingDefaultComparator", "usingRecursiveComparison",
+                  "withComparator", "withMessage", "that", "comparingElementsUsing", "ignoringFields"}
+FLUENT_TRANSFORMS = {"extracting", "flatExtracting", "filteredOn", "map", "flatMap", "first", "last",
+                     "element", "get", "actual", "asInstanceOf"}
+FLUENT_TERMINALS = ("is", "has", "have", "contains", "doesNot", "startsWith", "endsWith",
+                    "matches", "satisfies", "allSatisfy", "anySatisfy", "noneSatisfy", "fails",
+                    "succeeded", "was", "starts", "ends", "completes", "lies", "exists",
+                    "anyMatch", "allMatch", "noneMatch", "canRead", "canWrite")
+KOTEST_EXACT = {"should", "shouldNot", "shouldBe", "shouldNotBe", "shouldHave", "shouldNotHave"}
+KOTEST_PREFIXES = ("shouldBe", "shouldNotBe", "shouldHave", "shouldNotHave", "shouldThrow",
+                   "shouldNotThrow", "shouldContain", "shouldNotContain", "shouldStart", "shouldEnd",
+                   "shouldMatch", "shouldNotMatch", "shouldEqual", "shouldNotEqual", "shouldFail")
+VERIFICATIONS = {"verify", "verifyBlocking", "coVerify", "verifySequence", "coVerifySequence",
+                 "verifyOrder", "coVerifyOrder", "verifyAll", "coVerifyAll"}
+NO_INTERACTIONS = {"verifyZeroInteractions", "verifyNoInteractions", "verifyNoMoreInteractions",
+                   "confirmVerified"}
+BINARY_KINDS = {"binary_expression", "equality_expression", "comparison_expression",
+                "conjunction_expression", "disjunction_expression", "elvis_expression"}
+INTEGER_KINDS = {"integer_literal", "hex_literal", "bin_literal", "decimal_integer_literal",
+                 "hex_integer_literal", "binary_integer_literal", "octal_integer_literal"}
+SYNCHRONOUS = {"assertAll", "assertSoftly", "assertTimeout", "assertTimeoutPreemptively", "runTest",
+               "runBlocking", "run", "apply", "also", "let", "with", "use", "synchronized",
+               "assumingThat", "assertDoesNotThrow", "assertNotNull", "assertIs", "assertIsNot",
+               "eventually", "continually", "assertEach", "runOnIdle", "runOnUiThread", "runOnMainSync",
+               "onActivity", "runComposeUiTest", "runAndroidComposeUiTest", "dynamicTest"}
+ITERATING = {"forEach", "forEachIndexed", "map", "mapIndexed", "onEach", "all", "any", "none",
+             "filter", "filterNot", "repeat"}
+
+
+def split(node):
+    node = unwrap(node)
+    if node is not None and node.kind() in BINARY_KINDS:
+        elements = [entry for entry in node.children() if entry.kind() not in
+                    {"comment", "line_comment", "block_comment", "multiline_comment"}]
+        if len(elements) == 3:
+            left, operator, right = elements
+            return operator.text(), left, right
+    return "", None, None
+
+
+def negate(node):
+    node = unwrap(node)
+    if node is not None and node.kind() in {"prefix_expression", "unary_expression"}:
+        entries = node.children()
+        if len(entries) == 2 and entries[0].kind() == "!":
+            return entries[1]
+    return None
+
+
+def literal(syntax, node):
+    node = unwrap(node)
+    if node is None:
+        return UNKNOWN
+    kind = node.kind()
+    if kind == "string_literal":
+        title = string_title(node)
+        return title if title is not None and "\\" not in title else UNKNOWN
+    if kind in {"null", "null_literal"}:
+        return None
+    if kind in INTEGER_KINDS:
+        word = node.text().replace("_", "").lower().removesuffix("l")
+        if word.endswith("u"):
+            return UNKNOWN
+        base = 8 if kind == "octal_integer_literal" else 0 if word.startswith(("0x", "0b")) else 10
+        try:
+            value = int(word, base)
+        except ValueError:
+            return UNKNOWN
+        if value < 2 ** 63 and (base == 10 or value < 2 ** 31):
+            return value
+        return UNKNOWN
+    if kind in {"real_literal", "decimal_floating_point_literal"}:
+        if node.text()[-1:].lower() == "f":
+            return UNKNOWN
+        try:
+            return float(node.text().replace("_", "").lower().removesuffix("d"))
+        except ValueError:
+            return UNKNOWN
+    if kind in {"prefix_expression", "unary_expression"} and node.children()[0].kind() in {"-", "+"}:
+        operand = literal(syntax, children(node)[-1])
+        if type(operand) in {float, int}:
+            return -operand if node.children()[0].kind() == "-" else operand
+    return stage_literal(syntax, node)
+
+
+def compare(operator, first, second):
+    if UNKNOWN in (first, second) or type(first) is not type(second):
+        return UNKNOWN
+    if operator in {"==", "!="}:
+        return COMPARISONS[operator](first, second)
+    if type(first) in {int, float} and operator in COMPARISONS:
+        return COMPARISONS[operator](first, second)
+    return UNKNOWN
+
+
+def truth(syntax, node):
+    value = literal(syntax, node)
+    if type(value) is bool:
+        return value
+    if (inner := negate(node)) is not None:
+        value = truth(syntax, inner)
+        return not value if value is not UNKNOWN else UNKNOWN
+    operator, left, right = split(node)
+    if operator in {"&&", "||"}:
+        values = (truth(syntax, left), truth(syntax, right))
+        decisive = operator == "||"
+        if any(value is decisive for value in values):
+            return decisive
+        if UNKNOWN not in values:
+            return not decisive
+    return compare(operator, literal(syntax, left), literal(syntax, right))
+
+
+def iterable_size(syntax, node):
+    node = unwrap(node)
+    if node is None:
+        return None
+    if node.kind() == "array_creation_expression":
+        if (initializer := child(node, "array_initializer")) is not None:
+            return len(children(initializer))
+        size = literal(syntax, child(child(node, "dimensions_expr"), *INTEGER_KINDS))
+        return size if type(size) is int and size >= 0 else None
+    if node.kind() in {"range_expression", "infix_expression"}:
+        entries = children(node)
+        if len(entries) in {2, 3} and entries:
+            operator = (name(entries[1]) if len(entries) == 3 else
+                        next((token.kind() for token in node.children() if token.kind() in {"..", "..<"}), ""))
+            first, last = (literal(syntax, target) for target in (entries[0], entries[-1]))
+            if type(first) is type(last) is int:
+                if operator in {"..", "..<", "until"}:
+                    return range_size(first, last + int(operator == ".."))
+                if operator == "downTo":
+                    return range_size(first, last - 1, -1)
+    if (call := call_of(node)) is not None:
+        factories = {"listOf", "mutableListOf", "arrayOf", "booleanArrayOf", "byteArrayOf", "intArrayOf",
+                     "longArrayOf", "doubleArrayOf", "floatArrayOf", "charArrayOf", "shortArrayOf",
+                     "setOf", "mutableSetOf", "sequenceOf", "mapOf", "mutableMapOf"}
+        if call.receiver is None and call.method in factories:
+            return sum(arg.kind() != "spread_expression" for arg in call.args)
+        if call.receiver is None and call.method in {"emptyList", "emptyArray", "emptySet", "emptySequence", "emptyMap"}:
+            return 0
+        if call.receiver is not None:
+            _, owner = member(call.receiver)
+            if (owner, call.method) in {("List", "of"), ("Set", "of"), ("Collections", "singletonList"),
+                                       ("Collections", "singleton")}:
+                return len(call.args)
+    value = literal(syntax, node)
+    return len(value) if type(value) is str and syntax.language == "kotlin" else None
+
+
+@dataclass
+class Check:
+    node: object
+    predicate: object = None
+    operator: str = ""
+    left: object = None
+    right: object = None
+    negated: bool = False
+    observations: tuple = ()
+
+    def constant(self, syntax):
+        if self.predicate is not None:
+            return truth(syntax, self.predicate) is (not self.negated)
+        return compare(self.operator, literal(syntax, self.left), literal(syntax, self.right)) is True
+
+
+def equality(node, method, first, second):
+    if method in EQUAL | UNEQUAL | IDENTITY and first is not None and second is not None:
+        operator = "!=" if method in UNEQUAL else "==" if method in EQUAL else (
+            "is not" if method in {"assertNotSame", "isNotSameAs"} else "is")
+        return Check(node, operator=operator, left=first, right=second)
+    return Check(node)
+
+
+def predicate(node, subject, negated):
+    operator, left, right = split(subject)
+    if operator in {"===", "!=="}:
+        operator = "is" if operator == "===" else "is not"
+    if negated:
+        operator = {"==": "!=", "!=": "==", "is": "is not", "is not": "is"}.get(operator, "")
+    return Check(node, subject, operator, left, right, negated)
+
+
+def compares_itself(syntax, check, title, notes, checks):
+    if check.operator not in {"==", "!=", "is", "is not"} or check.left is None or check.right is None:
+        return False
+    lhs = shape(check.left)
+    if lhs != shape(check.right):
+        return False
+    if check.operator in {"!=", "is not"} or not query(check.left, "call_expression" if syntax.language == "kotlin" else "method_invocation"):
+        return True
+    site = line(check.node)
+    comment = " ".join(notes.get(at, "") for at in (site - 1, site))
+    if any(lint.describes_distinct_inputs(text) for text in (title, comment)):
+        return True
+    if any(lint.suggests_repeatability(text) for text in (title, comment)):
+        return False
+    for other in checks:
+        if other is check:
+            continue
+        for operand, expected in ((other.left, other.right), (other.right, other.left)):
+            if shape(operand) == lhs and (
+                    other.operator == "!=" and shape(expected) != lhs
+                    or other.operator == "==" and (literal(syntax, expected) is not UNKNOWN
+                                                    or iterable_size(syntax, expected) is not None)):
+                return False
+    return True
+
+
+def kotest_matcher(method):
+    return method in KOTEST_EXACT or method.startswith(KOTEST_PREFIXES)
+
+
+def fluent_origin(file, node):
+    transformed = False
+    while (call := call_of(node)) is not None:
+        method = file.resolve_name(call.method)
+        if method in FLUENT_ROOTS:
+            if method == "then" and (not call.args or call.callbacks()):
+                return False, None
+            subject = call.args[0] if method in {"assertThat", "then"} and call.args else None
+            return True, None if transformed else subject
+        if method == "that" and call.args:
+            sender = call_of(call.receiver)
+            if sender is not None and sender.method in {"assertWithMessage", "withMessage", "assert_"}:
+                return True, None if transformed else call.args[0]
+        transformed |= method in FLUENT_TRANSFORMS
+        if method not in FLUENT_OPTIONS | FLUENT_TRANSFORMS and not method.startswith(FLUENT_TERMINALS):
+            break
+        node = call.receiver
+    return False, None
+
+
+def junit_args(file, call, method):
+    args = [arg for arg in call.args if not any(arg is named for named in call.named.values())]
+    if method in BOOLEANS:
+        if "actual" in call.named:
+            return [call.named["actual"]]
+        slots = 1
+    else:
+        if "actual" in call.named or "expected" in call.named:
+            positional = iter(args)
+            return [call.named[label] if label in call.named else next(positional, None)
+                    for label in ("expected", "actual")]
+        slots = 2
+    if len(args) > slots:
+        _, owner = member(call.receiver)
+        qualified = file.imports.get(call.method, file.imports.get(owner, owner))
+        junit4 = ("org.junit.Assert", "junit.framework.Assert")
+        leading_message = (qualified.startswith(junit4) or owner == "Assert"
+                           or not qualified and file.wildcard_imports.intersection(junit4))
+        trailing_message = qualified.startswith(("org.junit.jupiter.", "kotlin.test.")) or (
+            owner == "Assertions" or "org.junit.jupiter.api.Assertions" in file.wildcard_imports)
+        can_have_leading_message = slots == 1 or method != "assertEquals" or len(args) > 3 or (
+            file.syntax.language == "java" and args[0].kind() == "string_literal")
+        if leading_message and can_have_leading_message or (
+                file.syntax.language == "java" and not trailing_message and args[0].kind() == "string_literal"):
+            return args[1:]
+    return args
+
+
+def check_call(file, node, call):
+    method = file.resolve_name(call.method)
+    first = call.args[0] if call.args else None
+    if method == "assertThat":
+        matcher = call_of(call.args[-1]) if len(call.args) >= 2 else None
+        hamcrest = file.imports.get(call.method, "").startswith(("org.hamcrest.", "org.junit.Assert."))
+        _, owner = member(call.receiver)
+        if hamcrest or matcher is not None or owner in {"MatcherAssert", "Assert"} and len(call.args) > 1:
+            if len(call.args) >= 2:
+                subject = call.args[-2]
+                return hamcrest_check(file, node, subject, matcher)
+        return None
+    if method in FLUENT_ROOTS | {"assertWithMessage", "assert_"} | VERIFICATIONS:
+        if method == "assertThatThrownBy":
+            return Check(node)
+        if method in VERIFICATIONS and call.callbacks():
+            return Check(node, observations=mockk_observations(file, call))
+        return None
+    if method in NO_INTERACTIONS:
+        observations = tuple((("calls", target), False) for arg in call.args
+                             if (target := file.recorder(arg)) is not None)
+        return Check(node, observations=observations)
+    if call.receiver is not None:
+        if (verified := call_of(call.receiver)) is not None and file.resolve_name(verified.method) == "verify":
+            return Check(node, observations=mockito_observations(file, verified))
+        found, subject = fluent_origin(file, call.receiver)
+        if found and method not in FLUENT_OPTIONS | FLUENT_TRANSFORMS and method.startswith(FLUENT_TERMINALS):
+            check = (predicate(node, subject, method in {"isFalse", "shouldBeFalse"})
+                     if method in BOOLEANS else equality(node, method, subject, first))
+            return collect_observations(file, check, method, subject, first)
+        if method == "check" and first is not None and call_of(first) is not None and (
+                call_of(first).method in {"matches", "doesNotExist", "selectedDescendantsMatch"}):
+            return Check(node)
+    if kotest_matcher(method):
+        if method in BOOLEANS:
+            return collect_observations(file, predicate(node, call.receiver, method == "shouldBeFalse"))
+        return collect_observations(file, equality(node, method, call.receiver, first),
+                                    method, call.receiver, first)
+    if method in BOOLEANS:
+        operands = junit_args(file, call, method)
+        if operands and operands[0] is not None:
+            return collect_observations(file, predicate(node, operands[0], method == "assertFalse"))
+    if method in EQUAL | UNEQUAL | IDENTITY:
+        operands = junit_args(file, call, method)
+        if len(operands) >= 2:
+            return collect_observations(file, equality(node, method, *operands[:2]))
+    if lint.assertion(method) or method == "fail" or file.imports.get(call.method) and lint.helper(method):
+        return Check(node)
+    return None
+
+
+def hamcrest_check(file, node, subject, matcher):
+    if matcher is None:
+        return Check(node)
+    inverse = False
+    while matcher.method in {"is", "not"} and matcher.args:
+        inverse ^= matcher.method == "not"
+        inner = call_of(matcher.args[0])
+        if inner is None:
+            check = equality(node, "assertNotEquals" if inverse else "assertEquals", subject, matcher.args[0])
+            return collect_observations(file, check)
+        matcher = inner
+    expected = next(iter(matcher.args), None)
+    method = matcher.method
+    if inverse and method in {"equalTo", "isEmpty", "empty", "emptyIterable"}:
+        method = "notEqualTo" if method == "equalTo" else "isNotEmpty"
+    check = equality(node, method, subject, expected)
+    return collect_observations(file, check, method, subject, expected)
+
+
+def infix_check(file, node):
+    bindings = children(node)
+    if len(bindings) == 3:
+        subject, identifier, expected = bindings
+        method = file.resolve_name(name(identifier))
+        if kotest_matcher(method):
+            return collect_observations(file, equality(node, method, subject, expected), method, subject, expected)
+    return None
+
+
+def mockk_observations(file, call):
+    exact, least, most = (literal(file.syntax, call.named.get(key)) for key in ("exactly", "atLeast", "atMost"))
+    if exact == 0 or most == 0:
+        present = False
+    elif (type(exact) is int and exact > 0 or type(least) is int and least > 0
+          or all(key not in call.named for key in ("exactly", "atLeast", "atMost"))):
+        present = True
+    else:
+        return ()
+    return tuple((("calls", key), present) for callback in call.callbacks()
+                 for statements in children(callback) if statements.kind() == "statements"
+                 for entry in children(statements)
+                 if (recorded := call_of(entry)) is not None and (key := file.recorder(recorded.receiver)) is not None)
+
+
+def mockito_observations(file, call):
+    if not call.args or (target := file.recorder(call.args[0])) is None:
+        return ()
+    if len(call.args) == 1:
+        return ((("calls", target), True),)
+    mode = call_of(call.args[1])
+    if mode is not None:
+        if mode.method == "never":
+            return ((("calls", target), False),)
+        if mode.method == "atLeastOnce":
+            return ((("calls", target), True),)
+        if mode.args and mode.method in {"times", "atLeast", "atMost"}:
+            count = literal(file.syntax, mode.args[0])
+            if count == 0 and mode.method != "atLeast":
+                return ((("calls", target), False),)
+            if type(count) is int and count > 0 and mode.method != "atMost":
+                return ((("calls", target), True),)
+    return ()
+
+
+def collect_observations(file, check, method="", subject=None, expected=None):
+    def observe(receiver, present):
+        if (target := file.recorder(receiver)) is not None:
+            check.observations = ((("size", target), present),)
+        return check
+
+    tested = unwrap(check.predicate)
+    if tested is not None:
+        opposite = negate(tested)
+        if (call := call_of(opposite or tested)) is not None and call.receiver is not None:
+            positive = (not check.negated) != (opposite is not None)
+            if call.method in {"isEmpty", "isNotEmpty"} and not call.args:
+                return observe(call.receiver, positive == (call.method == "isNotEmpty"))
+            if positive and call.method in {"contains", "containsKey", "containsValue", "any"}:
+                return observe(call.receiver, True)
+    if method in {"isEmpty", "isNotEmpty", "empty", "emptyIterable", "shouldBeEmpty", "shouldNotBeEmpty"}:
+        return observe(subject, method in {"isNotEmpty", "shouldNotBeEmpty"})
+    if method in {"contains", "containsAnyOf", "containsExactly", "containsExactlyElementsIn",
+                  "containsAtLeast", "shouldContain", "hasSizeGreaterThan", "hasSizeLessThan", "hasSize",
+                  "shouldHaveSize"}:
+        length = literal(file.syntax, expected)
+        if method in {"hasSize", "shouldHaveSize", "hasSizeGreaterThan", "hasSizeLessThan"}:
+            if type(length) is int and length >= 0:
+                if method == "hasSizeLessThan" and length == 1:
+                    return observe(subject, False)
+                if method != "hasSizeLessThan":
+                    return observe(subject, length > 0 or method == "hasSizeGreaterThan")
+        elif method == "containsExactlyElementsIn":
+            known = iterable_size(file.syntax, expected)
+            if known is not None:
+                return observe(subject, known > 0)
+        elif expected is not None or method == "containsExactly":
+            return observe(subject, expected is not None)
+    if check.operator in COMPARISONS:
+        reverse = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
+        for operand, expected, relation in ((check.left, check.right, check.operator),
+                                             (check.right, check.left, reverse.get(check.operator, check.operator))):
+            receiver, property_name = member(operand)
+            measurement = call_of(operand)
+            if measurement is not None and not measurement.args:
+                receiver, property_name = measurement.receiver, measurement.method
+            count = literal(file.syntax, expected)
+            if property_name not in {"size", "length", "count"} or type(count) is not int or count < 0:
+                continue
+            if relation == "==" or count == 0 and relation in {"!=", ">", "<="} or count == 1 and relation == "<":
+                return observe(receiver, (count > 0) if relation == "==" else relation in {"!=", ">"})
+            if relation in {">", ">="} and count > 0:
+                return observe(receiver, True)
+    return check
