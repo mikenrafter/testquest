@@ -1,8 +1,10 @@
 import json
+import os
 import shlex
+import subprocess
 import sys
 
-from test_tq import TqCase
+from test_tq import ROOT, TqCase
 
 
 class LedgerTests(TqCase):
@@ -15,6 +17,7 @@ class LedgerTests(TqCase):
         self.ledger = self.scratch / "ledger.jsonl"
 
     def log(self, *args, **kwargs):
+        kwargs.setdefault("env", self.config_env())
         return self.tq("log", "--ledger", self.ledger, *args, **kwargs)
 
     def events(self):
@@ -195,14 +198,170 @@ class LedgerTests(TqCase):
             "test_payload.py::test_full_word", "test_payload.py::test_lower_digits",
         ])
 
-    def test_default_ledger_lives_beside_repo(self):
-        # catches: writing inside the checkout or using the caller's nested directory
+    def test_default_ledger_lives_in_main_worktree(self):
+        # WHY: linked worktrees must share a ledger without sharing the history they inspect.
+        # catches: anchoring the default at the caller's current directory or linked worktree
         self.write("src/test_added.py", "def test_added():\n    assert actual() == 19\n")
         self.commit("Add test")
-        self.tq("log", "record", "--since", self.base)
-        path = self.scratch / "repo.research" / "tq" / "ledger.jsonl"
-        self.assertEqual(json.loads(path.read_text())["test"], "src/test_added.py::test_added")
+        main = self.repo
+        linked = self.scratch / "linked"
+        self.git("worktree", "add", "--detach", str(linked), "HEAD")
+        self.repo = linked
+        self.write("src/test_linked.py", "def test_linked():\n    assert actual() == 42\n")
+        self.commit("Add linked worktree test")
+        self.repo = linked / "src"
+        self.tq("log", "record", "--since", self.base, env=self.config_env())
+        path = main / ".tq" / "ledger.jsonl"
+        self.assertEqual([entry["test"] for entry in self.read_ledger(path)],
+                         ["src/test_added.py::test_added", "src/test_linked.py::test_linked"])
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def config_env(self, **overrides):
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"TQ_LEDGER", "TQ_GLOBAL_LEDGER"}}
+        return env | {"XDG_CONFIG_HOME": str(self.scratch / "config"),
+                      "HOME": str(self.scratch)} | overrides
+
+    def write_global_config(self, config):
+        path = self.scratch / "config" / "tq" / "config.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(config)
+        return path
+
+    def read_ledger(self, path):
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def where(self, *args, **env):
+        return json.loads(self.tq("log", "where", "--json", *args, env=self.config_env(**env)))
+
+    def test_ledger_config_resolves_paths_per_key_with_provenance(self):
+        # WHY: each ledger can be configured independently at every precedence level.
+        # catches: replacing the whole TOML table or choosing the environment over flags
+        global_config = self.write_global_config(
+            '[ledger]\npath = "{parent}/{name}.research/tq/ledger.jsonl"\n'
+            'global = "{home}/notes/tq/ledger.jsonl"\n')
+        configured = {"path": str(self.scratch / "repo.research/tq/ledger.jsonl"),
+                      "source": f"{global_config} [ledger].path"}
+        shared = {"path": str(self.scratch / "notes/tq/ledger.jsonl"),
+                  "source": f"{global_config} [ledger].global"}
+        self.assertEqual(self.where(), {"ledger": configured, "global": shared})
+        local_config = self.write(".tq/config.toml", '[ledger]\npath = "{root}/custom.jsonl"\n')
+        local = {"path": str(self.repo / "custom.jsonl"),
+                 "source": f"{local_config} [ledger].path"}
+        self.assertEqual(self.where(), {"ledger": local, "global": shared})
+        self.write(".tq/config.toml", '[ledger]\npath = "{root}/custom.jsonl"\nglobal = "none"\n')
+        self.assertEqual(self.where(), {"ledger": local,
+                                       "global": {"path": None, "source": f"{local_config} [ledger].global"}})
+        self.assertEqual(self.where(TQ_LEDGER="env.jsonl", TQ_GLOBAL_LEDGER="~/shared.jsonl"),
+                         {"ledger": {"path": str(self.repo / "env.jsonl"), "source": "TQ_LEDGER"},
+                          "global": {"path": str(self.scratch / "shared.jsonl"), "source": "TQ_GLOBAL_LEDGER"}})
+        self.assertEqual(self.where("--ledger", "cli.jsonl", "--global-ledger", "all.jsonl",
+                                    TQ_LEDGER="env.jsonl", TQ_GLOBAL_LEDGER="env-all.jsonl"),
+                         {"ledger": {"path": str(self.repo / "cli.jsonl"), "source": "--ledger"},
+                          "global": {"path": str(self.repo / "all.jsonl"), "source": "--global-ledger"}})
+
+    def test_ledger_config_rejects_unknown_entries(self):
+        # WHY: typos in a shadowed config still need a diagnostic.
+        # catches: ignoring a misspelled key or accepting access to fields outside the template
+        for line, diagnostic in (('paht = "old.jsonl"', "unknown key ledger.paht"),
+                                 ('path = "{root.name}/ledger.jsonl"', "unknown template field {root.name}"),
+                                 ('global = 42', "ledger.global must be a nonempty string")):
+            with self.subTest(line=line):
+                config = self.write_global_config(f"[ledger]\n{line}\n")
+                result = subprocess.run(
+                    [sys.executable, "-I", str(ROOT / "tq"), "log", "--ledger", "override", "where"],
+                    cwd=self.repo, env=self.config_env(), capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"{config} ", result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+
+    def test_global_record_keeps_same_ids_from_distinct_repositories(self):
+        # WHY: repositories with identical histories and directory names can have the same local event ID.
+        # catches: dropping the second repository under contention by deduplicating on id alone
+        from concurrent.futures import ThreadPoolExecutor
+        self.write("test_local.py", "def test_new():\n    assert actual() == 6\n")
+        self.commit("Add test")
+        shared = self.scratch / "global.jsonl"
+        self.write_global_config(f'[ledger]\npath = "{{root}}/.tq/ledger.jsonl"\nglobal = "{shared}"\n')
+        main = self.repo
+        second = self.scratch / "other" / main.name
+        self.git("clone", "--quiet", str(main), str(second))
+        origins = ("https://example.test/team-a/repo", "https://example.test/team-b/repo")
+        for checkout, origin in zip((main, second), origins):
+            self.repo = checkout
+            self.git("remote", "set-url" if checkout == second else "add", "origin",
+                     origin.replace("example.test", "EXAMPLE.TEST") + ".git/")
+        command = [sys.executable, "-I", str(ROOT / "tq"), "log", "record", "--since", self.base]
+        with ThreadPoolExecutor(4) as workers:
+            runs = [workers.submit(subprocess.run, command, cwd=checkout, env=self.config_env(),
+                                   capture_output=True, text=True, timeout=10)
+                    for checkout in (main, second, main, second)]
+            for run in runs:
+                result = run.result()
+                self.assertEqual(result.returncode, 0, result.stderr)
+        first, = self.read_ledger(main / ".tq" / "ledger.jsonl")
+        second_local, = self.read_ledger(second / ".tq" / "ledger.jsonl")
+        self.assertEqual(first, second_local)
+        self.assertCountEqual(self.read_ledger(shared),
+                              [first | {"repo": origin, "repo_name": "repo"} for origin in origins])
+        report = json.loads(self.tq("log", "report", "--global", "--json", env=self.config_env()))
+        self.assertEqual(report["phases"]["unknown"]["born"], 2)
+        self.assertEqual({origin: row["phases"]["unknown"]["born"]
+                          for origin, row in report["repositories"].items()}, dict.fromkeys(origins, 1))
+        only = json.loads(self.tq("log", "report", "--global", "--repo", origins[1] + ".git",
+                                 "--json", env=self.config_env()))
+        self.assertEqual(set(only["repositories"]), {origins[1]})
+        command = [sys.executable, "-I", str(ROOT / "tq"), "log", "report", "--global",
+                   "--repo", "repo", "--json"]
+        by_name = subprocess.run(command, cwd=self.scratch, env=self.config_env(),
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(by_name.returncode, 0, by_name.stderr)
+        self.assertEqual(json.loads(by_name.stdout), report)
+
+    def test_global_only_keeps_history_and_accepts_verdicts(self):
+        # WHY: a single global ledger must supply the prior rows and history for writes.
+        # catches: turning every write into a no-op when the local path is disabled
+        self.write_global_config('[ledger]\npath = "none"\nglobal = "~/all.jsonl"\n')
+        env = self.config_env()
+        self.write("test_local.py", "def test_new():\n    assert True\n")
+        self.commit("Add test")
+        self.tq("log", "record", "--since", self.base, env=env)
+        born, = self.read_ledger(self.scratch / "all.jsonl")
+        self.git("rm", "test_local.py")
+        after_birth = self.git("rev-parse", "HEAD").strip()
+        self.commit("Remove test")
+        self.tq("log", "record", "--since", after_birth, env=env)
+        self.write("test_lint.py", "def test_lint():\n    assert True\n")
+        row, = json.loads(self.tq("log", "lint", "--since", "HEAD", "--json", env=env, code=(1,)))
+        self.tq("log", "verdict", "--row", row["row"], "--verdict", "real", "--why", "Constant",
+                env=env)
+        events = self.read_ledger(self.scratch / "all.jsonl")
+        self.assertEqual([entry["event"] for entry in events], ["born", "died", "lint", "verdict"])
+        self.assertEqual(events[1]["test_id"], born["test_id"])
+        self.assertEqual({entry["repo"] for entry in events}, {str(self.repo)})
+        self.assertFalse((self.repo / ".tq").exists())
+
+    def test_global_append_failure_preserves_local_then_retries(self):
+        # WHY: a failed global append must leave the first write available to retry.
+        # catches: writing globally first or duplicating local events when the global write recovers
+        self.write("test_local.py", "def test_new():\n    assert observed() == 6\n")
+        self.commit("Add test")
+        shared = self.scratch / "global.jsonl"
+        shared.mkdir()
+        command = [sys.executable, "-I", str(ROOT / "tq"), "log", "record",
+                   "--global-ledger", str(shared), "--since", self.base]
+        result = subprocess.run(command, cwd=self.repo, env=self.config_env(),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"global ledger {shared}", result.stderr)
+        path = self.repo / ".tq" / "ledger.jsonl"
+        recorded = path.read_bytes()
+        first, = self.read_ledger(path)
+        shared.rmdir()
+        self.tq("log", "record", "--global-ledger", shared, "--since", self.base, env=self.config_env())
+        self.assertEqual(path.read_bytes(), recorded)
+        self.assertEqual(self.read_ledger(shared), [first | {"repo": str(self.repo), "repo_name": "repo"}])
 
     def test_concurrent_record_adds_each_event_once(self):
         # catches: checking for duplicate keys before taking the append lock

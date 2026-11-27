@@ -3,7 +3,7 @@ import json
 import subprocess
 import sys
 
-from . import catches, history, ledger, ledger_report, lint, props, repo, risk, witness
+from . import catches, history, ledger, ledger_config, ledger_report, lint, props, repo, risk, witness
 
 
 DIAGNOSTIC_RULES = {
@@ -127,38 +127,63 @@ def print_replays(rows, as_json):
 
 def run_log(options):
     command = options.log_command
-    path = options.ledger
-    if path is None or command in {"record", "lint", "kill"}:
+    try:
         repository = repo.root(getattr(options, "repo", "."))
-        if path is None:
-            path = repository.with_name(repository.name + ".research") / "tq" / "ledger.jsonl"
-    log = ledger.Ledger(path)
+    except subprocess.CalledProcessError as error:
+        if command in {"record", "lint", "kill"}:
+            raise ValueError(f"log {command} requires a Git worktree") from error
+        repository = None
+    main = repo.main_worktree(repository) if repository is not None else None
+    local, shared = ledger_config.resolve(main, options.ledger, options.global_ledger)
+    if command == "where":
+        if options.json:
+            print(json.dumps({"ledger": local.describe(), "global": shared.describe()}, indent=2))
+        else:
+            for label, location in (("Per-repository ledger", local), ("Global ledger", shared)):
+                print(f"{label}: {location.path or 'none'} ({location.source})")
+        return 0
+    if command == "report":
+        return report_log(options, local, shared)
+
+    log = ledger.RepositoryLedger(local.path, shared.path, repository, main)
     if command == "record":
-        with log.edit() as (existing, append):
-            append(ledger.record(repository, options.since, existing))
+        log.update(lambda existing: ledger.record(repository, main.name, options.since, existing))
     elif command == "lint":
         owners = {}
         select = history.ChangedTests(repository, options.since)
         rows = lint.find(options.paths, select=select, owners=owners)
-        entries = list(ledger.lint_events(repository, rows, owners))
+        entries = list(ledger.lint_events(repository, main.name, rows, owners))
         log.write(entries)
         return print_findings([
             row | {"row": entry["row"], "rule_version": entry["rule_version"]}
             for row, entry in zip(rows, entries)
         ], options.json)
     elif command == "verdict":
-        with log.edit() as (existing, append):
-            append([ledger.judgment(existing, options)])
+        log.update(lambda existing: [ledger.judgment(existing, options)])
     elif command == "import-verdicts":
         log.write(ledger.import_verdicts(options.file))
     elif command == "kill":
-        rows, events = ledger.kill(repository, options.worktree, options.cmd)
+        rows, events = ledger.kill(repository, main.name, options.worktree, options.cmd)
         log.write(events)
         return print_replays(rows, False)
-    elif command == "report":
-        report = ledger_report.summarize(log.read())
-        if options.json:
-            print(json.dumps(report, indent=2, sort_keys=True))
-        else:
-            ledger_report.print_report(report)
+    return 0
+
+
+def report_log(options, local, shared):
+    if options.repository_filter is not None and not options.global_report:
+        raise ValueError("log report --repo requires --global")
+    location = shared if options.global_report else local
+    if location.path is None:
+        label = "global" if options.global_report else "per-repository"
+        raise ValueError(f"{label} ledger path is unavailable ({location.source})")
+    entries = ledger.Ledger(location.path).read()
+    report = (ledger_report.summarize_global(entries, options.repository_filter)
+              if options.global_report else ledger_report.summarize(entries))
+    if options.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        ledger_report.print_report(report)
+        for repository, breakdown in report.get("repositories", {}).items():
+            print(f"\nRepository: {repository}")
+            ledger_report.print_report(breakdown)
     return 0

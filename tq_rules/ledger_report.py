@@ -1,4 +1,7 @@
 from collections import Counter, defaultdict
+from pathlib import Path
+
+from . import repo
 
 
 def ratio(numerator, denominator):
@@ -9,9 +12,9 @@ def precision(events):
     latest = {}
     for entry in events:
         if entry["event"] == "verdict":
-            latest[entry["rule_version"], entry["row"]] = entry
+            latest[entry["repo"], entry["rule_version"], entry["row"]] = entry
         elif entry["event"] == "lint":
-            latest.setdefault((entry["rule_version"], entry["row"]), entry)
+            latest.setdefault((entry["repo"], entry["rule_version"], entry["row"]), entry)
     counts = defaultdict(Counter)
     for entry in latest.values():
         counts[entry["rule"], entry["rule_version"]][entry.get("verdict", "unjudged")] += 1
@@ -99,6 +102,19 @@ def summarize(events):
     phases, aliases, versions, current, dead = lifecycle(events)
     tests, candidates = kills(events, aliases, versions, current, dead)
     return dict(phases=phases, precision=precision(events), tests=tests, deletion_candidates=candidates)
+
+
+def summarize_global(events, selection):
+    if selection is not None:
+        normalized = repo.normalize_remote(selection, Path.cwd())
+        matching = {entry["repo"] for entry in events
+                    if selection in {entry["repo"], entry.get("repo_name"), repo.remote_name(entry["repo"])}
+                    or normalized == entry["repo"]}
+        events = [entry for entry in events if entry["repo"] in matching]
+    grouped = defaultdict(list)
+    for entry in events:
+        grouped[entry["repo"]].append(entry)
+    return summarize(events) | {"repositories": {name: summarize(grouped[name]) for name in sorted(grouped)}}
 
 
 def print_report(report):

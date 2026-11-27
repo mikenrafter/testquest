@@ -99,7 +99,7 @@ tests/test_codec.py:9 red tests.test_codec.CodecTest.test_encode_order byte orde
 FAILED (failures=1)
 ```
 
-Record history and fault kills in the ledger (`../<repo-name>.research/tq/ledger.jsonl` beside the checkout by default; pass `--ledger PATH` to put it anywhere), then report:
+Record history and fault kills in the ledger, `.tq/ledger.jsonl` in the main worktree, then report. A config file can move it or add a global ledger across repositories ([docs/ledger.md](docs/ledger.md)).
 
 ```sh
 tq log record --since HEAD~1 # record born, changed, and died tests

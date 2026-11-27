@@ -1,6 +1,11 @@
 import os
+import re
 from pathlib import Path
 import subprocess
+from urllib.parse import unquote, urlsplit, urlunsplit
+
+
+SCP_REMOTE = re.compile(r"(?P<user>[^/@:]+@)?(?P<host>\[[^\]]+\]|[^/:]+):(?P<path>.+)")
 
 
 def git(repository, *arguments):
@@ -18,6 +23,56 @@ def git_environment():
 
 def root(path):
     return Path(os.fsdecode(git(path, "rev-parse", "--show-toplevel")).rstrip("\n"))
+
+
+def main_worktree(repository):
+    common_dir = os.fsdecode(git(
+        repository, "rev-parse", "--path-format=absolute", "--git-common-dir",
+    )).removesuffix("\n")
+    if Path(common_dir) == repository / ".git":
+        return repository
+    first = os.fsdecode(git(repository, "worktree", "list", "--porcelain", "-z").split(b"\0", 1)[0])
+    return Path(first.removeprefix("worktree "))
+
+
+def identity(repository, main):
+    """Return a normalized origin URL, or the main worktree path when origin is absent."""
+    try:
+        origin = os.fsdecode(git(repository, "remote", "get-url", "origin")).removesuffix("\n")
+    except subprocess.CalledProcessError:
+        return str(main)
+    return normalize_remote(origin, main)
+
+
+def normalize_remote(remote, base):
+    if "://" in remote:
+        parts = urlsplit(remote)
+        if parts.scheme == "file" and parts.hostname in {None, "localhost"}:
+            return str((base / unquote(parts.path)).resolve())
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        port = parts.port
+        if port is not None and port != {"http": 80, "https": 443, "ssh": 22, "git": 9418}.get(parts.scheme):
+            host += f":{port}"
+        if parts.scheme == "ssh" and parts.username:
+            host = f"{parts.username}@{host}"
+        path = parts.path.rstrip("/").removesuffix(".git")
+        return urlunsplit((parts.scheme, host, path, "", ""))
+
+    scp = SCP_REMOTE.fullmatch(remote)
+    if scp:
+        return (scp["user"] or "") + scp["host"].lower() + ":" + scp["path"].rstrip("/").removesuffix(".git")
+    return str((base / remote).resolve())
+
+
+def remote_name(repository):
+    scp = SCP_REMOTE.fullmatch(repository)
+    if "://" in repository:
+        path = urlsplit(repository).path
+    else:
+        path = scp["path"] if scp else repository
+    return path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
 
 
 def tracked(repository):

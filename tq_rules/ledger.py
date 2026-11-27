@@ -20,7 +20,8 @@ DEFAULT_COMMAND = "python3 -m unittest {test}"
 
 
 def add_commands(parser):
-    parser.add_argument("--ledger", type=Path)
+    parser.add_argument("--ledger")
+    parser.add_argument("--global-ledger")
     commands = parser.add_subparsers(dest="log_command", required=True)
     record = commands.add_parser("record", help="Record test changes from Git history.")
     record.add_argument("--since", required=True)
@@ -42,8 +43,13 @@ def add_commands(parser):
     kill.add_argument("--cmd", default=DEFAULT_COMMAND)
     report = commands.add_parser("report", help="Summarize test survival, precision and kills.")
     report.add_argument("--json", action="store_true")
-    for command in (record, scan, verdict, cache, kill, report):
-        command.add_argument("--ledger", type=Path, default=argparse.SUPPRESS)
+    report.add_argument("--global", dest="global_report", action="store_true")
+    report.add_argument("--repo", dest="repository_filter", metavar="NAME|URL")
+    where = commands.add_parser("where", help="Show ledger paths and their sources.")
+    where.add_argument("--json", action="store_true")
+    for command in (record, scan, verdict, cache, kill, report, where):
+        command.add_argument("--ledger", default=argparse.SUPPRESS)
+        command.add_argument("--global-ledger", default=argparse.SUPPRESS)
 
 
 def encode(value):
@@ -93,25 +99,24 @@ class Ledger:
         return events
 
     def append(self, stream, events, additions):
-        seen = {entry["id"] for entry in events}
+        seen = {(entry["repo"], entry["id"]): entry for entry in events}
+        persisted = {}
         new = []
         for entry in additions:
-            if entry["id"] not in seen:
-                seen.add(entry["id"])
+            identity = entry["repo"], entry["id"]
+            if identity not in seen:
+                seen[identity] = entry
                 new.append(encode(entry).encode())
-        if not new:
-            return
-        if stream.tell():
-            stream.seek(-1, os.SEEK_END)
-            if stream.read(1) != b"\n":
-                new.insert(0, b"")
-        stream.write(b"\n".join(new) + b"\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-
-    def write(self, additions):
-        with self.edit() as (_, append):
-            append(additions)
+            persisted[identity] = seen[identity]
+        if new:
+            if stream.tell():
+                stream.seek(-1, os.SEEK_END)
+                if stream.read(1) != b"\n":
+                    new.insert(0, b"")
+            stream.write(b"\n".join(new) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        return persisted.values()
 
     def read(self):
         try:
@@ -123,17 +128,56 @@ class Ledger:
             return self.read_events(stream)
 
 
+class RepositoryLedger:
+    def __init__(self, local, shared, repository, main):
+        self.local = Ledger(local) if local is not None else None
+        self.shared = Ledger(shared) if shared is not None else None
+        self.repository = repository
+        self.main = main
+
+    def update(self, build):
+        """Build and append under the primary lock, then append to the global ledger.
+
+        A global failure raises after the local append has been flushed. The two
+        locks are never held together.
+        """
+        if self.local:
+            with self.local.edit() as (existing, append):
+                additions = append(build(existing))
+            if not self.shared:
+                return
+        elif not self.shared:
+            raise ValueError("no ledger is configured")
+
+        try:
+            if self.main is None:
+                raise ValueError("a Git worktree is required to identify the repository")
+            if self.local and self.shared.path.exists() and self.local.path.samefile(self.shared.path):
+                raise ValueError("resolves to the per-repository ledger")
+            identity = repo.identity(self.repository, self.main)
+            name = self.main.name
+            with self.shared.edit() as (existing, append):
+                if not self.local:
+                    additions = build([entry | {"repo": name} for entry in existing if entry["repo"] == identity])
+                append(entry | {"repo": identity, "repo_name": name} for entry in additions)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            raise ValueError(f"global ledger {self.shared.path}: {error}") from error
+
+    def write(self, additions):
+        self.update(lambda _: additions)
+
+
 def age(birth, death):
     return max(0, int((datetime.fromisoformat(death) - datetime.fromisoformat(birth)).total_seconds()))
 
 
-def record(repository, since, existing):
+def record(repository, name, since, existing):
     base = repo.resolve(repository, since)
     head = repo.resolve(repository, "HEAD")
     previous = defaultdict(list)
     observed_kills = defaultdict(list)
     for entry in existing:
-        if entry["repo"] != repository.name:
+        if entry["repo"] != name:
             continue
         if entry["event"] in {"born", "changed", "died"}:
             previous[entry["commit"]].append(entry)
@@ -154,7 +198,7 @@ def record(repository, since, existing):
         else:
             active = first
         if commit in pending:
-            changes = record_commit(repository, commit, parents, generation, pending[commit],
+            changes = record_commit(repository, name, commit, parents, generation, pending[commit],
                                     inherited[1:], first, kills_by_test)
             additions.extend(changes)
         else:
@@ -175,12 +219,13 @@ def record(repository, since, existing):
                 body = observation.get("bodies", {}).get(test)
                 known = active.get(test)
                 identity = (known[1] if known and (body is None or known[0] == body)
-                            else key(repository.name, test, body))
+                            else key(name, test, body))
                 kills_by_test[identity].add(observation["mutant"])
     return additions
 
 
-def record_commit(repository, commit, parents, generation, metadata, other_parents, active, kills_by_test):
+def record_commit(repository, name, commit, parents, generation, metadata, other_parents, active,
+                  kills_by_test):
     date, author, phase, co_authors, build_loop = metadata
     before, after, moves = history.versions_in_commit(repository, commit, parents)
     additions = []
@@ -198,12 +243,12 @@ def record_commit(repository, commit, parents, generation, metadata, other_paren
         if known and known[0] == old.hash:
             _, identity, birth = known
         elif old:
-            identity = key(repository.name, old.test, old.hash)
+            identity = key(name, old.test, old.hash)
             birth = None
         else:
-            identity = key(repository.name, new.test, new.hash, commit)
+            identity = key(name, new.test, new.hash, commit)
             birth = date
-        fields = dict(repo=repository.name, test=current.test, test_id=identity, hash=current.hash,
+        fields = dict(repo=name, test=current.test, test_id=identity, hash=current.hash,
                       commit=commit, generation=generation, date=date, phase=phase,
                       author=author, co_authors=co_authors, build_loop=build_loop, claim=current.claim,
                       catches=list(current.catches), before=old_ref, after=new_ref)
@@ -216,7 +261,7 @@ def record_commit(repository, commit, parents, generation, metadata, other_paren
         else:
             kind = "changed"
             fields.update(checks_before=old.checks, checks_after=new.checks, loosened=new.checks < old.checks)
-        additions.append(event(kind, (repository.name, commit, old_ref, new_ref), **fields))
+        additions.append(event(kind, (name, commit, old_ref, new_ref), **fields))
     return additions
 
 
@@ -230,7 +275,7 @@ def rules_version():
         return RULES_VERSION
 
 
-def lint_events(repository, rows, owners):
+def lint_events(repository, name, rows, owners):
     run = uuid4().hex
     version = rules_version()
     lines_by_path = {}
@@ -243,9 +288,9 @@ def lint_events(repository, rows, owners):
         lines = lines_by_path[path]
         hash_ = history.digest("\n".join(lines[owner.line - 1:owner.end]))[:16]
         offset = row["line"] - owner.line
-        row_id = key(version, repository.name, relative, row["rule"], hash_, offset)
+        row_id = key(version, name, relative, row["rule"], hash_, offset)
         yield event("lint", (run, row_id), **(row | dict(
-            repo=repository.name, path=relative, rule_version=version,
+            repo=name, path=relative, rule_version=version,
             row=row_id, hash=hash_, offset=offset, test=f"{relative}::{owner.qualified}", run=run,
         )))
 
@@ -279,7 +324,7 @@ def import_verdicts(path):
     return additions
 
 
-def kill(repository, worktree, command):
+def kill(repository, name, worktree, command):
     if not any("{test}" in part for part in shlex.split(command)):
         raise ValueError("log kill --cmd requires a {test} placeholder to attribute results")
     commit = repo.resolve(repository, "HEAD")
@@ -291,7 +336,7 @@ def kill(repository, worktree, command):
             outcomes[row["mutant"]]["bodies"][row["test"]] = row["body_hash"]
     run = uuid4().hex
     events = [
-        event("kill", (run, mutant), repo=repository.name, run=run, mutant=mutant,
+        event("kill", (run, mutant), repo=name, run=run, mutant=mutant,
               operator="catches", commit=commit, worktree=worktree,
               red=sorted(tests["red"]), green=sorted(tests["green"] - tests["red"]), bodies=tests["bodies"])
         for mutant, tests in sorted(outcomes.items())
