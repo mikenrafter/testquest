@@ -105,3 +105,187 @@ class AstGrepTypeScript(TqCase):
         self.commit("guarded outcome")
         self.write("suite.ts", "".join(line for line in source.splitlines(keepends=True) if "expect" not in line))
         self.assertEqual(self.locations("--since", "HEAD"), [(2, "no-assert")])
+
+    def test_joined_wrappers_credit_checks(self):
+        # WHY: doctorRuntime.test.ts:215 and navigation.sources.test.ts:65 await their checks.
+        # catches: skipping joined callbacks or crediting a dropped callback
+        path = self.write("wrappers.test.ts", """
+            test("awaited", async () => {
+              await withVerifierCleanup(async () => { expect(selected()).toBe(true); });
+            });
+            test("returned", () => page.settled(() => expect(page.pw("source-detail")).toHaveLength(1)));
+            test("dropped", () => { withVerifierCleanup(async () => expect(selected()).toBe(true)); });
+            test("unchecked Result", async () => {
+              await withSignatureTarget(target, async (binding) => {
+                expect(binding.snapshotPath).toContain("copy");
+                return verifySignatureTarget(binding);
+              });
+            });
+            test("ignored by local wrapper", async () => {
+              async function ignore(callback) {}
+              await ignore(() => expect(selected()).toBe(true));
+            });
+            async function withClient(callback) { await callback(client); }
+            test("local forwarding", () => withClient(async client => expect(client.ready).toBe(true)));
+            async function start(callback) { callback(client); }
+            test("local detached", () => start(async client => expect(client.ready).toBe(true)));
+        """)
+        self.assertEqual(self.locations(path.name), [
+            (5, "no-assert"), (6, "no-assert"), (12, "no-assert"), (19, "guarded-assert"),
+        ])
+
+    def test_failure_helpers_and_fast_check(self):
+        # WHY: capture.test.ts:87,257 and vitest.ts:17 fail through distinct check APIs.
+        # catches: counting only expect matchers and unconditional throws
+        path = self.write("helpers.test.ts", """
+            import nodeAssert from "node:assert";
+            function must(result) {
+              if (!result.ok) nodeAssert.fail("invalid result");
+              return result.value;
+            }
+            function requireValue(result) {
+              if (!result.ok) throw new Error("invalid result");
+            }
+            test("must", () => must(validateObjectGraph(fixture())));
+            test("throwing helper", () => requireValue(validateObjectGraph(fixture())));
+            test("throw outcome", async () => {
+              const thrown = outcomeToThrow(await runExample());
+              if (thrown !== undefined) throw thrown;
+            });
+            test("property check", async () => {
+              const fc = await import("fast-check");
+              fc.assert(fc.property(fc.integer(), x => check(x)));
+            });
+            test("arbitrary method", () => product.assert());
+            import { must as unwrap } from "./helpers/must.ts";
+            function importAt(input) {
+              clock.set();
+              unwrap(importCollection(input));
+              clock.reset();
+            }
+            test("empty result skips the only output check", () => {
+              importAt(input);
+              for (const item of listViews().items) expect(item.lastCapture).toBeNull();
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(19, "no-assert"), (26, "guarded-assert")])
+
+    def test_try_failure_requires_a_check_in_the_catch(self):
+        # WHY: CdpRuntimeRequests.test.ts:47 fails closed if no exception arrives.
+        # catches: overlooking expect.fail or treating a swallowed failure as coverage
+        path = self.write("failure.test.ts", """
+            test("checks refusal", () => {
+              try { requests.result(); expect.fail("expected refusal"); }
+              catch (cause) { expect(cause).toBeInstanceOf(ConstraintError); }
+            });
+            test("swallows refusal", () => {
+              try { requests.result(); expect.fail("expected refusal"); }
+              catch (cause) { console.log(cause); }
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(5, "guarded-assert")])
+
+    def test_fixed_iterations_and_skippable_product_checks(self):
+        # WHY: fidelity-round.test.ts:63, graph.test.ts:23, and matrix-view.test.ts:153 use fixtures.
+        # catches: treating test-owned inputs as optional or crediting optional product outputs
+        path = self.write("loops.test.ts", """
+            const SCENARIOS = ["shared-child", "cycle"];
+            const seeds = count => Array.from({length: count}, (_, i) => 4217 + i * 7919);
+            test("named fixtures", () => {
+              for (const scenario of SCENARIOS) expect(loadFixture(scenario)).toBeDefined();
+            });
+            test("seed list", () => {
+              const inputs = Array.from({length: 40}, (_, i) => 4217 + i * 7919);
+              for (const seed of inputs) expect(out(seed)).toBeDefined();
+              for (const seed of seeds(40)) expect(out(seed)).toBeDefined();
+            });
+            test("inserted DOM", () => {
+              document.body.innerHTML = '<div class="row">seed</div>';
+              for (const row of document.body.querySelectorAll(".row")) expect(change(row)).toBe(true);
+            });
+            test("empty fallback", () => {
+              for (const shift of mod.nudgeLabels?.(boxes, 12) ?? []) expect(shift.delta).toBeGreaterThan(0);
+            });
+            test("not visible", async () => {
+              if (await toggle.isVisible()) await expect(toggle).toBeEnabled();
+            });
+            test("different DOM selector", () => {
+              document.body.innerHTML = '<div class="row">seed</div>';
+              for (const row of document.body.querySelectorAll(".other")) expect(change(row)).toBe(true);
+            });
+            test("seed helper", () => {
+              for (const seed of seeds(40)) expect(out(seed)).toBeDefined();
+            });
+            test("empty seed list", () => {
+              for (const seed of seeds(0)) expect(out(seed)).toBeDefined();
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(line, "guarded-assert") for line in (15, 18, 21, 28)])
+
+    def test_absence_controls_require_positive_evidence_on_the_recorder(self):
+        # WHY: import-parser.test.ts:15, ElectronCaptureCleanup.test.ts:196 and staging.test.ts:66
+        # exercise paired outputs, sibling spy coverage and a prototype spy with no witness.
+        # catches: overlooking sibling checks or crediting an unrelated recorder's activity
+        path = self.write("controls.test.ts", """
+            import * as ownership from "./ownership.js";
+            test("parses good text", () => {
+              const result = parseImportText(good);
+              expect(result.items.length).toBeGreaterThan(0);
+              expect(result.errors).toHaveLength(0);
+              const item = result.items[0];
+              expect(item.name).toBe("good");
+            });
+            test("reports bad text", () => {
+              const invalid = parseImportText(bad);
+              expect(invalid.errors).toEqual([{kind: "bad"}]);
+            });
+            test("does not probe for blank text", () => {
+              const blank = parseImportText(empty);
+              expect(blank.errors).toHaveLength(0);
+              expect(blank.items).toHaveLength(0);
+            });
+            test("observes live lineage", () => {
+              const observe = vi.spyOn(ownership, "observe");
+              release(live);
+              expect(observe).toHaveBeenCalledOnce();
+            });
+            test("skips unknown lineage", () => {
+              const observe = vi.spyOn(ownership, "observe");
+              const cleanup = vi.spyOn(ownership, "cleanup");
+              release(unknown);
+              expect(observe).not.toHaveBeenCalled();
+              expect(cleanup).not.toHaveBeenCalled();
+            });
+            test("spy can miss prototype read", () => {
+              const read = vi.spyOn(FileHandle.prototype, "read");
+              const stat = vi.spyOn(FileHandle.prototype, "stat");
+              expect(stat).toHaveBeenCalled();
+              expect(read).not.toHaveBeenCalled();
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [(28, "absence-no-control"), (34, "absence-no-control")])
+
+    def test_literal_only_checks_and_manual_inspection(self):
+        # WHY: treeView.test.ts:104 checks a fixture, and gutter-comments.spec.ts:68,140 check no result.
+        # catches: treating literal data, logs or screenshots as verification of product output
+        path = self.write("smoke.test.ts", """
+            const makeGroup = overrides => ({files: [stub], ...overrides});
+            test("checks a literal", () => {
+              const group = makeGroup({files: []});
+              expect(group.files).toHaveLength(0);
+            });
+            test("checks product output", () => {
+              const group = buildGroup({files: []});
+              expect(group.files).toHaveLength(0);
+            });
+            test("logs", async () => {
+              console.log(await page.evaluate(readGlyph));
+              await page.screenshot({path: "glyph.png"});
+            });
+            test("screenshot only", async () => {
+              if (await glyph.isVisible()) await page.screenshot({path: "hover.png"});
+            });
+        """)
+        self.assertEqual(self.locations(path.name), [
+            (4, "const-truth"), (8, "absence-no-control"), (10, "no-assert"), (14, "no-assert"),
+        ])

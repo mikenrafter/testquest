@@ -1,10 +1,12 @@
 """Track paths through an ECMAScript callback that can finish without checking."""
 
+import re
+
 from . import lint
 from .ast_grep import children, line, offset, query, shape, split_operands
 from .ast_grep_ts import (
     CHAINS, FUNCTIONS, ITERATORS, TRANSPARENT, Check, arguments, chain, compare, expression,
-    literal, name, truth,
+    formal_parameters, literal, name, text_literal, truth,
 )
 
 
@@ -36,12 +38,13 @@ def is_async(callback):
 
 
 class Flow:
-    def __init__(self, file, callback, context, active=frozenset()):
+    def __init__(self, file, callback, context, active=frozenset(), callbacks=None):
         self.file = file
         self.callback = callback
         self.body = callback.field("body")
         self.context = context
         self.active = active | {offset(callback)}
+        self.callbacks = callbacks or {}
         self.checks = []
         self.references = None
 
@@ -74,6 +77,12 @@ class Flow:
             consequent = node.field("consequence")
             alternate = node.field("alternative")
             leading = self.visit(condition, conditional, catches)
+            operator, left, right = split_operands(expression(condition))
+            if (not catches and alternate is None and operator in {"!==", "!="}
+                    and name(left) and right.kind() in {"identifier", "undefined"}
+                    and right.text() == "undefined" and consequent.kind() == "throw_statement"
+                    and shape(left) == shape(next(iter(children(consequent)), None))):
+                return followed_by(leading, self.record(Check(node, "throw"), conditional))
             known = truth(condition)
             first = self.visit(consequent, conditional or known is not True, catches)
             second = self.visit(alternate, conditional or known is not False, catches)
@@ -143,8 +152,8 @@ class Flow:
             declarations = children(initializer) if initializer is not None else []
             declaration = declarations[0] if len(declarations) == 1 and declarations[0].kind() == "variable_declarator" else None
             op, left, right = split_operands(condition)
-            lower = literal(declaration.field("value")) if declaration is not None else lint.UNKNOWN
-            upper = literal(right)
+            lower = self.file.fixture_number(declaration.field("value")) if declaration is not None else lint.UNKNOWN
+            upper = self.file.fixture_number(right)
             nonempty = (declaration is not None and bool(name(left)) and name(left) == name(declaration.field("name"))
                         and lower is not lint.UNKNOWN and upper is not lint.UNKNOWN
                         and compare(op, lower, upper) is True) or truth(condition) is True
@@ -169,7 +178,10 @@ class Flow:
         guarded = conditional or optional
         if (check := self.file.check(node, self.context)) is not None:
             detached = check.asynchronous and not self.completed(node)
-            return followed_by(result, self.record(check, guarded, optional or detached))
+            coverage = self.record(check, guarded, optional or detached)
+            if check.method == "fail" and catches and not optional:
+                coverage = THROW
+            return followed_by(result, coverage)
 
         receiver, members = chain(callee)
         method = members[-1] if members else ""
@@ -203,16 +215,58 @@ class Flow:
             detached = not self.completed(node)
             return followed_by(result, self.invoke(self.callback_target(args[1]), guarded, catches, detached=detached))
 
+        callback = self.callbacks.get(name(callee))
+        if callback is not None and self.file.binding(callee) is None:
+            detached = is_async(callback) and not self.completed(node)
+            coverage = self.invoke(callback, guarded, catches, detached=detached)
+            return followed_by(result, NEXT if optional else coverage)
+
         target = self.file.helper(callee)
+        joined = self.completed(node)
+        callbacks = {key: callback for key, arg in zip(formal_parameters(target), args)
+                     if key and (callback := self.callback_target(arg)) is not None} if target is not None else {}
         if target is not None and offset(target) not in self.active and target.field("body") is not None:
-            nested = Flow(self.file, target, (), self.active)
+            nested = Flow(self.file, target, (), self.active, callbacks)
             incomplete = nested.visit(nested.body)
-            if any(check.method != "throw" for check in nested.checks) or (
-                    lint.helper(name(callee)) and nested.checks):
-                detached = is_async(target) and not self.completed(node)
-                return followed_by(result, self.record(Check(node, "helper"), guarded,
-                                                       optional or detached or bool(incomplete)))
+            detached = is_async(target) and not joined
+            forwarded = [check for check in nested.checks
+                         if any(within(check.node, callback) for callback in callbacks.values())]
+            for check in forwarded:
+                self.record(check, guarded or check.guarded, optional or detached)
+            if forwarded:
+                return followed_by(result, NEXT if optional or detached or incomplete else 0)
+            checks = [check for check in nested.checks if check.method != "result helper"]
+            if not checks and len(children(nested.body)) == 1:
+                checks = nested.checks
+            if checks:
+                failure_helper = all(check.method in {"throw", "fail"} for check in checks)
+                if not failure_helper or not callbacks:
+                    return followed_by(result, self.record(Check(node, "helper"), guarded,
+                                                           optional or detached or bool(incomplete) and not failure_helper))
+            return result
+
+        if joined and not optional and target is None:
+            for arg in args:
+                callback = expression(arg)
+                if callback is not None and callback.kind() in FUNCTIONS and self.check_callback(callback):
+                    count = len(self.checks)
+                    coverage = self.invoke(callback, conditional, catches, detached=False)
+                    if any(check.method != "throw" for check in self.checks[count:]):
+                        result = followed_by(result, coverage)
+                    else:
+                        del self.checks[count:]
         return result
+
+    def check_callback(self, callback):
+        body = callback.field("body")
+        if body is None:
+            return False
+        if body.kind() != "statement_block":
+            return body.kind() == "call_expression" and self.file.check(body, self.context) is not None
+        # An opaque wrapper may return a failure without ever invoking a result-producing callback.
+        return not any(children(node) and not any(
+            parent.kind() in FUNCTIONS and within(parent, body) for parent in node.ancestors()
+        ) for node in query(body, "return_statement"))
 
     def invoke(self, callback, conditional, catches, *, detached):
         if callback is None or offset(callback) in self.active or callback.field("body") is None:
@@ -304,33 +358,68 @@ class Flow:
             node, parent = parent, parent.parent()
         return False
 
-    def nonempty(self, node, *, keys=False, seen=frozenset()):
-        node = expression(node)
+    def nonempty(self, node, *, keys=False, supplied=None, seen=frozenset()):
+        node, supplied = self.file.fixed(node, supplied)
         if node is None:
             return False
+        span = offset(node), node.range().end.index
+        if span in seen:
+            return False
+        seen = seen | {span}
         kind = node.kind()
         if keys and kind == "object":
             return any(item.kind() in {"pair", "method_definition", "shorthand_property_identifier"}
                        for item in children(node))
         if kind == "array":
-            return any(item.kind() != "spread_element" for item in children(node))
-        if kind == "string" or kind == "template_string":
-            value = literal(node)
-            return isinstance(value, str) and bool(value)
-        if kind == "call_expression":
+            return any(self.nonempty(children(item)[0], supplied=supplied, seen=seen) if item.kind() == "spread_element"
+                       else True for item in children(node))
+        size = self.file.fixture_size(node, supplied)
+        if type(size) is int and size > 0:
+            return True
+        if kind == "call_expression" and not self.optional(node):
             fn = expression(node.field("function"))
-            if fn is not None and fn.kind() == "member_expression" and name(fn.field("property")) in {
-                    "map", "values", "entries", "keys", "toReversed", "toSorted"}:
-                return self.nonempty(fn.field("object"), keys=keys, seen=seen)
-        binding = self.file.binding(node)
-        if binding is None or binding.kind() != "variable_declarator" or offset(binding) in seen:
+            receiver, methods = chain(fn)
+            args = arguments(node)
+            if name(receiver) == "Object" and methods in {("entries",), ("keys",), ("values",)} and args:
+                return self.nonempty(args[0], keys=True, supplied=supplied, seen=seen)
+            if name(receiver) == "Array" and methods == ("from",) and args:
+                return self.nonempty(args[0], supplied=supplied, seen=seen)
+            if methods and methods[-1] in {"map", "values", "entries", "keys", "toReversed", "toSorted"}:
+                return self.nonempty(fn.field("object"), keys=keys, supplied=supplied, seen=seen)
+            if methods and methods[-1] == "querySelectorAll" and args:
+                return self.inserted_selector(fn.field("object"), args[0], node)
+        return False
+
+    def inserted_selector(self, receiver, selector_node, query_node):
+        selector = text_literal(selector_node)
+        if selector is None or re.fullmatch(r"[.#]?[\w-]+", selector) is None:
             return False
-        if binding.parent().children()[0].kind() != "const" or not within(binding, self.body):
+        statement = query_node
+        while statement.parent() is not None and statement.parent().kind() != "statement_block":
+            statement = statement.parent()
+        if statement.parent() is None:
             return False
-        for reference in self.references_to(node):
-            if offset(binding) < offset(reference) < offset(node):
+        for previous in reversed(children(statement.parent())):
+            if offset(previous) >= offset(statement):
+                continue
+            if previous.kind() == "lexical_declaration":
+                continue
+            assignment = next(iter(children(previous)), None)
+            if previous.kind() != "expression_statement" or assignment is None or assignment.kind() != "assignment_expression":
                 return False
-        return self.nonempty(binding.field("value"), keys=keys, seen=seen | {offset(binding)})
+            target = assignment.field("left")
+            if name(target.field("property")) != "innerHTML" or shape(target.field("object")) != shape(receiver):
+                return False
+            markup = literal(assignment.field("right"))
+            if not isinstance(markup, str):
+                return False
+            if selector.startswith("."):
+                return any(selector[1:] in classes.split()
+                           for classes in re.findall(r"""class=["']([^"']*)["']""", markup))
+            if selector.startswith("#"):
+                return selector[1:] in re.findall(r"""id=["']([^"']*)["']""", markup)
+            return re.search(r"<" + re.escape(selector) + r"(?=[\s/>])", markup, re.I) is not None
+        return False
 
     def compares_itself(self, check, test_name, notes):
         left, right = expression(check.actual), expression(check.expected)
