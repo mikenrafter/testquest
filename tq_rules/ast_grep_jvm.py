@@ -375,6 +375,8 @@ def parse(source, path, language, *, inventory=False, observe=None):
     from .ast_grep_jvm_checks import compares_itself
     from .ast_grep_jvm_flow import Flow, merge
 
+    from .ast_grep_jvm_micro import micro_snapshot
+
     syntax = Syntax.parse(source, language)
     file = File(syntax)
     notes = list(comments(syntax))
@@ -390,12 +392,7 @@ def parse(source, path, language, *, inventory=False, observe=None):
         exits = flow.visit(body_of(body) if body.kind() in LAMBDAS else body)
         evidence = merge(exits.values())
         checks = list(flow.checks.values())
-        fragments = (((*location(check.node), *origin[1:]), check.fragment_subject)
-                     for (_, origin), check in flow.checks.items() if check.fragment_subject is not None)
-        whole = (subject for check in checks
-                 for subject in ((check.left, check.right) if check.operator == "==" else (check.snapshot_subject,))
-                 if subject is not None)
-        lint.micro_snapshot(test, fragments, whole, key=shape, display=text)
+        micro_snapshot(file, test, flow.checks)
         test.checks = len(checks) + int(expected_exception)
         if not test.checks:
             test.issues.append((test.line, "no-assert"))

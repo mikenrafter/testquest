@@ -9,7 +9,7 @@ import operator
 import tokenize
 import tomllib
 
-from . import lint
+from . import ast_grep_micro as micro, lint
 from .ast_grep import (
     CALLS, COMMENTS, FUNCTIONS, MEMBERS, NAMES, RUST_ASSERTIONS, SCOPES, Call, Syntax,
     attribute_name, attributes, children, line, location, macro_name, macro_tree, namespace,
@@ -2039,39 +2039,121 @@ def rust_subject(node):
 
 
 def micro_snapshot(file, flow, test):
+    membership = {"assertIn", "assertNotIn"}
+    assertions = [check.source for check in flow.checks]
+    assertions.extend(node for node, call in flow.calls if call.method in membership
+                      or (python_golden(call) is not None if flow.syntax.language == "python"
+                          else call.macro and call.method in RUST_SNAPSHOTS))
+    reads = micro.Reads(assertions)
     fragments = []
     whole = []
-    if flow.syntax.language == "python":
+    syntax = flow.syntax
+
+    def binding_at(node, before):
+        name = parts(node)
+        positions = [site for length in range(1, len(name) + 1) for site, _ in flow.bindings.get(name[:length], ())
+                     if site < before]
+        positions.extend(site for site in flow.writes.get(name[:1], ()) if site < before)
+        return max(positions, default=-1)
+
+    def key(source, subject):
+        return reads.key(source, shape(subject), binding_at(subject, syntax.absolute(source)),
+                         reread=micro.has_call(subject))
+
+    def line_count(source, joined):
+        call = syntax.call(joined) if joined is not None and joined.kind() == "call" else None
+        if not call or call.method != "join" or len(call.arguments) != 1 or child_text(call.receiver) not in {
+            r'"\n"', r"'\n'",
+        }:
+            return False
+        lines = call.arguments[0]
+        site = syntax.absolute(source)
+        version = binding_at(lines, site)
+        if not parts(lines) or binding_at(lines, syntax.absolute(joined)) != version:
+            return False
+        for check in flow.checks:
+            if check.operator != "==" or micro.branch_path(source) != micro.branch_path(check.source):
+                continue
+            for operand, expected in ((check.left, check.right), (check.right, check.left)):
+                if type(literal(syntax, expected)) is not int or operand is None:
+                    continue
+                counted = query(operand, "identifier")
+                if any(parts(node) == parts(lines) for node in counted) and any(
+                    syntax.call(node).method in {"len", "sum"} for node in query(operand, "call")
+                ) and binding_at(lines, check.location) == version:
+                    return True
+        return False
+
+    def fixture_echo(initializer, needle, before):
+        if syntax.language != "rust" or initializer is None or not isinstance(needle, str) or len(needle) < 2:
+            return False
+        inputs = [syntax.call(node).arguments[0] for node in query(initializer, "call_expression")
+                  if syntax.call(node).method == "read_to_string" and syntax.call(node).arguments]
+        return any(call.method == "write" and call.name[-2:] == ("fs", "write")
+                   and len(call.arguments) == 2 and syntax.absolute(node) < before
+                   and any(shape(rust_subject(path)) == shape(rust_subject(call.arguments[0])) for path in inputs)
+                   and rust_string(call.arguments[1])
+                   and (needle in value if isinstance(value := literal(syntax, call.arguments[1]), str) else
+                        any(needle in part.text() for part in children(call.arguments[1])
+                            if part.kind() == "string_content"))
+                   for node, call in flow.calls)
+
+    def add(source, subject, needle, negative):
+        if subject is None:
+            return
+        before = syntax.absolute(source)
+        name = parts(subject)
+        initial = flow.resolve(name, before) if name else subject
+        diagnostic = child_text(initial)
+        if initial is not None:
+            receiver = next((part for part in query(initial, "attribute" if syntax.language == "python" else "field_expression")
+                             if parts(part)[-1:] == ("stdout",)), None)
+            if receiver is not None and (origin := flow.resolve(parts(receiver)[:-1], before)) is not None:
+                diagnostic += child_text(origin)
+        if micro.excluded(child_text(subject), diagnostic, test.name) or (
+                initial is not None and initial.kind() in {"list", "tuple", "set", "dictionary", "array_expression",
+                                                            "list_comprehension", "set_comprehension",
+                                                            "dictionary_comprehension", "tuple_expression"}):
+            return
+        producer = syntax.call(initial).method if initial is not None and initial.kind() in CALLS else ""
+        compact = bool(micro.words(producer) & {"diff", "hook"})
+        value = literal(syntax, needle)
+        fragments.append(micro.Fragment(
+            (file.line_at(before), source.range().start.column), child_text(subject), key(source, subject),
+            value if isinstance(value, str) else child_text(needle), negative, compact,
+            syntax.language == "python" and line_count(source, initial), not negative and fixture_echo(initial, value, before),
+        ))
+
+    if syntax.language == "python":
         for check in flow.checks:
             if check.operator in {"in", "not in"} and python_string(check.left):
-                fragments.append((location(check.source), unwrap(check.right)))
+                add(check.source, unwrap(check.right), check.left, check.operator == "not in")
             elif check.operator == "==":
-                whole.extend((check.left, check.right))
+                whole.extend((check.source, subject) for subject in (check.left, check.right) if subject is not None)
         for node, call in flow.calls:
-            if call.method in {"assertIn", "assertNotIn"}:
+            if call.method in membership:
                 needle, subject = python_membership(call)
-                if subject is not None and python_string(needle):
-                    fragments.append((location(node), subject))
+                if python_string(needle):
+                    add(node, subject, needle, call.method == "assertNotIn")
             elif (subject := python_golden(call)) is not None:
-                whole.append(subject)
+                whole.append((node, subject))
     else:
-        def site(node):
-            return file.line_at(flow.syntax.absolute(node)), node.range().start.column
-
         for check in flow.checks:
             if check.kind in RUST_ASSERTIONS and check.operator == "==":
-                whole.extend(map(rust_subject, (check.left, check.right)))
+                whole.extend((check.source, rust_subject(subject)) for subject in (check.left, check.right)
+                             if subject is not None)
             elif check.kind in RUST_ASSERTIONS and check.predicate is not None:
-                predicate = unwrap(opposite(unwrap(check.predicate)) or check.predicate)
+                negated = opposite(unwrap(check.predicate))
+                predicate = unwrap(negated or check.predicate)
                 if predicate.kind() == "call_expression":
-                    call = flow.syntax.call(predicate)
+                    call = syntax.call(predicate)
                     if (call.method == "contains" and call.receiver is not None and
                             len(call.arguments) == 1 and rust_string(call.arguments[0])):
-                        fragments.append((site(check.source), rust_subject(call.receiver)))
+                        add(check.source, rust_subject(call.receiver), call.arguments[0], negated is not None)
         for node, call in flow.calls:
-            if call.macro and call.method in RUST_SNAPSHOTS:
-                whole.append(rust_subject(rust_snapshot(call, node)))
-    lint.micro_snapshot(test, fragments, whole, key=shape, display=child_text)
+            if call.macro and call.method in RUST_SNAPSHOTS and (subject := rust_snapshot(call, node)) is not None:
+                whole.append((node, rust_subject(subject)))
+    micro.report(test, fragments, whole, key)
 
 
 def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
@@ -2082,7 +2164,7 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
         from .ast_grep_ts import parse as parse_ecmascript
 
         return parse_ecmascript(source, path, ECMASCRIPT_LANGUAGES[path.suffix],
-                                inventory=inventory, observe=observe)
+                                scan_root=scan_root, inventory=inventory, observe=observe)
     if path.suffix == ".dart":
         from .ast_grep_dart import parse as parse_dart
 
