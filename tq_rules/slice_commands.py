@@ -115,21 +115,20 @@ def normalized_words(text):
     return " ".join(re.findall(r"[^\W_]+", text))
 
 
-def reaches_reasons(case):
+def reaches_reasons(case, inventory, runner):
     notes = [note for note in case.notes if note.text.startswith("reaches:")]
+    required = "must say 'when X, then Y' or name another test"
     if not notes and (case.test.guarded or case.test.conditional):
-        yield f"{case.path}:{case.test.line}: reaches: must say 'when X, then Y'"
+        yield f"{case.path}:{case.test.line}: reaches: {required}"
     title = normalized_words(case.test.name)
     for note in notes:
         text = note.text.removeprefix("reaches:").strip()
         words = normalized_words(text)
-        match = REACHES.fullmatch(text)
         location = f"{case.path}:{note.line}: reaches:"
-        if title and words and (f" {title} " in f" {words} " or f" {words} " in f" {title} "):
-            yield f"{location} repeats the enclosing test name"
-        elif match is None:
-            yield f"{location} must say 'when X, then Y'"
-        else:
+        if match := REACHES.fullmatch(text):
+            if title and (f" {title} " in f" {words} " or f" {words} " in f" {title} "):
+                yield f"{location} repeats the enclosing test name"
+                continue
             condition, effect = map(normalized_words, match.groups())
             if not condition:
                 yield f"{location} 'when' condition is empty"
@@ -137,6 +136,19 @@ def reaches_reasons(case):
                 yield f"{location} 'then' effect is empty"
             elif condition == effect:
                 yield f"{location} 'when' condition must be distinct from the 'then' effect"
+        elif not text:
+            yield f"{location} {required}"
+        elif words and any(words == normalized_words(alias)
+                           for alias in case.aliases(runner) | {case.test.name}):
+            yield f"{location} repeats the enclosing test name"
+        else:
+            try:
+                witness = find_test(inventory, runner, text)
+            except ValueError as error:
+                yield f"{location} {error}"
+            else:
+                if witness.name == case.name:
+                    yield f"{location} repeats the enclosing test name"
 
 
 def find_test(cases, runner, name):
@@ -237,9 +249,8 @@ def mutants_check(options):
     return int(any(row["outcome"] != "killed" or row["flip_disagreement"] for row in rows))
 
 
-def green_gate(repository, directory, commit, base, runner, cases, parser, reasons, advisories, progress):
+def green_gate(repository, directory, commit, base, runner, cases, inventory, reasons, advisories, progress):
     pins = pinned_mutants.discover(directory)
-    inventory, _ = test_cases(directory, parser)
     referenced = set().union(*(case.catches for case in cases))
     for name in sorted(referenced - pins.keys()):
         reasons.append(f"{name}: no pinned mutant in HEAD")
@@ -316,13 +327,21 @@ def slice_check(options):
                            for row in found.findings if row["level"] != "advisory")
             if not cases:
                 reasons.append("No tests changed since base")
+            has_named_witness = any(
+                note.text.startswith("reaches:")
+                and not REACHES.fullmatch(note.text.removeprefix("reaches:").strip())
+                for case in cases for note in case.notes
+            )
+            inventory = []
+            if options.after_green or has_named_witness:
+                inventory, _ = test_cases(directory, parser)
             for case in cases:
                 if not case.catches:
                     reasons.append(f"{case.name}: catches: must name a mutant ID")
-                reasons.extend(reaches_reasons(case))
+                reasons.extend(reaches_reasons(case, inventory, runner))
             if options.after_green:
                 progress = None if options.json else lambda row: print_mutant(row, show_disagreement=False)
-                mutants = green_gate(repository, directory, commit, base, runner, cases, parser,
+                mutants = green_gate(repository, directory, commit, base, runner, cases, inventory,
                                      reasons, advisories, progress)
             else:
                 for case in cases:

@@ -5,6 +5,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -64,6 +65,64 @@ class SliceTools(TqCase):
         self.assertEqual(entries[0]["tests"][0]["classifier"], "unittest")
         self.assertEqual([(row["event"], row["mutant"], row["outcome"]) for row in self.events()],
                          [("mutant", "M-012", "killed")])
+
+    def test_slice_accepts_witness_names_from_unchanged_files(self):
+        # why: A witness can already exist outside the files changed by this slice.
+        # catches: requiring sentence syntax or searching only changed files.
+        self.write("test_witness.py", """
+            import unittest
+
+            class WitnessTest(unittest.TestCase):
+                def test_supplies_items(self):
+                    self.assertEqual(len(["a", "b"]), 2)
+        """)
+        self.commit("Add the existing witness")
+        base = self.git("rev-parse", "HEAD").strip()
+        for witness in ("test_supplies_items", "test_witness.py::WitnessTest::test_supplies_items"):
+            with self.subTest(witness=witness):
+                self.add_test(reaches=witness)
+                output = self.run_tq("slice", "check", 1, "--base", base, "--json")
+                self.assertEqual(json.loads(output)["outcome"], "pass")
+
+    def test_slice_rejects_self_and_unknown_witness_names(self):
+        # why: A named witness must resolve to a different test.
+        # catches: accepting any name or only checking for a bare self-reference.
+        for witness, reason in (
+            ("test_feature.py::CountTest::test_count", "repeats the enclosing test name"),
+            ("test_supplies_itmes", "Unknown test: test_supplies_itmes"),
+        ):
+            with self.subTest(witness=witness):
+                self.add_test(reaches=witness)
+                output = self.run_tq("slice", "check", 1, "--base", self.base, "--json", code=(1,))
+                self.assertEqual(json.loads(output)["reasons"],
+                                 [f"test_feature.py:7: reaches: {reason}"])
+
+    @unittest.skipUnless(shutil.which("node"), "requires Node.js")
+    def test_slice_accepts_another_test_title_in_the_same_file(self):
+        # why: Test titles can overlap without naming the same test.
+        # catches: checking name references for substrings instead of resolving the title.
+        source = self.write("count.test.js", """
+            const {test, it} = require("node:test");
+            const assert = require("node:assert/strict");
+
+            it("counts both items for a pair", () => {
+                assert.equal(["a", "b"].length, 2);
+            });
+        """)
+        self.commit("Add the existing title")
+        base = self.git("rev-parse", "HEAD").strip()
+        with source.open("a") as stream:
+            stream.write(textwrap.dedent("""
+                test("counts both items", () => {
+                    // catches: M-012
+                    // reaches: counts both items for a pair
+                    assert.equal(["a", "b"].slice(1).length, 2);
+                });
+            """))
+        self.commit("Add a title reference")
+        output = self.run_tq("slice", "check", 1, "--base", base, "--json",
+                             command="node --test --test-name-pattern=^{test}$ count.test.js")
+        self.assertEqual(json.loads(output)["outcome"], "pass")
 
     def test_slice_rejects_import_errors_and_bad_notes(self):
         self.add_test(catches="the boundary", reaches="counts all items")

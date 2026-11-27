@@ -66,11 +66,10 @@ tq revert-check test_window.py::WindowTest::test_last_item_kept --mutant M-012 -
 
 - `slice check` runs the ast-grep lint gate and checks the notes on changed
   tests. A `catches:` note can cite a planned ID before the implementation
-  exists. Conditional tests and tests with a `reaches:` note need the form
-  `when X, then Y`. The red run requires every selected test to fail on an
-  assertion. The green run checks that each cited pin exists and that its
-  named tests catch it. Each pin introduced or changed in the slice must
-  have a citation from a slice test.
+  exists. Conditional tests need a `reaches:` note. The red run requires
+  every selected test to fail on an assertion. The green run checks that
+  each cited pin exists and that its named tests catch it. Each pin
+  introduced or changed in the slice must have a citation from a slice test.
 - `mutants check` replays each pin in isolation. When given `--since`, it
   selects pins whose definition or replacement span changed since the
   specified commit. It uses unittest by default. `killed` requires every
@@ -121,9 +120,17 @@ Both `slice check` and `mutants check` accept `--json`. The JSON output and
 ledger events include each pin's `classification` and `flip_disagreement`.
 The `file` and `line` fields point to the replacement span when tq can locate it.
 
-A `reaches:` note must give a condition and an effect. The condition needs
-its own wording. tq ignores case and punctuation and compares whole words
-when it checks for a copied test name or identical condition and effect.
+A `reaches:` note takes either form.
+
+- `reaches: when X, then Y` states the condition and effect in its own words.
+  tq ignores case and punctuation and compares whole words when it checks
+  for a copied test name or identical condition and effect.
+- `reaches: <test name>` names another test in the repository at the slice
+  commit. Use its exact `it()` or `test()` title, function name, or runner
+  selector. Use a repository-relative `file::name` selector for ambiguous
+  names or titles shaped like `when X, then Y`. tq rejects unknown names
+  and references to the enclosing test, including normalized variants of
+  its name.
 
 A swap is `trivial` if it only removes whole statements or JSX elements,
 forces a JSX branch off, or empties a body. Empty bodies include an empty
