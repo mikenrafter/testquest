@@ -13,14 +13,14 @@ from test_tq import FIXTURES, TqCase
                      "Dart requires ast-grep-py and TQ_DART_GRAMMAR")
 class AstGrepDart(TqCase):
     def locations(self, *paths):
-        rows = json.loads(self.tq("lint", "--engine", "ast-grep", "--json", *paths, code=(0, 1)))
+        rows = json.loads(self.tq("lint", "--engine", "ast-grep", "--json", *paths, code=(0, 1)))["findings"]
         return [(row["line"], row["rule"]) for row in rows]
 
     def test_discovery(self):
         # catches: counting setUp evidence or losing the inherited skip
         path = self.copy(FIXTURES / "dart" / "discovery_test.dart")
         self.assertEqual(self.locations("."), [(8, "no-assert"), (11, "no-assert")])
-        self.assertEqual(json.loads(self.tq("lint", "--json", path.name)), [])
+        self.assertEqual(json.loads(self.tq("lint", "--json", path.name)), {"findings": [], "suppressed": []})
 
     def test_matchers_and_tautologies(self):
         # catches: reading contains as equality or flagging a repeatability check

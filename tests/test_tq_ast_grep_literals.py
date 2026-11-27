@@ -20,7 +20,7 @@ class AstGrepLiterals(TqCase):
                     if any(marker in line for marker in wanted)]
         self.assertEqual(len(expected), len(wanted), wanted)
         rows = json.loads(self.tq("lint", "--engine", ENGINE, "--json", path.relative_to(self.repo),
-                                  code=(0, 1)))
+                                  code=(0, 1)))["findings"]
         self.assertEqual([row["line"] for row in rows if row["rule"] == RULE], expected, rows)
         self.assertTrue(all(row["level"] == "advisory" for row in rows if row["rule"] == RULE))
 

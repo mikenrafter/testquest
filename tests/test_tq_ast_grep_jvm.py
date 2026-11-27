@@ -14,7 +14,7 @@ class AstGrepJvm(TqCase):
 
     def locations(self, *paths):
         return [(row["line"], row["rule"]) for row in json.loads(
-            self.tq("lint", "--engine", "ast-grep", "--json", *paths, code=(0, 1)))]
+            self.tq("lint", "--engine", "ast-grep", "--json", *paths, code=(0, 1)))["findings"]]
 
     def test_kotlin_discovery_and_evidence(self):
         # WHY: registrations, annotated functions and inner assertions have distinct owners.
