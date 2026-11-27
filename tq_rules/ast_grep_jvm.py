@@ -192,6 +192,40 @@ def read_file(path, module):
         return None
 
 
+@lru_cache(maxsize=256)
+def _repo_package_directories(repo_root, module_parent, pkg_parts):
+    dirs = []
+    parents = [p for p in (repo_root, module_parent) if p is not None]
+    if not parents:
+        return ()
+    roots = []
+    seen = set()
+    for base in parents:
+        for candidate_root in [base]:
+            if candidate_root not in seen:
+                seen.add(candidate_root)
+                roots.append(candidate_root)
+            try:
+                for entry in base.iterdir():
+                    if entry.is_dir() and not entry.name.startswith(".") and entry not in seen:
+                        seen.add(entry)
+                        roots.append(entry)
+            except OSError:
+                pass
+    for root in roots:
+        src = root / "src"
+        if not src.is_dir():
+            continue
+        for source_set in src.glob("*"):
+            if source_set.name == "testFixtures":
+                continue
+            for language in ("java", "kotlin"):
+                candidate = source_set.joinpath(language, *pkg_parts)
+                if candidate.is_dir():
+                    dirs.append(candidate)
+    return tuple(dirs)
+
+
 @lru_cache(maxsize=2048)
 def cached_file(path, module, modified, size):
     return File(parse_syntax(path.read_text(encoding="utf-8"), JVM_LANGUAGES[path.suffix]), path, module)
@@ -318,6 +352,31 @@ class File:
                 closest = max(offset(scope) for scope, _ in visible)
                 candidates = [fn for scope, fn in visible if offset(scope) == closest]
                 return (self, candidates[0]) if len(candidates) == 1 else None
+            if self.syntax.language == "java" and (owner := owner_of(node)) is not None:
+                cur_file, cur_cls = self, owner
+                seen_cls = {(cur_file.path, node_key(cur_cls))}
+                for _ in range(6):
+                    super_node = child(cur_cls, "superclass")
+                    if super_node is None:
+                        break
+                    base_type = child(super_node, "type_identifier", "scoped_type_identifier", "generic_type")
+                    if base_type is None:
+                        break
+                    base_name = base_type.text().split("<", 1)[0].rsplit(".", 1)[-1]
+                    target = cur_file.type_named(base_name)
+                    if target is None:
+                        break
+                    base_file, base_cls = target
+                    key = (base_file.path, node_key(base_cls))
+                    if key in seen_cls:
+                        break
+                    seen_cls.add(key)
+                    candidates = [fn for scope, fn in base_file.functions.get(call.method, ())
+                                  if node_key(scope) == node_key(base_cls)
+                                  and not has_modifier(fn, "private") and bind_arguments(fn, call) is not None]
+                    if candidates:
+                        return (base_file, candidates[0]) if len(candidates) == 1 else None
+                    cur_file, cur_cls = base_file, base_cls
         if call.receiver is None:
             qualified = self.imports.get(call.method)
             package, _, method = qualified.rpartition(".") if qualified else (self.package, "", call.method)
@@ -429,6 +488,24 @@ class File:
             target = direct[0] if len(direct) == 1 else None
             self.resolved_types[identifier] = target
             return target
+        repo_root = project_root(self.path, None, {".git"})
+        module_parent = self.module.parent if self.module is not None else None
+        for pkg in packages:
+            if not pkg:
+                continue
+            pkg_parts = tuple(pkg.split("."))
+            for directory in _repo_package_directories(repo_root, module_parent, pkg_parts):
+                for suffix in (".java", ".kt"):
+                    candidate = directory / f"{short}{suffix}"
+                    if candidate.is_file() and not candidate.is_symlink():
+                        file = self if candidate == self.path else read_file(candidate, self.module)
+                        if file is not None and file.package == pkg and short in file.types and (
+                                file is self or not has_modifier(file.types[short], "private")):
+                            direct.append((file, file.types[short]))
+            if direct:
+                target = direct[0] if len(direct) == 1 else None
+                self.resolved_types[identifier] = target
+                return target
         candidates = [(file, file.types[short]) for pkg in packages
                       for file in self.package_files(pkg) if short in file.types
                       and (file is self or not has_modifier(file.types[short], "private"))]
@@ -600,8 +677,8 @@ class File:
 
     def collection_recorder(self, node):
         recorder = self.recorder(node)
-        if recorder is None or recorder.shared is not None:
-            return recorder
+        if recorder is None:
+            return None
         base = unwrap(node)
         while (view := call_of(base)) is not None and not view.args and view.receiver is not None and view.method in {
                 "asMap", "asList", "asSet", "entrySet", "keySet", "values"}:
@@ -615,15 +692,72 @@ class File:
             if alias is not None:
                 return self.collection_recorder(alias)
         initialized = self.initializer(binding)
+        if initialized is not None and self.syntax.language == "java":
+            while initialized is not None and unwrap(initialized).kind() == "cast_expression":
+                inner = unwrap(initialized)
+                initialized = inner.field("value") or next(reversed(children(inner)), None)
+            initialized = unwrap(initialized)
+            if initialized is not None and name(initialized):
+                return self.collection_recorder(initialized)
+        if initialized is not None and initialized.kind() in {
+                "array_creation_expression", "array_initializer", "field_access"}:
+            return None
+        if recorder.shared is not None:
+            return recorder
+        if binding is not None and binding.kind() == "formal_parameter":
+            owner_fn = next((parent for parent in binding.ancestors() if parent.kind() in FUNCTIONS), None)
+            if owner_fn is not None and any(
+                    ann in {"EmptySource", "NullAndEmptySource"} for ann, _ in self.annotations(owner_fn)):
+                return None
+        if self.syntax.language == "java" and scope is not None and scope.kind() not in CLASSES and binding is not None:
+            ident = declaration_name(binding)
+            limit = offset(node)
+            latest_rhs, latest_pos = None, offset(binding)
+            for assign in query(scope, "assignment_expression"):
+                pos = offset(assign)
+                if latest_pos < pos < limit and name(unwrap(assign.field("left"))) == ident:
+                    latest_pos = pos
+                    latest_rhs = unwrap(assign.field("right"))
+            while latest_rhs is not None and latest_rhs.kind() == "cast_expression":
+                latest_rhs = unwrap(latest_rhs.field("value") or next(reversed(children(latest_rhs)), None))
+            if latest_rhs is not None and latest_rhs.kind() in {
+                    "array_creation_expression", "array_initializer", "field_access"}:
+                return None
         if initialized is None or scope.kind() in CLASSES:
             return recorder
         if initialized.kind() == "object_creation_expression":
-            created = name(initialized.field("type"))
+            type_node = initialized.field("type")
+            created = type_node.text().split("<", 1)[0].rsplit(".", 1)[-1] if type_node is not None else ""
             created_args = child(initialized, "argument_list")
             has_args = created_args is not None and bool(children(created_args))
-            if has_args and not created.endswith((
+            if not created.endswith((
                     "List", "Set", "Map", "Queue", "Deque", "Collection", "Stack", "Bag", "Multiset", "Multimap")):
-                return None
+                if has_args:
+                    return None
+                if self.syntax.language == "java" and scope.kind() not in CLASSES:
+                    ident = declaration_name(binding)
+                    start, end = offset(binding), offset(node)
+                    escaped = False
+                    for entry in query(scope, "method_invocation", "object_creation_expression", "method_reference"):
+                        if not start < offset(entry) < end:
+                            continue
+                        if entry.kind() == "method_reference":
+                            if any(name(c) == ident for c in children(entry)):
+                                escaped = True
+                                break
+                            continue
+                        called = call_of(entry)
+                        if called is not None:
+                            if any(name(unwrap(arg)) == ident for arg in called.args):
+                                escaped = True
+                                break
+                        else:
+                            arg_list = child(entry, "argument_list")
+                            if arg_list is not None and any(name(unwrap(arg)) == ident for arg in children(arg_list)):
+                                escaped = True
+                                break
+                    if not escaped:
+                        return None
         origin = call_of(initialized)
         if origin is not None and not (origin.receiver is None and origin.method in {
                 "mutableListOf", "mutableSetOf", "mutableMapOf", "arrayListOf", "hashSetOf", "hashMapOf",
@@ -901,7 +1035,8 @@ def _seeded_then_drained(file, body, check_node, local_recs):
         rec = file.recorder(call.receiver)
         if rec is None or rec.identity not in local_recs:
             continue
-        if call.method in {"add", "addAll", "put", "putAll", "offer", "push", "append"}:
+        if call.method in {"add", "addAll", "addProperty", "addFirst", "addLast", "put", "putAll",
+                           "offer", "offerFirst", "offerLast", "push", "append", "set"}:
             seeded.add(rec.identity)
         elif call.method in {"clear", "remove", "removeAll", "poll", "pop"}:
             drained.add(rec.identity)
@@ -1065,7 +1200,9 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
                               if channel == "size" and recorder.shared is None}
                 if local_recs and _seeded_then_drained(file, body, check.node, local_recs):
                     continue
-                if not flow.throwing_fake_check and not related & (witnesses | checked_reads):
+                same_test_types = {rec.shared for ch, rec in witnesses if ch == "field-mock-type" and rec.shared is not None}
+                if (not flow.throwing_fake_check and not related & (witnesses | checked_reads)
+                        and not any(ch == "field-mock-type" and rec.shared in same_test_types for ch, rec in related)):
                     absences.append((index, test, site, shared_keys(related)))
 
     pending = []

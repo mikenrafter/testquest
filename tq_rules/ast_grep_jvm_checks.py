@@ -295,6 +295,10 @@ def fluent_origin(file, node, *, preserves_size=False):
             buffered = soft_recorder(file, call.receiver) if owner == "soft-assertj" else None
             return True, None if transformed else subject, buffered, owner
         if method == "that" and call.args:
+            if owner == "truth" and not transformed:
+                return True, call.args[0], None, owner
+            if owner == "truth":
+                return True, None, None, owner
             sender = call_of(call.receiver)
             if sender is not None:
                 owner, builder = signature(file, sender)
@@ -304,8 +308,9 @@ def fluent_origin(file, node, *, preserves_size=False):
                         owner, builder = signature(file, outer)
                 if owner in {"", "truth"} and builder in {"assertWithMessage", "withMessage", "assert_", "assertAbout"}:
                     return True, None if transformed else call.args[0], None, owner
-        transformed |= method in FLUENT_TRANSFORMS and not (preserves_size and method in {"extracting", "map"})
-        if method not in FLUENT_OPTIONS | FLUENT_TRANSFORMS and not method.startswith(FLUENT_TERMINALS):
+        transformed |= (method in FLUENT_TRANSFORMS or method.startswith("extracting")) and not (
+            preserves_size and method in {"extracting", "map"})
+        if method not in FLUENT_OPTIONS | FLUENT_TRANSFORMS and not method.startswith(("extracting",) + FLUENT_TERMINALS):
             break
         node = call.receiver
     return False, None, None, ""
@@ -405,7 +410,7 @@ def check_call(file, node, call):
         check = Check(node, owner=owner)
         for arg in call.args:
             record_observation(check, (key for key in verified_call(file, arg, "")
-                                       if key[0] in {"calls", "mock-type", "installed-mock"}), False)
+                                       if key[0] in {"calls", "mock-type", "field-mock-type", "installed-mock"}), False)
         return check
     if call.receiver is not None:
         if ((verified := call_of(call.receiver)) is not None
@@ -567,7 +572,7 @@ def mockito_observations(file, check, call, method):
     else:
         return check
     keys = verified_call(file, call.args[0], method)
-    record_observation(check, (key for key in keys if present or key[0] != "mock-type"), present)
+    record_observation(check, (key for key in keys if present or key[0] not in {"mock-type", "field-mock-type"}), present)
     return check
 
 

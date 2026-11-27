@@ -62,6 +62,10 @@ def verified_call(file, receiver, method):
             observations.append((channel, Recorder(recorder.identity, (target,))))
         elif file.syntax.language == "java" and (factory := java_mock_factory(file, value)) is not None:
             observations.append(("mock-factory", Recorder(factory + (method,), factory + (method,))))
+    elif file.syntax.language == "java" and scope is not None and scope.kind() in CLASSES and binding is not None:
+        field_value = value if value is not None else file.initializer(binding)
+        if (target := mock_type(file, binding, field_value)) is not None:
+            observations.append(("field-mock-type", Recorder(recorder.identity, (target,))))
     return tuple(observations)
 
 
@@ -554,7 +558,8 @@ def analyze(file, body, sizes=None):
 
 
 def shared_keys(witnesses):
-    return {(channel, recorder.shared) for channel, recorder in witnesses if recorder.shared is not None}
+    return {(channel, recorder.shared) for channel, recorder in witnesses
+            if recorder.shared is not None and channel != "field-mock-type"}
 
 
 def sibling_controls(file, wanted, cache):

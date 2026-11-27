@@ -21,6 +21,8 @@ OWNERS = {
     "org.assertj.core.api.BDDSoftAssertions": "soft-assertj",
     "org.assertj.core.api.AutoCloseableBDDSoftAssertions": "soft-assertj",
     "com.google.common.truth.Truth": "truth", "com.google.common.truth.Truth8": "truth",
+    "com.google.common.truth.Expect": "truth", "com.google.common.truth.StandardSubjectBuilder": "truth",
+    "org.skyscreamer.jsonassert.JSONAssert": "jsonassert",
     "org.mockito.Mockito": "mockito", "org.mockito.BDDMockito": "mockito",
     "org.mockito.InOrder": "mockito",
     "io.mockk": "mockk",
@@ -40,11 +42,10 @@ JUNIT_METHODS = {
 }
 API_SOURCE_MARKERS = {
     "assertj": ("org/assertj/core/api/Assertions.java", "org/assertj/core/api/AbstractAssert.java"),
-    "soft-assertj": ("org/assertj/core/api/SoftAssertions.java", "org/assertj/core/api/AbstractAssert.java"),
+    "soft-assertj": ("org/assertj/core/api/SoftAssertions.java", "org/assertj/core/api/Assertions.java"),
     "jupiter": ("org/junit/jupiter/api/Assertions.java",),
     "junit4": ("org/junit/Assert.java", "junit/framework/Assert.java"),
     "truth": ("com/google/common/truth/Truth.java",),
-    "soft-assertj": ("org/assertj/core/api/Assertions.java",),
 }
 
 
@@ -110,6 +111,8 @@ def accepts(owner, method):
                 or (method.startswith("then") and method.endswith("Exception")))
     if owner == "stepverifier":
         return method in {"create", "withVirtualTime"} or method.startswith(("expect", "verify", "consume", "assert"))
+    if owner == "jsonassert":
+        return method in {"assertEquals", "assertNotEquals"}
     if owner == "kotest":
         return method.startswith(("assert", "should", "fail"))
     if owner == "assertk":
@@ -148,6 +151,16 @@ def soft_callback(file, receiver):
     return False
 
 
+def _is_local_soft_assertions(file, declared_type):
+    local_type = file.types.get(declared_type)
+    if local_type is None:
+        return False
+    text = local_type.text().split("{", 1)[0]
+    return any(marker in text for marker in (
+        "AbstractSoftAssertions", "SoftAssertionsProvider", "StandardSoftAssertionsProvider",
+        "BDDSoftAssertions", "SoftAssertions"))
+
+
 def signature(file, call):
     receiver = unwrap(call.receiver)
     if receiver is None:
@@ -161,13 +174,15 @@ def signature(file, call):
         declared_type = declared_node.text().split("<", 1)[0] if declared_node is not None else ""
         if declared_type:
             owner = family(file.imports.get(declared_type, declared_type))
-            if owner in {"assertj", "soft-assertj", "mockito", "stepverifier"}:
+            if owner in {"assertj", "soft-assertj", "truth", "mockito", "stepverifier"}:
                 return owner, call.method
             if declared_type in {"BDDSoftAssertions", "AutoCloseableBDDSoftAssertions", "SoftAssertions",
-                                 "AutoCloseableSoftAssertions"}:
+                                 "AutoCloseableSoftAssertions"} or _is_local_soft_assertions(file, declared_type):
                 return "soft-assertj", call.method
             if declared_type in {"WithAssertions", "WithBDDAssertions", "BDDAssertions"}:
                 return "assertj", call.method
+            if declared_type in {"Expect", "StandardSubjectBuilder"}:
+                return "truth", call.method
         value = file.initializer(binding)
         if value is not None:
             constructor = value.field("type") if value.kind() == "object_creation_expression" else None
@@ -175,10 +190,13 @@ def signature(file, call):
             declared = constructor.text().split("<", 1)[0] if constructor is not None else called.method if called is not None else ""
             owner = family(file.imports.get(declared, declared))
             if owner == "soft-assertj" or declared in {"SoftAssertions", "AutoCloseableSoftAssertions",
-                                                      "BDDSoftAssertions", "AutoCloseableBDDSoftAssertions"}:
+                                                      "BDDSoftAssertions", "AutoCloseableBDDSoftAssertions"} or _is_local_soft_assertions(file, declared):
                 return "soft-assertj", call.method
             if declared in {"WithAssertions", "WithBDDAssertions", "BDDAssertions"}:
                 return "assertj", call.method
+            if declared in {"Expect", "StandardSubjectBuilder"} or (
+                    called is not None and called.method == "create" and name(called.receiver) == "Expect"):
+                return "truth", call.method
             if declared == "inOrder" or owner == "mockito":
                 return "mockito", call.method
         if declared_type == "var" and name(receiver) in {"order", "inOrder"} and call.method.startswith("verify"):
@@ -237,3 +255,12 @@ def executable_callbacks(file, args):
                 ("java.util.List", "of"), ("java.util.Arrays", "asList"), ("java.util.stream.Stream", "of"),
                 ("", "listOf"), ("", "arrayOf")}:
             yield from executable_callbacks(file, call.args)
+        elif call.method == "map" and call.receiver is not None and len(call.callbacks()) == 1:
+            from .ast_grep_jvm import body_of
+
+            body = unwrap(body_of(call.callbacks()[0]))
+            if body is not None and body.kind() == "block":
+                steps = children(body)
+                body = unwrap(next(iter(children(steps[0])), None)) if len(steps) == 1 and steps[0].kind() == "return_statement" else None
+            if body is not None and body.kind() in LAMBDAS:
+                yield body

@@ -112,13 +112,16 @@ def tri_truth(syntax, node, known=None):
             return decisive
         if UNKNOWN not in (first, second):
             return not decisive
-    if operator in {"==", "!="}:
+    if operator in {"==", "!=", "is", "is not"}:
         first, second = (literal(syntax, child) for child in (left, right))
         if known is not None:
             first = known(left) if first is UNKNOWN else first
             second = known(right) if second is UNKNOWN else second
         if UNKNOWN not in (first, second):
-            return (first == second) == (operator == "==")
+            if operator in {"==", "!="}:
+                return (first == second) == (operator == "==")
+            if first is None or second is None or type(first) is bool or type(second) is bool:
+                return (first is second) == (operator == "is")
     return UNKNOWN
 
 
@@ -224,7 +227,7 @@ def range_size(start, stop, step=1):
 class Flow:
     """Record checks and prove when execution cannot skip all of them."""
 
-    def __init__(self, file, syntax, body, scope, initial=()):
+    def __init__(self, file, syntax, body, scope, initial=(), row_bindings=None):
         self.file = file
         self.syntax = syntax
         self.body = body
@@ -241,13 +244,20 @@ class Flow:
         self.collection_growth = defaultdict(list)
         strategy_entries = []
         param_values = {}
+        param_rows = ()
         for key, val in initial:
             if key == "__params__":
                 param_values = val
+            elif key == "__param_rows__":
+                param_rows = val
             else:
                 strategy_entries.append((key, val))
         self.strategies = dict(strategy_entries)
         self.param_values = param_values
+        self.param_rows = param_rows
+        self.row_bindings = row_bindings or {}
+        self.checked_early_exits = set()
+        self.with_spans = []
         self.loop_values = {}
         self.loop_ranges = {}
         self.checked_collections = {}
@@ -301,6 +311,12 @@ class Flow:
                         return len(text.encode())
                 return self.size(receiver, exact=not minimum, seen=seen)
         name = parts(node)
+        if self.syntax.language == "python" and name:
+            if len(name) == 1 and name[0] in self.row_bindings:
+                return self.known_value(self.row_bindings[name[0]], seen, minimum=minimum)
+            if self.file.python_import(name, self.scope) in {
+                    ("pickle", "HIGHEST_PROTOCOL"), ("pickle", "DEFAULT_PROTOCOL")}:
+                return 5 if name[-1] == "HIGHEST_PROTOCOL" else 3
         if minimum and name in self.loop_ranges:
             return self.loop_ranges[name].start
         if name and name not in seen and (value := self.resolve(name, self.syntax.absolute(node))) is not None:
@@ -319,6 +335,8 @@ class Flow:
         return None
 
     def resolve(self, name, before):
+        if len(name) == 1 and name[0] in self.row_bindings:
+            return self.row_bindings[name[0]]
         entries = self.bindings.get(name, ())
         if entries:
             value = next((value for site, value in reversed(entries) if site < before), None)
@@ -458,6 +476,11 @@ class Flow:
             if call.receiver is None:
                 if method in {"enumerate", "reversed", "iter", "list", "tuple", "sorted", "array", "repeat"} and args:
                     return self.size(args[0], before=before, exact=exact, seen=seen)
+                if self.syntax.language == "python" and method == "dict" and len(args) == 1 and not exact:
+                    return self.size(args[0], before=before, exact=exact, seen=seen)
+                if self.syntax.language == "python" and method == "set" and len(args) == 1 and not exact:
+                    inner = self.size(args[0], before=before, exact=exact, seen=seen)
+                    return min(1, inner) if inner is not None else None
                 if method in {"once", "repeat_with"} or method == "repeat" and self.syntax.language == "rust":
                     return None if exact and method != "once" else 1
                 if method == "zip" and args:
@@ -471,6 +494,9 @@ class Flow:
                         ("Vec",), ("VecDeque",), ("HashSet",), ("HashMap",), ("BTreeSet",),
                         ("BTreeMap",), ("std", "iter"), ("JoinSet",), ("tokio", "task", "JoinSet")}:
                     return 0
+            if (self.syntax.language == "python" and method == "fields" and len(args) == 1
+                    and not exact and (fcount := self._class_field_count(args[0], before, seen)) is not None):
+                return fcount
             if (self.syntax.language == "rust" and call.receiver is None or not args and (
                     call.receiver is None or call.name[:1] == ("self",))) and (
                     helper := self.file.fixture_function(call.name, self.scope)):
@@ -481,6 +507,10 @@ class Flow:
                     returned = helper_flow.fixture_return(function)
                     if returned is not None:
                         return helper_flow.size(returned, seen=seen | {identity}, exact=exact)
+                    if self.syntax.language == "python" and not exact:
+                        gsize = self._generator_size(helper_flow, body_of(function), seen | {identity})
+                        if gsize is not None:
+                            return gsize
             if call.receiver is not None:
                 if method == "concat" and not args:
                     rows = self.fixture_rows(call.receiver, before, seen)
@@ -534,6 +564,8 @@ class Flow:
             joined, minimum = self.reaching_facts.path_minimum(name[0], before)
             if joined:
                 return None if exact else minimum
+        if len(name) == 1 and name[0] in self.row_bindings:
+            return self.size(self.row_bindings[name[0]], before=before, exact=exact, seen=seen | {name})
         entries = self.bindings.get(name, ())
         if not entries and name in self.loop_values:
             sizes = [self.size(item, before=before, exact=exact, seen=seen | {name})
@@ -611,6 +643,81 @@ class Flow:
             self.mark_vector(statement.field("type"), value)
         self.mark_vector(function.field("return_type"), tail)
         return tail
+
+    def _generator_size(self, helper_flow, body, seen):
+        if body is None:
+            return None
+        for stmt in direct_statements(body):
+            if stmt.kind() == "assignment":
+                target, val = binding(stmt)
+                if target:
+                    helper_flow.bindings[target].append((helper_flow.syntax.absolute(stmt), val))
+            elif stmt.kind() == "yield":
+                text = stmt.text().strip()
+                if text.startswith("yield from "):
+                    expr = next(iter(children(stmt)), None)
+                    if expr is not None:
+                        if parts(expr) == ("lc",) or expr.text().endswith("ascii_lowercase"):
+                            return 26
+                        for sub in children(stmt):
+                            if sub.kind() == "identifier":
+                                resolved = helper_flow.resolve(parts(sub), helper_flow.syntax.absolute(stmt))
+                                if resolved is not None and resolved.text() == "string.ascii_lowercase":
+                                    return 26
+                                sz = helper_flow.size(sub, seen=seen)
+                                if sz is not None and sz > 0:
+                                    return sz
+                return 1
+            elif stmt.kind() == "while_statement" and literal(helper_flow.syntax, stmt.field("condition")) is True:
+                if query(stmt, "yield"):
+                    return 1
+        return None
+
+    def _class_field_count(self, node, before, seen):
+        node = unwrap(node)
+        if node is None:
+            return None
+        cname = parts(node)
+        if len(cname) == 1 and cname[0] in self.param_values:
+            counts = [self._class_field_count(item, before, seen) for item in self.param_values[cname[0]]]
+            return min(counts) if counts and None not in counts else None
+        if len(cname) == 1 and cname[0] in self.row_bindings:
+            return self._class_field_count(self.row_bindings[cname[0]], before, seen)
+        if node.kind() == "call":
+            call = self.syntax.call(node)
+            if call.method == "make_class" and len(call.arguments) >= 2:
+                return self.size(call.arguments[1], before=before, exact=False, seen=seen)
+        if cname and cname not in seen:
+            val = self.resolve(cname, before)
+            if val is not None:
+                return self._class_field_count(val, before, seen | {cname})
+            cls_name = cname[-1]
+            cls_node = next((c for scope_node in (self.body, self.syntax.root) if scope_node is not None
+                             for c in query(scope_node, "class_definition") if function_name(c) == cls_name), None)
+            if cls_node is not None:
+                return self._count_attrs_in_class(cls_node, seen | {cname})
+        return None
+
+    def _count_attrs_in_class(self, cls_node, seen):
+        cls_body = body_of(cls_node)
+        count = 0
+        if cls_body is not None:
+            for stmt in direct_statements(cls_body):
+                if stmt.kind() == "assignment":
+                    count += 1
+                elif stmt.kind() == "type" or (stmt.kind() == "expression_statement" and any(
+                        c.kind() == "type" for c in children(stmt))):
+                    count += 1
+        bases = cls_node.field("superclasses")
+        if bases is not None:
+            for base in children(bases):
+                bname = parts(base)
+                if bname and bname not in seen:
+                    bcls = next((c for c in query(self.syntax.root, "class_definition")
+                                 if function_name(c) == bname[-1]), None)
+                    if bcls is not None:
+                        count += self._count_attrs_in_class(bcls, seen | {bname})
+        return count if count > 0 else None
 
     def fixture_keys(self, node, before):
         seen = set()
@@ -758,10 +865,52 @@ class Flow:
                    and (any(part.kind() == "async" for part in child.children())
                         or not self.size(child.field("right"))) for child in children(generator))
 
+    def _row_known(self, node):
+        name = parts(node)
+        if len(name) == 1 and name[0] in self.row_bindings:
+            return literal(self.syntax, self.row_bindings[name[0]])
+        return UNKNOWN
+
+    def _is_failure_branch(self, consequence, before):
+        if consequence is None:
+            return False
+        steps = list(direct_statements(consequence))
+        if not steps:
+            return False
+        last = steps[-1]
+        if last.kind() == "raise_statement":
+            exc = next(iter(children(last)), None)
+            ename = self.syntax.call(exc).method if exc is not None and exc.kind() in CALLS else child_text(exc)
+            return ename == "AssertionError"
+        if last.kind() == "call":
+            return self.syntax.call(last).method == "fail"
+        return False
+
     def branch(self, node):
         before = len(self.checks)
         condition = node.field("condition")
         primary = self.visit(condition)
+        if self.syntax.language == "python" and self.row_bindings:
+            decision = tri_truth(self.syntax, condition, self._row_known)
+            if decision is True:
+                proved = self.isolated(node.field("consequence"))
+                for arm in children(node):
+                    if arm.kind() in {"elif_clause", "else_clause"}:
+                        self.conditional(arm)
+                return primary or proved
+            if decision is False:
+                self.conditional(node.field("consequence"))
+                for arm in children(node):
+                    if arm.kind() == "elif_clause":
+                        arm_dec = tri_truth(self.syntax, arm.field("condition"), self._row_known)
+                        if arm_dec is True:
+                            return primary or self.isolated(arm.field("consequence"))
+                        if arm_dec is False:
+                            self.conditional(arm.field("consequence"))
+                            continue
+                    elif arm.kind() == "else_clause":
+                        return primary or self.isolated(arm.field("body") or next(iter(children(arm)), None))
+                return primary
         if self.reaching_facts is not None and tri_truth(self.syntax, condition) is UNKNOWN:
             site = self.syntax.absolute(node)
             decision = tri_truth(self.syntax, condition, lambda value: self.reaching_facts.branch_boolean(value, site))
@@ -797,11 +946,18 @@ class Flow:
             else:
                 branches.append(self.isolated(arm.field("body") or next(iter(children(arm)), None)))
         exhaustive = bool(alternatives and alternatives[-1].kind() == "else_clause" and all(branches))
+        if (not exhaustive and self.syntax.language == "python" and not alternatives and branches[0]
+                and self._is_failure_branch(node.field("consequence"), before)):
+            exhaustive = True
+            for check in self.checks[before:]:
+                check.guarded = False
         if (not exhaustive and self.syntax.language == "python" and len(branches) == 2
                 and alternatives and alternatives[-1].kind() == "else_clause"
                 and self._parametrized_raises_dual(condition, branches, node.field("consequence"), alternatives[-1])):
             exhaustive = True
         if not exhaustive:
+            if not alternatives and branches[0]:
+                self.checked_early_exits.add(self.syntax.absolute(node))
             for check in self.checks[before:]:
                 check.guarded = True
         return exhaustive
@@ -913,6 +1069,12 @@ class Flow:
         return condition
 
     def can_exit_block(self, statement):
+        unwrapped = unwrap(statement)
+        if unwrapped is not None and unwrapped.kind() == "expression_statement":
+            unwrapped = next(iter(children(unwrapped)), unwrapped)
+        if unwrapped is not None and unwrapped.kind() == "if_statement" and (
+                self.syntax.absolute(unwrapped) in self.checked_early_exits):
+            return False
         jumps = (("return_statement", "break_statement", "continue_statement")
                  if self.syntax.language == "python" else
                  ("return_expression", "break_expression", "continue_expression"))
@@ -1007,6 +1169,9 @@ class Flow:
         kind = node.kind()
         if kind in SCOPES | COMMENTS:
             return False
+        if kind == "with_statement" and self.syntax.language == "python":
+            start = self.syntax.absolute(node)
+            self.with_spans.append((start, start + len(node.text())))
         if kind in {"block", "expression_statement"}:
             possible_exit = False
             guaranteed = False
@@ -1150,6 +1315,14 @@ class Flow:
                         and call.arguments and integer(self.syntax, call.arguments[0]) is not None):
                     recognized = outcome = False
             checked_callback = False
+            if self.syntax.language == "python" and call.method == "invoke" and any(
+                    arg.kind() == "keyword_argument" and child_text(arg.field("name")) == "catch_exceptions"
+                    and literal(self.syntax, arg.field("value")) is False for arg in call.arguments):
+                pos_args = [arg for arg in call.arguments if arg.kind() != "keyword_argument"]
+                if pos_args and len(target_name := parts(pos_args[0])) == 1:
+                    nested_fn = self.file.functions.get((*self.scope, target_name[0]))
+                    if nested_fn is not None and body_of(nested_fn) is not None:
+                        checked_callback = self.visit(body_of(nested_fn))
             if self.syntax.language == "rust" and not call.macro:
                 local = self.resolve(call.name, site) if len(call.name) == 1 else None
                 if local is not None and local.kind() == "closure_expression":
@@ -1287,6 +1460,8 @@ class Flow:
         if alias and not any(site < changed < before for key in {root[0], alias[0]}
                              for changed in self.alias_changes[key]):
             if self.syntax.language == "python" and len(alias) >= 2:
+                if any(w_start < site < w_end <= before for w_start, w_end in self.with_spans):
+                    return name
                 pure_checks = {c.location for c in self.checks
                                if c.kind == "assert" or c.kind.startswith(("assert", "raises", "warns", "deprecated"))}
                 for call_node, call in self.calls:
@@ -1560,6 +1735,8 @@ class Flow:
             if name in negative and recorders[name] == "empty":
                 if self.is_failure_collector(writes[name]) and not inputs[name]:
                     continue
+                if self.syntax.language == "python" and self._deleted_or_shrunk(name, negative[name], calls):
+                    continue
                 for check in negative[name]:
                     producers = {producer for producer, site in inputs[name] if site < check.location}
                     if producers & controlled:
@@ -1571,7 +1748,7 @@ class Flow:
                             continue
                     yield self.file.line_at(check.location)
             elif name in writes and name not in negative:
-                methods = {parts(call.receiver) for _, call in self.calls if call.method not in RECORDING}
+                methods = {parts(call.receiver) for _, call in calls if call.method not in RECORDING}
                 if name not in methods and not self.is_read_in_checks(name) and not self.serialized(name):
                     callback_write = next((site for site, node in writes[name]
                                            if any(parent.kind() in {callback_kind, "function_definition"}
@@ -1581,6 +1758,27 @@ class Flow:
                         yield self.file.line_at(callback_write)
         yield from self.unobserved_callback_writes(recorders)
         self.detector_absences(observations)
+
+    def _deleted_or_shrunk(self, name, checks, calls):
+        limit = min(check.location for check in checks)
+        deleted = False
+        for node in query(self.body, "delete_statement"):
+            site = self.syntax.absolute(node)
+            if site < limit and any(parts(ident) == name for ident in query(node, "identifier")):
+                deleted = True
+                break
+        if not deleted:
+            deleted = any(
+                site < limit and parts(call.receiver) == name and call.method in SHRINKING
+                for node, call in calls if (site := self.syntax.absolute(node))
+            )
+        if not deleted:
+            return False
+        return any(
+            self.syntax.absolute(node) < limit and any(
+                parts(arg) == name for arg in call.arguments)
+            for node, call in calls if call.method not in SHRINKING
+        )
 
     def serialized(self, name):
         if self.syntax.language != "rust":
@@ -2153,6 +2351,16 @@ class File:
                              and not check.kind.startswith("debug_assert")
                              or target[-1].startswith(("assert", "check", "verify")))
                              for check in flow.checks)
+                if not checks and self.syntax.language == "python":
+                    returned = [node for node in query(body_of(function), "return_statement")
+                                if not any(p.kind() == "function_definition" and offset(p) > offset(function)
+                                           for p in node.ancestors())]
+                    if returned and (ret_val := next(iter(children(returned[-1])), None)) is not None:
+                        inner = self.functions.get((*target, child_text(ret_val)))
+                        if inner is not None and body_of(inner) is not None:
+                            inner_flow = Flow(self, self.syntax, body_of(inner), (*target, child_text(ret_val)))
+                            inner_flow.visit(inner_flow.body)
+                            checks = any(check.outcome for check in inner_flow.checks)
             self.helper_checks[key] = checks
             return checks
         finally:
@@ -2178,7 +2386,8 @@ class File:
             return verifies or lint.helper(method) and not call.macro, verifies
         if method in {"check_returncode", "assert_that"} or lint.helper(method) or (
                 self.syntax.language == "python" and call.receiver is not None
-                and method in {"fnmatch_lines", "fnmatch_lines_random", "re_match_lines", "re_match_lines_random"}) or (
+                and method in {"fnmatch_lines", "fnmatch_lines_random", "re_match_lines", "re_match_lines_random",
+                               "no_fnmatch_line", "no_re_match_line"}) or (
                 self.syntax.language == "rust" and method.startswith("debug_assert")):
             return True, True
         return False, False
@@ -2195,6 +2404,7 @@ class File:
             pname = child_text(entry.field("name")) if entry.kind().startswith("default") else child_text(entry)
             if pname and pname not in {"self", "cls"}:
                 fn_params.append(pname.lstrip("*"))
+        param_rows = [{}]
         for dec in children(parent):
             if dec.kind() != "decorator":
                 continue
@@ -2237,6 +2447,7 @@ class File:
                     elif isinstance(raw, (list, tuple)):
                         names_list = [str(part).strip() for part in raw if str(part).strip()]
                 if names_list and argvalues is not None and argvalues.kind() in {"list", "tuple"}:
+                    dec_rows = []
                     for row in children(argvalues):
                         if row.kind() == "call" and self.syntax.call(row).method == "param":
                             p_args = [a for a in self.syntax.call(row).arguments if a.kind() != "keyword_argument"]
@@ -2247,10 +2458,19 @@ class File:
                         else:
                             p_args = []
                         if len(p_args) == len(names_list):
+                            row_map = {}
                             for kname, pval in zip(names_list, p_args):
                                 param_values[kname].append(pval)
+                                row_map[kname] = pval
+                            dec_rows.append(row_map)
+                    if dec_rows and len(param_rows) * len(dec_rows) <= 64:
+                        param_rows = [{**prev, **cur} for prev in param_rows for cur in dec_rows]
+                    else:
+                        param_rows = []
         if param_values:
             strategies.append(("__params__", dict(param_values)))
+        if len(param_rows) > 1 or (len(param_rows) == 1 and param_rows[0]):
+            strategies.append(("__param_rows__", tuple(param_rows)))
         return tuple(strategies)
 
     def inventory(self):
@@ -2566,6 +2786,17 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
             captures=(syntax.absolute(site) for site in sites),
         )
         guaranteed = flow.visit(flow.body)
+        if (not guaranteed and syntax.language == "python" and flow.param_rows
+                and any(check.reachability for check in flow.checks)):
+            all_rows_checked = True
+            for row in flow.param_rows:
+                row_flow = Flow(file, syntax, body_of(fn), tuple(test.qualified.split("::")), initial, row_bindings=row)
+                row_flow.reaching_facts = flow.reaching_facts
+                if not row_flow.visit(row_flow.body):
+                    all_rows_checked = False
+                    break
+            if all_rows_checked:
+                guaranteed = True
         test.issues.extend((site, "swallowed-assertion") for site in
                            swallowed_assertions(flow.body, syntax.language, (check.source for check in flow.checks)))
         should_panic = ("should_panic",) in attrs
