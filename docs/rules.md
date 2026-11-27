@@ -254,7 +254,7 @@ def test_encode_order():
 
 ### `self-derived-expected`
 
-Flags an equality check whose expected value comes from production code or its rendered output. The TypeScript check follows a rendered value through local bindings and helpers. A loose bound on a rendered number still leaves that number under the application's control.
+Flags an equality check whose expected value comes from production code or its rendered output. The TypeScript check follows a rendered value through local bindings and helpers. A same-test inequality on the captured value can establish that another render produces different output. A loose bound on a rendered number still leaves that number under the application's control.
 
 **Why it can pass on broken code.** If the shared helper has a bug, both sides of the assertion produce the same wrong value and the test passes.
 
@@ -286,7 +286,7 @@ Use an allow note when the CSS class itself is a contract, such as a class expos
 
 ### `unawaited-navigation`
 
-The ast-grep engine flags a TypeScript or JavaScript assertion that reads `location.hash` or `history.state` after an event that can call native `history.back()` or `history.go()`. Native history traversal can finish after the event handler returns.
+The ast-grep engine flags a TypeScript or JavaScript assertion that reads `location.hash` or `history.state` after a click whose handler resolves to native `history.back()` or `history.go()`. The check follows local and imported functions in the scanned tree. Native history traversal can finish after the event handler returns.
 
 Wait for the destination screen, wait for `popstate`, or retry the history assertion with `await waitFor(() => expect(location.hash).toBe("#/home"))`.
 

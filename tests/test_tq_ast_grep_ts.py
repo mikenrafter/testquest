@@ -665,3 +665,21 @@ class AstGrepTypeScript(TqCase):
             });
         """)
         self.assertEqual(self.locations(path.name), [(7, "unawaited-navigation")])
+
+    def test_navigation_requires_the_selected_handler(self):
+        # WHY: the v4 tab and scrim races share a router with synchronous and unresolved clicks.
+        # catches: inferring Back from an unrelated handler or losing callbacks passed through props
+        for name in ("navigation-panel.tsx", "navigation-routes.ts", "navigation-events.ts"):
+            self.fixture(name)
+        path = self.fixture("navigation-precision.test.tsx")
+        self.assertEqual(self.locations(path.name), [
+            (line, "unawaited-navigation") for line in (9, 16, 22, 77)
+        ])
+
+    def test_negative_equality_controls_only_the_same_render_capture(self):
+        # WHY: a different render proves the captured preview can vary before restoring it.
+        # catches: matching output origins or variable names rather than the exact captured operand
+        path = self.fixture("expected-precision.test.tsx")
+        self.assertEqual(self.locations(path.name), [
+            (line, "self-derived-expected") for line in (35, 36, 45)
+        ])

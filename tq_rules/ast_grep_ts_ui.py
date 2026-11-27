@@ -5,7 +5,7 @@ import re
 from . import lint
 from .ast_grep import children, offset, query, shape, split_operands
 from .ast_grep_origins import Origin
-from .ast_grep_ts import FUNCTIONS, arguments, chain, expression, literal, name, span
+from .ast_grep_ts import ASSERT_UNEQUAL, FUNCTIONS, arguments, chain, expression, literal, name, span
 from .ast_grep_ts_recorders import object_member
 
 
@@ -216,10 +216,18 @@ def element_key(file, node, seen=frozenset()):
     return shape(node)
 
 
+def capture(file, node):
+    initializer, field = reaching_initializer(file, expression(node))
+    return (offset(initializer), field) if initializer is not None else None
+
+
 def ui_issues(file, test, checks):
     origins = OutputOrigins(file)
     semantic = {element_key(file, element) for check in checks
                 if (element := visible_element(file, check)) is not None and not check.guarded}
+    contrasted = {key for check in checks if not check.guarded and (
+        check.method in ASSERT_UNEQUAL or check.negated and check.method in {"toBe", "toEqual", "toStrictEqual"})
+        for operand in (check.actual, check.expected) if (key := capture(file, operand)) is not None}
     for check in checks:
         subject = expression(check.actual)
         if subject is None:
@@ -231,6 +239,8 @@ def ui_issues(file, test, checks):
             if element is not None and element_key(file, element) not in semantic:
                 yield check.node, "implementation-selector"
         if check.method not in EQUALITY or check.negated or check.expected is None:
+            continue
+        if capture(file, check.expected) in contrasted:
             continue
         expected = origins.origin(check.expected)
         actual = origins.origin(subject)
