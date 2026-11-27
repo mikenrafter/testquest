@@ -1,6 +1,7 @@
 """Read pinned mutants and apply their swaps inside a scratch tree."""
 
 from dataclasses import dataclass
+from enum import Enum, auto
 import io
 import json
 from pathlib import Path
@@ -24,6 +25,18 @@ HEADER = re.compile(rf"[ \t]*(?P<comment>\#|//)[ \t]*tq-mutant[ \t]+"
                     rf"(?P<id>{MUTANT_ID})[ \t]+(?P<flip>[\w-]+)[ \t]+(?P<metadata>.+)")
 COMMENT = re.compile(r"[ \t]*(?:#|//)[ \t]*tq-mutant[ \t]+")
 SWAP_LINE = re.compile(r"[ \t]*(?:#|//)[ \t]*\|")
+NON_TRIVIAL_FLIPS = {
+    "boundary", "condition", "constant", "constant-result", "off-by-one",
+    "order", "swapped-operands", "wrong-constant", "wrong-fallback",
+}
+JSX_ELEMENTS = {"jsx_element", "jsx_self_closing_element"}
+STATEMENT_LISTS = {
+    "block", "constructor_body", "function_body", "module", "program",
+    "source_file", "statement_block", "statements",
+}
+EMPTY_RETURN = re.compile(r"return(?:\s+(?:null|undefined|None))?\s*;?")
+SIMPLE_CALL = re.compile(r"(?m)[ \t]*[A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)*"
+                         r"\([ \t]*(?:[A-Za-z_]\w*|[0-9]+)?[ \t]*\);[ \t]*")
 CONFIG = re.compile(r"""mutants\s*=\s*(?:"(inline|sidecar)"|'(inline|sidecar)'|(inline|sidecar))""")
 
 
@@ -40,6 +53,20 @@ class Mutant:
     block: tuple[str, ...] = ()
     start: int = 0
     replaces: int = 0
+
+
+@dataclass(frozen=True)
+class AppliedSwap:
+    outcome: str | None
+    detail: str = ""
+    classification: str = "unknown"
+    line: int | None = None
+
+
+class Edit(Enum):
+    UNCHANGED = auto()
+    TRIVIAL = auto()
+    OTHER = auto()
 
 
 def safe_path(directory, path):
@@ -79,8 +106,7 @@ def syntax_tree(source, path):
     return Syntax.parse(source, language)
 
 
-def parse_error(source, path):
-    tree = syntax_tree(source, path)
+def parse_error(source, path, tree):
     from .ast_grep import syntax_errors
 
     lines = syntax_errors(tree.root, missing=True)
@@ -153,8 +179,6 @@ def parse_sidecar(directory, path):
     name, assumes = string(item, "id"), string(item, "assumes")
     source = Path(string(item, "file"))
     safe_path(directory, source)
-    if source.suffix not in LANGUAGES:
-        raise ValueError(f"{path}: unsupported mutant language: {source}")
     tests = item.get("killed_by")
     if (not re.fullmatch(MUTANT_ID, name) or not re.fullmatch(r"A-\d+", assumes)
             or not isinstance(tests, list) or not tests
@@ -228,15 +252,160 @@ def swap_span(mutant, lines):
     return matches[0] if len(matches) == 1 else None
 
 
+def syntax_children(node):
+    from .ast_grep import COMMENTS, children
+
+    return [child for child in node.children()
+            if child.kind() not in COMMENTS
+            and not (child.kind() == "jsx_text" and not child.text().strip())
+            and not (node.kind() == "jsx_element" and child.kind() == "jsx_expression"
+                     and not children(child))]
+
+
+def renders_element(node):
+    if node.kind() in JSX_ELEMENTS:
+        return True
+    if node.kind() in {"jsx_expression", "parenthesized_expression"}:
+        from .ast_grep import children
+
+        return any(renders_element(child) for child in children(node))
+    if node.kind() == "ternary_expression":
+        return renders_element(node.field("consequence")) or renders_element(node.field("alternative"))
+    return (node.kind() == "binary_expression" and node.field("operator").text() == "&&"
+            and renders_element(node.field("right")))
+
+
+def disables_condition(before, after):
+    if after.kind() == "false":
+        return before.kind() != "false"
+    if not all(node.kind() == "binary_expression" and node.field("operator").text() == "&&"
+               for node in (before, after)):
+        return False
+    return any(
+        disables_condition(before.field(changed), after.field(changed))
+        and compare_edits(before.field(kept), after.field(kept)) is Edit.UNCHANGED
+        for changed, kept in (("left", "right"), ("right", "left"))
+    )
+
+
+def disabled_element(before, after):
+    kind = before.kind()
+    if kind == "ternary_expression" and kind == after.kind():
+        return (renders_element(before.field("consequence"))
+                and disables_condition(before.field("condition"), after.field("condition"))
+                and all(compare_edits(before.field(field), after.field(field)) is Edit.UNCHANGED
+                        for field in ("consequence", "alternative")))
+    if kind == "binary_expression" and kind == after.kind():
+        return (all(node.field("operator").text() == "&&" for node in (before, after))
+                and renders_element(before.field("right"))
+                and disables_condition(before.field("left"), after.field("left"))
+                and compare_edits(before.field("right"), after.field("right")) is Edit.UNCHANGED)
+    return False
+
+
+def empty_body(node):
+    from .ast_grep import children
+
+    if node.kind() not in STATEMENT_LISTS:
+        return False
+    statements = children(node)
+    if len(statements) == 1 and statements[0].kind() == "statements":
+        statements = children(statements[0])
+    return not statements or (len(statements) == 1
+                              and (statements[0].kind() == "pass_statement"
+                                   or EMPTY_RETURN.fullmatch(statements[0].text())))
+
+
+def emptied_arrow(before, after):
+    from .ast_grep import children
+
+    if before.kind() != "arrow_function" or after.kind() != "arrow_function":
+        return False
+    old_body, new_body = before.field("body"), after.field("body")
+    if not empty_body(new_body) or empty_body(old_body):
+        return False
+    old_params = before.field("parameters") or before.field("parameter")
+    new_params = after.field("parameters")
+    if new_params is None or children(new_params):
+        return False
+    old_head = [node.text() for node in syntax_children(before) if node not in (old_body, old_params)]
+    new_head = [node.text() for node in syntax_children(after) if node not in (new_body, new_params)]
+    return old_head == new_head
+
+
+def removable(parent, child):
+    if parent.kind() == "jsx_element":
+        return renders_element(child)
+    return parent.kind() in STATEMENT_LISTS and child.is_named()
+
+
+def compare_edits(before, after):
+    """Compare parsed source while ignoring comments and JSX indentation."""
+    if before.kind() == after.kind() and before.text() == after.text():
+        return Edit.UNCHANGED
+    if empty_body(after) and not empty_body(before):
+        if before.kind() in STATEMENT_LISTS and before.kind() == after.kind():
+            return Edit.TRIVIAL
+        if before.kind() == "expression_statement" and not any(
+                child.is_named() for child in syntax_children(after)):
+            return Edit.TRIVIAL
+        parent = before.parent()
+        if parent is not None and parent.kind() == "arrow_function" and before == parent.field("body"):
+            return Edit.TRIVIAL
+    if emptied_arrow(before, after) or disabled_element(before, after):
+        return Edit.TRIVIAL
+    if before.kind() != after.kind() or before.is_leaf() or after.is_leaf():
+        return Edit.OTHER
+    remaining = iter(syntax_children(after))
+    next_node = next(remaining, None)
+    edit = Edit.UNCHANGED
+    for child in syntax_children(before):
+        difference = compare_edits(child, next_node) if next_node is not None else Edit.OTHER
+        if difference is not Edit.OTHER:
+            next_node = next(remaining, None)
+        elif removable(before, child):
+            difference = Edit.TRIVIAL
+        else:
+            return Edit.OTHER
+        if difference is Edit.TRIVIAL:
+            edit = Edit.TRIVIAL
+    return edit if next_node is None else Edit.OTHER
+
+
+def classify_swap(path, source, updated, updated_tree=None):
+    """Classify a full source edit. Use a narrow line heuristic without a grammar."""
+    if path.suffix not in LANGUAGES:
+        from difflib import SequenceMatcher
+
+        before, after = source.splitlines(), updated.splitlines()
+        changes = [op for op in SequenceMatcher(None, before, after, autojunk=False).get_opcodes()
+                   if op[0] != "equal"]
+        trivial = changes and all(kind == "delete" and all(SIMPLE_CALL.fullmatch(line)
+                          for line in before[start:stop]) for kind, start, stop, _, _ in changes)
+    else:
+        from .ast_grep import syntax_errors
+
+        try:
+            before = syntax_tree(source, path)
+            after = updated_tree if updated_tree is not None else syntax_tree(updated, path)
+            if syntax_errors(before.root, missing=True) or (
+                    updated_tree is None and syntax_errors(after.root, missing=True)):
+                return "unknown"
+            trivial = compare_edits(before.root, after.root) is Edit.TRIVIAL
+        except RecursionError:
+            return "unknown"
+    return "trivial" if trivial else "non-trivial"
+
+
 def apply(directory, mutant):
     path = safe_path(directory, mutant.file)
     if not path.is_file():
-        return "anchor-missing", f"{mutant.file} is missing"
+        return AppliedSwap("anchor-missing", f"{mutant.file} is missing")
     source, codec = read_source(path)
     lines = source.splitlines(keepends=True)
     span = swap_span(mutant, [line.rstrip("\r\n") for line in lines])
     if span is None:
-        return "anchor-missing", f"{mutant.file} has no unique replacement span"
+        return AppliedSwap("anchor-missing", f"{mutant.file} has no unique replacement span")
     start, stop, prefix = span
     endings = lines[start][len(lines[start].rstrip("\r\n")):]
     newline = endings or "\n"
@@ -244,10 +413,12 @@ def apply(directory, mutant):
     replacement = [prefix + line if line else "" for line in mutant.swap]
     swapped = newline.join(replacement) + (target_ending if replacement else "")
     updated = "".join(lines[:start]) + swapped + "".join(lines[stop:])
-    if error := parse_error(updated, mutant.file):
-        return "unparseable", error
+    tree = syntax_tree(updated, mutant.file) if mutant.file.suffix in LANGUAGES else None
+    if tree is not None and (error := parse_error(updated, mutant.file, tree)):
+        return AppliedSwap("unparseable", error, line=start + 1)
+    classification = classify_swap(mutant.file, source, updated, tree)
     path.write_bytes(updated.encode(codec))
-    return None, ""
+    return AppliedSwap(None, classification=classification, line=start + 1)
 
 
 def changes(repository, base, commit):

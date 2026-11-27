@@ -116,3 +116,29 @@ directory name. A pass also appends `gate-ok` for a watcher.
 Pinned replays append `mutant` events and revert-check appends a `kill`
 event to the configured test ledger. Revert-check writes the ledger after
 comparing live worktree contents. [Test ledger reference](ledger.md)
+
+Both `slice check` and `mutants check` accept `--json`. The JSON output and
+ledger events include each pin's `classification` and `flip_disagreement`.
+The `file` and `line` fields point to the replacement span when tq can locate it.
+
+A `reaches:` note must give a condition and an effect. The condition needs
+its own wording. tq ignores case and punctuation and compares whole words
+when it checks for a copied test name or identical condition and effect.
+
+A swap is `trivial` if it only removes whole statements or JSX elements,
+forces a JSX branch off, or empties a body. Empty bodies include an empty
+block, Python `pass`, and a body reduced to `return`, `return null`,
+`return undefined`, or Python `return None`. tq compares syntax trees
+when the source language has a parser. A sidecar for a source language
+without a parser uses a narrower check for deletion of simple, standalone
+call lines. The test runner still checks whether the swap is killed.
+`non-trivial` means the swap falls outside the trivial patterns.
+`unknown` means tq could not classify the swap, such as a stale or missing
+replacement span.
+
+A trivial swap fails the gate if its declared flip is `boundary`,
+`condition`, `constant`, `constant-result`, `off-by-one`, `order`,
+`swapped-operands`, `wrong-constant`, or `wrong-fallback`. tq records the
+disagreement alongside the replay outcome. A green slice needs at least
+one non-trivial swap. When the tests kill every pin, the gate records
+`all N killed, K trivial` in `advisories` regardless of the gate outcome.
