@@ -12,7 +12,7 @@ import tomllib
 from . import lint
 from .ast_grep import (
     CALLS, COMMENTS, FUNCTIONS, MEMBERS, NAMES, RUST_ASSERTIONS, SCOPES, Call, Syntax,
-    attribute_name, attributes, children, line, macro_name, namespace,
+    attribute_name, attributes, children, line, location, macro_name, macro_tree, namespace,
     offset, opposite, parts, query, shape, split_operands, syntax_errors, unwrap,
 )
 from .source import Test, project_root
@@ -1971,6 +1971,109 @@ class File:
         return syntax, fn, test, marked, initial
 
 
+def python_string(node):
+    node = unwrap(node)
+    if node is None:
+        return False
+    if node.kind() == "concatenated_string":
+        return all(python_string(part) for part in children(node))
+    return node.kind() == "string" and not node.children()[0].text().lower().startswith(
+        ("b", "f", "rf", "t", "rt", "rb")
+    )
+
+
+def rust_string(node):
+    node = unwrap(node)
+    return node is not None and node.kind() in {"string_literal", "raw_string_literal"} and node.text().startswith(
+        ('"', 'r"', "r#")
+    )
+
+
+def python_membership(call):
+    args = {}
+    for index, arg in enumerate(call.arguments):
+        if arg.kind() == "keyword_argument":
+            args[child_text(arg.field("name"))] = arg.field("value")
+        else:
+            args[index] = arg
+    return args.get(0, args.get("member")), unwrap(args.get(1, args.get("container")))
+
+
+def python_golden(call):
+    args = call.arguments
+    if call.name[-2:] == ("golden", "check") and len(args) >= 3:
+        return args[2]
+    if call.method in {"assert_golden", "assert_snapshot", "assert_match_snapshot", "check_snapshot"} or (
+        call.method == "assert_match" and call.name[-2:-1] == ("snapshot",)
+    ):
+        return next(iter(args), None)
+    return None
+
+
+RUST_SNAPSHOTS = {"assert_snapshot", "assert_debug_snapshot", "assert_display_snapshot",
+                  "assert_json_snapshot", "assert_yaml_snapshot", "assert_toml_snapshot",
+                  "assert_ron_snapshot", "assert_csv_snapshot", "assert_binary_snapshot"}
+
+
+def rust_snapshot(call, node):
+    if call.arguments:
+        return call.arguments[-1]
+    tree = macro_tree(node)
+    if tree is not None:
+        tokens = tree.children()
+        for index, token in enumerate(tokens):
+            if token.kind() == "@" and index >= 2 and tokens[index - 1].kind() == ",":
+                operand = tree.text()[1:offset(tokens[index - 1]) - offset(tree)]
+                parsed = Syntax.parse("fn tq() { tq(" + operand + "); }", "rust")
+                args = parsed.root.find(kind="arguments")
+                if args is not None and not syntax_errors(parsed.root, missing=True):
+                    return next(iter(reversed(children(args))), None)
+    return None
+
+
+def rust_subject(node):
+    node = unwrap(node)
+    while node is not None and node.kind() == "reference_expression":
+        node = unwrap(node.field("value"))
+    return node
+
+
+def micro_snapshot(file, flow, test):
+    fragments = []
+    whole = []
+    if flow.syntax.language == "python":
+        for check in flow.checks:
+            if check.operator in {"in", "not in"} and python_string(check.left):
+                fragments.append((location(check.source), unwrap(check.right)))
+            elif check.operator == "==":
+                whole.extend((check.left, check.right))
+        for node, call in flow.calls:
+            if call.method in {"assertIn", "assertNotIn"}:
+                needle, subject = python_membership(call)
+                if subject is not None and python_string(needle):
+                    fragments.append((location(node), subject))
+            elif (subject := python_golden(call)) is not None:
+                whole.append(subject)
+    else:
+        def site(node):
+            return file.line_at(flow.syntax.absolute(node)), node.range().start.column
+
+        for check in flow.checks:
+            if check.kind in RUST_ASSERTIONS and check.operator == "==":
+                whole.extend(map(rust_subject, (check.left, check.right)))
+            elif check.kind in RUST_ASSERTIONS and check.predicate is not None:
+                predicate = unwrap(opposite(unwrap(check.predicate)) or check.predicate)
+                if predicate.kind() == "call_expression":
+                    call = flow.syntax.call(predicate)
+                    if (call.method == "contains" and call.receiver is not None and
+                            len(call.arguments) == 1 and rust_string(call.arguments[0])):
+                        fragments.append((site(check.source), rust_subject(call.receiver)))
+        for node, call in flow.calls:
+            if call.macro and call.method in RUST_SNAPSHOTS:
+                whole.append(rust_subject(rust_snapshot(call, node)))
+    lint.micro_snapshot(test, fragments, whole, key=shape, display=child_text)
+
+
 def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
     from . import ast_grep_literals as literals
     from .ast_grep_languages import ECMASCRIPT_LANGUAGES, JVM_LANGUAGES
@@ -2037,6 +2140,8 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
         test.issues.extend((site, "absence-no-control") for site in flow.recorder_evidence())
         test.issues.extend((site, "nondistinguishing-literal")
                            for site in literals.issues(file, syntax, flow, flow.body, test.name))
+        if not ignored:
+            micro_snapshot(file, flow, test)
         observations.extend((key, present, site, test) for key, present, site in file.detectors)
 
         file.detectors.clear()

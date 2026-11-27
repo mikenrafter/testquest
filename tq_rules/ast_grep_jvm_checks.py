@@ -176,6 +176,8 @@ class Check:
     right: object = None
     negated: bool = False
     observations: tuple = ()
+    fragment_subject: object = None
+    snapshot_subject: object = None
 
     def constant(self, syntax):
         if self.predicate is not None:
@@ -296,6 +298,9 @@ def check_call(file, node, call):
         if method in VERIFICATIONS and call.callbacks():
             return Check(node, observations=mockk_observations(file, call))
         return None
+    if method in {"assertGolden", "assertSnapshot", "assertMatchesGolden", "assertMatchesSnapshot",
+                  "verifySnapshot"} and first is not None:
+        return Check(node, snapshot_subject=call.named.get("actual", first))
     if method in NO_INTERACTIONS:
         observations = tuple((("calls", target), False) for arg in call.args
                              if (target := file.recorder(arg)) is not None)
@@ -393,7 +398,17 @@ def mockito_observations(file, call):
     return ()
 
 
+def string_needle(node):
+    node = unwrap(node)
+    return node is not None and node.kind() == "string_literal" and all(
+        part.kind() in {"string_content", "string_fragment", "escape_sequence"} for part in children(node)
+    )
+
+
 def collect_observations(file, check, method="", subject=None, expected=None):
+    if method in {"contains", "doesNotContain", "shouldContain", "shouldNotContain"} and string_needle(expected):
+        check.fragment_subject = unwrap(subject)
+
     def observe(receiver, present):
         if (target := file.recorder(receiver)) is not None:
             check.observations = ((("size", target), present),)
@@ -403,6 +418,8 @@ def collect_observations(file, check, method="", subject=None, expected=None):
     if tested is not None:
         opposite = negate(tested)
         if (call := call_of(opposite or tested)) is not None and call.receiver is not None:
+            if call.method == "contains" and len(call.args) == 1 and string_needle(call.args[0]):
+                check.fragment_subject = unwrap(call.receiver)
             positive = (not check.negated) != (opposite is not None)
             if call.method in {"isEmpty", "isNotEmpty"} and not call.args:
                 return observe(call.receiver, positive == (call.method == "isNotEmpty"))

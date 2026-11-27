@@ -37,6 +37,15 @@ def line(node):
     return node.range().start.line + 1
 
 
+def location(node):
+    start = node.range().start
+    return start.line + 1, start.column
+
+
+def text(node):
+    return node.text()
+
+
 def unwrap(node):
     while node is not None and node.kind() in {"parenthesized_expression", "generic_function"}:
         node = next(iter(children(node)), None)

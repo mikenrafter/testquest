@@ -22,7 +22,7 @@ class ReworkTests(TqCase):
                     self.assertIn("Review\n  Reject ", recipe)
                     rendered.add((rule, language))
                     name = f"test_recipe.{language}"
-                    engines = [] if language == "ts" else ["legacy"]
+                    engines = [] if language == "ts" or rule == "micro-snapshot" else ["legacy"]
                     if has_ast_grep:
                         engines.append("ast-grep")
                     for engine in engines:
@@ -41,7 +41,7 @@ class ReworkTests(TqCase):
                             self.write(name, bad)
                             command = "witness" if rule == "missing-witness" else "lint"
                             exit_code = 0 if rule in {
-                                "nondistinguishing-literal", "self-derived-expected",
+                                "micro-snapshot", "nondistinguishing-literal", "self-derived-expected",
                             } else 1
                             rows = json.loads(self.tq(command, *args, code=(exit_code,)))
                             if command == "lint":
@@ -49,7 +49,7 @@ class ReworkTests(TqCase):
                                 rows = rows["findings"]
                             self.assertIn(rule, [row["rule"] for row in rows])
 
-        self.assertEqual(len(rendered), 24)  # Eight finding rules with three languages each.
+        self.assertEqual(len(rendered), 27)  # Nine finding rules with three languages each.
 
     def test_suppressions_partition_findings_and_preserve_reason(self):
         # WHY: one allow moves one matched row and preserves its location and reason.

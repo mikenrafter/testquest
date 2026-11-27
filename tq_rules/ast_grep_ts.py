@@ -6,7 +6,7 @@ import hashlib
 from pathlib import PurePosixPath
 
 from . import lint
-from .ast_grep import Syntax, children, line, offset, opposite, query, shape, split_operands, syntax_errors, unwrap
+from .ast_grep import Syntax, children, line, location, offset, opposite, query, shape, split_operands, syntax_errors, text, unwrap
 from .source import Comment, Test
 
 
@@ -774,6 +774,8 @@ def assert_check(node, method, args):
                     "deepStrictEqual": "===", "strictEqual": "==="}.get(
                         method, "===" if method in ASSERT_EQUAL else "!==")
         return Check(node, method, *args[:2], operator=operator)
+    if method == "snapshot" and args:
+        return Check(node, method, args[0])
     predicate = args[0] if args and method in ASSERT_PREDICATES else None
     operator, left, right = split_operands(expression(predicate))
     negated = method in {"falsy", "isNotOk", "isFalse", "false"}
@@ -797,6 +799,31 @@ def comments(syntax):
                               text, standalone or index > 0)
 
 
+def string_needle(node):
+    node = expression(node)
+    return node is not None and (
+        node.kind() == "string" or node.kind() == "template_string" and
+        not any(child.kind() == "template_substitution" for child in children(node))
+    )
+
+
+def micro_snapshot(test, checks):
+    fragments = []
+    whole = []
+    for check in checks:
+        actual = expression(check.actual)
+        if actual is None:
+            continue
+        if check.method in {"toContain", "toMatch"} and string_needle(check.expected):
+            fragments.append((location(check.node), actual))
+        elif check.operator in {"==", "==="}:
+            whole.extend((actual, expression(check.expected)))
+        elif not check.negated and check.method in {"snapshot", "toMatchSnapshot", "toMatchInlineSnapshot",
+                                                    "toMatchFileSnapshot"}:
+            whole.append(actual)
+    lint.micro_snapshot(test, fragments, whole, key=shape, display=text)
+
+
 def parse(source, path, language, *, inventory=False, observe=None):
     from .ast_grep_ts_flow import Flow
 
@@ -817,6 +844,7 @@ def parse(source, path, language, *, inventory=False, observe=None):
             continue
         flow = Flow(file, callback, parameters(callback))
         incomplete = flow.visit(body)
+        micro_snapshot(test, flow.checks)
         test.checks = len(flow.checks)
         if not flow.checks:
             test.issues.append((test.line, "no-assert"))

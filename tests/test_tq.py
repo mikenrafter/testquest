@@ -19,6 +19,7 @@ RULES = {
     "const-truth",
     "guarded-assert",
     "invalid-suppression",
+    "micro-snapshot",
     "missing-witness",
     "no-assert",
     "nondistinguishing-literal",

@@ -32,6 +32,7 @@ class Test:
     body_hash: str = ""
     checks: int = 0
     span_columns: tuple[int, int] | None = None
+    issue_messages: dict[tuple[int, str], str] | None = None
 
     def owns(self, comment):
         return self.start <= comment.line <= self.end and comment.column >= self.column

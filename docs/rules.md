@@ -158,6 +158,19 @@ def test_parse_port():
 
 ## Advisory rules
 
+### `micro-snapshot`
+
+**Advisory, ast-grep engine.** Reports the first group of three or more literal
+substring checks on the same expression in a test. Positive and negative
+checks count together. Variable needles are ignored. A whole-output equality
+check or a recognized golden or snapshot of the same expression exempts that
+group.
+
+**Rework.** Compare the complete text to one golden reviewed by a person when
+the whole text is the contract. When only a property matters, assert it over
+every output. Keep a single substring check for one fact that must survive
+rewording.
+
 ### `nondistinguishing-literal`
 
 Flags fixtures or assertions whose literal inputs cannot distinguish a right implementation from a common wrong one. Examples include palindromic inputs in order or encoding tests, repeated positional arguments that hide swapped parameters, neutral operands (`0`, `1`, `-1`, empty collections) held fixed across calls, and loose bounds when exact values are known.

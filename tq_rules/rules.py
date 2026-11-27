@@ -262,6 +262,58 @@ RULES = {
         ),
         command="lint",
     ),
+    "micro-snapshot": Rule(
+        "Several literal substring checks pin only parts of the same output.",
+        "The fragments are independent facts that must survive rewording.",
+        Recipe(
+            (
+                "When the whole text is the contract, compare it to one golden reviewed by a person.",
+                "When only a property matters, assert it over every output.",
+                "Keep a single substring check for one fact that must survive rewording.",
+            ),
+            "Reject moving the same hand-picked fragments into a helper or a table when the whole text is the contract.",
+            {
+                "py": ("""
+                    def test_report():
+                        output = render_report()
+                        assert "Build complete" in output
+                        assert "Passed: 3" in output
+                        assert "Failed: 0" in output
+                    """, """
+                    def test_report():
+                        assert render_report() == Path("goldens/build-report.txt").read_text()
+                    """),
+                "rs": ("""
+                    #[test]
+                    fn reports_build_results() {
+                        let output = render_report();
+                        assert!(output.contains("Build complete"));
+                        assert!(output.contains("Passed: 3"));
+                        assert!(output.contains("Failed: 0"));
+                    }
+                    """, """
+                    #[test]
+                    fn reports_build_results() {
+                        assert_eq!(render_report(), include_str!("goldens/build-report.txt"));
+                    }
+                    """),
+                "ts": ("""
+                    test("reports build results", () => {
+                      const output = renderReport();
+                      expect(output).toContain("Build complete");
+                      expect(output).toContain("Passed: 3");
+                      expect(output).toContain("Failed: 0");
+                    });
+                    """, """
+                    test("reports build results", () => {
+                      expect(renderReport()).toBe(readFileSync("goldens/build-report.txt", "utf8"));
+                    });
+                    """),
+            },
+        ),
+        command="lint",
+        level="advisory",
+    ),
     "nondistinguishing-literal": Rule(
         "The fixture or assertion can let a wrong implementation pass.",
         "The test's WHY explains the symmetric or fixed input. Examples include equal weights, a zero-write case, or a test that isolates another parameter.",
