@@ -104,6 +104,19 @@ class Call:
     optional: bool
 
 
+def call_arguments(arguments):
+    args, keywords = [], {}
+    for arg in contents(arguments):
+        components = contents(arg)
+        if kind(components) == "named_argument":
+            label, *value = contents(components[0])
+            if value and (label_parts := contents(label)):
+                keywords[label_parts[0].text()] = tuple(value)
+        elif components:
+            args.append(components)
+    return tuple(args), keywords
+
+
 def calls(nodes):
     for index, selector in enumerate(nodes[1:], 1):
         if selector.kind() != "selector":
@@ -117,18 +130,10 @@ def calls(nodes):
         target = tuple(child for child in nodes[:index] if not type_selector(child))
         names_path = names(target)
         method = (names_path[-1] if names_path else member(target[-1])) if target else ""
-        args, keywords = [], {}
-        for arg in contents(arguments):
-            components = contents(arg)
-            if kind(components) == "named_argument":
-                label, *value = contents(components[0])
-                if value and (label_parts := contents(label)):
-                    keywords[label_parts[0].text()] = tuple(value)
-            elif components:
-                args.append(components)
+        args, keywords = call_arguments(arguments)
         optional = any(child.kind() == "conditional_assignable_selector"
                        for node in target if node.kind() == "selector" for child in contents(node))
-        yield Call(nodes[0], names_path, method, target[:-1], tuple(args), keywords, optional)
+        yield Call(nodes[0], names_path, method, target[:-1], args, keywords, optional)
 
 
 def final_call(nodes):
