@@ -254,7 +254,7 @@ def test_encode_order():
 
 ### `self-derived-expected`
 
-Flags an equality check whose expected value is computed by calling production code from the same module under test.
+Flags an equality check whose expected value comes from production code or its rendered output. The TypeScript check follows a rendered value through local bindings and helpers. A loose bound on a rendered number still leaves that number under the application's control.
 
 **Why it can pass on broken code.** If the shared helper has a bug, both sides of the assertion produce the same wrong value and the test passes.
 
@@ -277,6 +277,18 @@ def test_total_cents():
 ```
 
 **Exemptions.** Exempt when the test checks repeatability, a before-and-after observation, inverse codecs (such as `encode` / `decode` or `compress` / `decompress`), or a declared relation between different inputs or entry points. Suppress with `# tq: allow self-derived-expected REASON` when the relation is intentional and not recognized automatically.
+
+### `implementation-selector`
+
+The ast-grep engine flags a TypeScript or JavaScript assertion on a CSS class or a class-only DOM selector when the same test has no role, label, or visible-text check on that element. For example, replace `expect(document.querySelector(".status-active")).toBeTruthy()` with `expect(screen.getByRole("status")).toHaveTextContent("Active")` when the status text is the behavior under test.
+
+Use an allow note when the CSS class itself is a contract, such as a class exposed to consumers of a component library.
+
+### `unawaited-navigation`
+
+The ast-grep engine flags a TypeScript or JavaScript assertion that reads `location.hash` or `history.state` after an event that can call native `history.back()` or `history.go()`. Native history traversal can finish after the event handler returns.
+
+Wait for the destination screen, wait for `popstate`, or retry the history assertion with `await waitFor(() => expect(location.hash).toBe("#/home"))`.
 
 ### `swallowed-assertion`
 

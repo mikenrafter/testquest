@@ -13,9 +13,11 @@ class ReworkTests(TqCase):
         has_literal_port = (ROOT / "tq_rules" / "ast_grep_literals.py").is_file()
         rendered = set()
         specialized = {
+            "implementation-selector": ("ts",),
             "misordered-expected": ("java",),
             "no-crash": ("py", "rs", "ts", "dart"),
             "swallowed-assertion": ("py", "ts"),
+            "unawaited-navigation": ("ts",),
         }
         for rule in sorted(RULES - {"invalid-suppression", "parse-error", "too-deep"}):
             languages = specialized.get(rule, ("py", "rs", "ts"))
@@ -50,7 +52,8 @@ class ReworkTests(TqCase):
                             command = "witness" if rule == "missing-witness" else "lint"
                             exit_code = 0 if rule in {
                                 "micro-snapshot", "misordered-expected", "no-crash", "nondistinguishing-literal",
-                                "self-derived-expected", "swallowed-assertion",
+                                "self-derived-expected", "swallowed-assertion", "implementation-selector",
+                                "unawaited-navigation",
                             } else 1
                             rows = json.loads(self.tq(command, *args, code=(exit_code,)))
                             if command == "lint":
@@ -58,7 +61,7 @@ class ReworkTests(TqCase):
                                 rows = rows["findings"]
                             self.assertIn(rule, [row["rule"] for row in rows])
 
-        self.assertEqual(len(rendered), 34)
+        self.assertEqual(len(rendered), 36)
 
     def test_suppressions_partition_findings_and_preserve_reason(self):
         # WHY: one allow moves one matched row and preserves its location and reason.

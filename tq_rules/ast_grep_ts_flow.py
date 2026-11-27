@@ -2,6 +2,7 @@
 
 import re
 
+from .ast_grep_ts_effects import effect_program, effect_reference
 from .ast_grep_ts_imports import imported_helper
 
 from . import lint
@@ -40,7 +41,8 @@ def is_async(callback):
 
 
 class Flow:
-    def __init__(self, file, callback, context, active=frozenset(), callbacks=None, supplied=None, follow_imports=True):
+    def __init__(self, file, callback, context, active=frozenset(), callbacks=None, supplied=None, follow_imports=True,
+                 *, runs_effect=False):
         self.file = file
         self.callback = callback
         self.body = callback.field("body")
@@ -49,6 +51,7 @@ class Flow:
         self.callbacks = callbacks or {}
         self.supplied = supplied or {}
         self.follow_imports = follow_imports
+        self.runs_effect = runs_effect or offset(callback) in file.effect_callbacks
         self.checks = []
         self.references = None
 
@@ -68,6 +71,17 @@ class Flow:
         if node is None:
             return NEXT
         kind = node.kind()
+        if self.runs_effect:
+            if kind == "return_statement" or kind == "yield_expression" and any(
+                    child.kind() == "*" for child in node.children()):
+                program = next(iter(children(node)), None)
+            else:
+                program = node if self.body.kind() != "statement_block" and same(node, self.body) else None
+            if program is not None:
+                executed = effect_program(self.file, program, self.supplied)
+                if executed is not None:
+                    covered = self.run_effect_program(executed, conditional, catches)
+                    return RETURN if kind == "return_statement" and covered else covered
         if kind in FUNCTIONS:
             return NEXT
         if kind == "call_expression":
@@ -87,10 +101,13 @@ class Flow:
                     and right.text() == "undefined" and consequent.kind() == "throw_statement"
                     and shape(left) == shape(next(iter(children(consequent)), None))):
                 return followed_by(leading, self.record(Check(node, "throw"), conditional))
-            known = truth(condition)
-            first = self.visit(consequent, conditional or known is not True, catches)
-            second = self.visit(alternate, conditional or known is not False, catches)
-            return followed_by(leading, first if known is True else second if known is False else first | second)
+            known = self.condition(condition)
+            if known is not lint.UNKNOWN:
+                branch = consequent if known else alternate
+                return followed_by(leading, self.visit(branch, conditional, catches))
+            first = self.visit(consequent, True, catches)
+            second = self.visit(alternate, True, catches)
+            return followed_by(leading, first | second)
         if kind == "binary_expression":
             operator, left, right = split_operands(node)
             if operator in {"&&", "||", "??"}:
@@ -187,6 +204,14 @@ class Flow:
                 coverage = THROW
             return followed_by(result, coverage)
 
+        if not optional:
+            program = effect_program(self.file, node, self.supplied, runtime=True)
+            if program is not None:
+                if self.completed(node) or effect_reference(self.file, callee) == ("Effect", "runSync"):
+                    coverage = self.run_effect_program(program, guarded, catches)
+                    return followed_by(result, coverage)
+                return result
+
         receiver, members = chain(callee)
         method = members[-1] if members else ""
         receiver = callee.field("object") if method else receiver
@@ -277,6 +302,40 @@ class Flow:
                         del self.checks[count:]
         return result
 
+    def condition(self, node):
+        node = expression(node)
+        known = truth(node)
+        if known is not lint.UNKNOWN or node is None or node.kind() != "call_expression":
+            return known
+        if effect_reference(self.file, node.field("function")) != ("Predicate", "isFunction"):
+            return known
+        args = arguments(node)
+        if len(args) != 1:
+            return known
+        arg = args[0]
+        owner = self.file.parameter_scope(arg)
+        supplied = self.supplied.get((offset(owner), name(arg))) if owner is not None else None
+        if supplied is None:
+            value, _ = self.file.fixed(arg, self.supplied)
+        else:
+            if any(name(write.field("left") or write.field("argument")) == name(arg)
+                   and offset(write) < offset(arg)
+                   for write in query(owner.field("body"), "assignment_expression", "augmented_assignment_expression",
+                                      "update_expression")):
+                return lint.UNKNOWN
+            value, _ = supplied
+        if value is not None:
+            if value.kind() in FUNCTIONS:
+                return True
+            if literal(value) is not lint.UNKNOWN or value.kind() in {"array", "object", "regex"}:
+                return False
+        return lint.UNKNOWN
+
+    def run_effect_program(self, program, conditional, catches):
+        if program.kind() == "call_expression":
+            return THROW if catches else self.record(Check(program, "fail"), conditional)
+        return self.invoke(program, conditional, catches, detached=False, runs_effect=True)
+
     def result_helper(self, node, guarded, detached):
         parent = node.parent()
         while parent is not None and parent.kind() in TRANSPARENT | {"await_expression"}:
@@ -297,11 +356,11 @@ class Flow:
             parent.kind() in FUNCTIONS and within(parent, body) for parent in node.ancestors()
         ) for node in query(body, "return_statement"))
 
-    def invoke(self, callback, conditional, catches, *, detached):
+    def invoke(self, callback, conditional, catches, *, detached, runs_effect=False):
         if callback is None or (self.file.path, offset(callback)) in self.active or callback.field("body") is None:
             return NEXT
         nested = Flow(self.file, callback, self.context, self.active, supplied=self.supplied,
-                      follow_imports=self.follow_imports)
+                      follow_imports=self.follow_imports, runs_effect=runs_effect)
         remaining = nested.visit(nested.body, conditional or detached, catches or detached)
         self.checks.extend(nested.checks)
         return NEXT if detached or remaining else 0
@@ -310,6 +369,8 @@ class Flow:
         node = expression(node)
         if node is not None and node.kind() in FUNCTIONS:
             return node
+        if self.file.parameter_scope(node) is not None:
+            return self.callbacks.get(name(node))
         return self.file.helper(node)
 
     def optional(self, node):

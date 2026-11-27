@@ -18,6 +18,7 @@ RULES = {
     "absence-no-control",
     "const-truth",
     "guarded-assert",
+    "implementation-selector",
     "invalid-suppression",
     "micro-snapshot",
     "missing-witness",
@@ -30,6 +31,7 @@ RULES = {
     "self-derived-expected",
     "swallowed-assertion",
     "too-deep",
+    "unawaited-navigation",
 }
 
 

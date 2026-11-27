@@ -175,7 +175,7 @@ class RustTestShapes(contract.TqCase):
 
 
 class AdvisoryRules(contract.TqCase):
-    ADVISORY = {"micro-snapshot", "misordered-expected", "no-crash", "nondistinguishing-literal",
+    ADVISORY = {"implementation-selector", "unawaited-navigation", "micro-snapshot", "misordered-expected", "no-crash", "nondistinguishing-literal",
                 "self-derived-expected", "swallowed-assertion"}
 
     def test_equal_positionals_fire_but_keyword_pairs_do_not(self):
