@@ -11,6 +11,7 @@
     {
       packages = forAllSystems (pkgs:
         let
+          python = pkgs.python3.withPackages (ps: [ ps.ast-grep-py ]);
           tq = pkgs.stdenvNoCC.mkDerivation {
             pname = "tq";
             version = "0.1.0";
@@ -19,7 +20,7 @@
               fileset = pkgs.lib.fileset.unions [ ./tq ./tq_rules ./props ./tests ];
             };
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            nativeCheckInputs = [ pkgs.python3 pkgs.git ];
+            nativeCheckInputs = [ python pkgs.git ];
             doCheck = true;
             checkPhase = ''
               runHook preCheck
@@ -33,7 +34,7 @@
               runHook preInstall
               mkdir -p $out/share/testquest $out/bin
               cp -r tq tq_rules props $out/share/testquest/
-              makeWrapper ${pkgs.python3}/bin/python3 $out/bin/tq \
+              makeWrapper ${python}/bin/python3 $out/bin/tq \
                 --add-flags "-I $out/share/testquest/tq" \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
               runHook postInstall
@@ -52,7 +53,7 @@
         });
 
       devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell { packages = [ pkgs.python3 pkgs.git ]; };
+        default = pkgs.mkShell { packages = [ (pkgs.python3.withPackages (ps: [ ps.ast-grep-py ])) pkgs.git ]; };
       });
     };
 }
