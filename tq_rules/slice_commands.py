@@ -7,16 +7,17 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import unicodedata
 from uuid import uuid4
 
 from . import history, ledger, ledger_config, lint, pinned_mutants, repo, scratch
 from .pinned_mutants import MUTANT_ID
-from .source import note_owners, scan_paths
+from .source import Comment, note_owners, scan_paths
 from .test_runner import DEFAULT, Runner
 
 
 PIN_REFERENCE = re.compile(rf"\b{MUTANT_ID}\b")
-REACHES = re.compile(r"reaches:\s*when\s+(.+?),\s*then\s+(.+)", re.IGNORECASE)
+REACHES = re.compile(r"when\b\s*(.*?),\s*then\b\s*(.*)", re.IGNORECASE)
 COMMAND_ERRORS = (OSError, ValueError, SyntaxError, subprocess.SubprocessError)
 
 
@@ -24,6 +25,7 @@ def add_commands(commands):
     mutants = commands.add_parser("mutants", help="Check pinned faulty implementations.")
     check_mutants = mutants.add_subparsers(required=True).add_parser("check")
     check_mutants.add_argument("--since")
+    check_mutants.add_argument("--json", action="store_true")
     check_mutants.add_argument("--cmd", default=DEFAULT)
     check_mutants.set_defaults(slice_command=mutants_check)
 
@@ -31,6 +33,7 @@ def add_commands(commands):
     check_slice = slices.add_subparsers(required=True).add_parser("check")
     check_slice.add_argument("number", type=int)
     check_slice.add_argument("--feature")
+    check_slice.add_argument("--json", action="store_true")
     check_slice.add_argument("--base", required=True)
     check_slice.add_argument("--cmd", required=True)
     check_slice.add_argument("--after-green", action="store_true")
@@ -72,7 +75,7 @@ def error_text(error):
 class TestCase:
     path: Path
     test: object
-    notes: tuple[str, ...]
+    notes: tuple[Comment, ...]
 
     @property
     def name(self):
@@ -80,8 +83,8 @@ class TestCase:
 
     @property
     def catches(self):
-        return {pin for note in self.notes if note.startswith("catches:")
-                for pin in PIN_REFERENCE.findall(note.removeprefix("catches:"))}
+        return {pin for note in self.notes if note.text.startswith("catches:")
+                for pin in PIN_REFERENCE.findall(note.text.removeprefix("catches:"))}
 
     def aliases(self, runner):
         return {self.name, self.test.qualified, self.test.identifier, runner.selector(self.path, self.test)}
@@ -100,10 +103,40 @@ def test_cases(directory, parser, select=None):
                 if comment.text.startswith(("catches:", "reaches:")):
                     for owner in note_owners(path, tests, comment, inventory=True):
                         if id(owner) in notes:
-                            notes[id(owner)].append(comment.text)
+                            notes[id(owner)].append(comment)
             for test in chosen:
                 cases.append(TestCase(path, test, tuple(notes[id(test)])))
     return cases, errors
+
+
+def normalized_words(text):
+    text = unicodedata.normalize("NFKC", text).casefold()
+    text = re.sub(r"\\?['’]", "", text)
+    return " ".join(re.findall(r"[^\W_]+", text))
+
+
+def reaches_reasons(case):
+    notes = [note for note in case.notes if note.text.startswith("reaches:")]
+    if not notes and (case.test.guarded or case.test.conditional):
+        yield f"{case.path}:{case.test.line}: reaches: must say 'when X, then Y'"
+    title = normalized_words(case.test.name)
+    for note in notes:
+        text = note.text.removeprefix("reaches:").strip()
+        words = normalized_words(text)
+        match = REACHES.fullmatch(text)
+        location = f"{case.path}:{note.line}: reaches:"
+        if title and words and (f" {title} " in f" {words} " or f" {words} " in f" {title} "):
+            yield f"{location} repeats the enclosing test name"
+        elif match is None:
+            yield f"{location} must say 'when X, then Y'"
+        else:
+            condition, effect = map(normalized_words, match.groups())
+            if not condition:
+                yield f"{location} 'when' condition is empty"
+            elif not effect:
+                yield f"{location} 'then' effect is empty"
+            elif condition == effect:
+                yield f"{location} 'when' condition must be distinct from the 'then' effect"
 
 
 def find_test(cases, runner, name):
@@ -119,23 +152,43 @@ def run_test(directory, runner, case):
     return runner.run(directory, case.path, runner.selector(case.path, case.test))
 
 
-def mutant_event(log, batch, commit, mutant, outcome, detail, runs=()):
+def mutant_event(log, batch, commit, mutant, applied, outcome, detail, runs):
+    disagreement = ""
+    if (applied.classification == "trivial"
+            and re.sub(r"[\s_]+", "-", mutant.flip.strip().casefold()) in pinned_mutants.NON_TRIVIAL_FLIPS):
+        disagreement = f"declared flip {mutant.flip!r} disagrees with trivial swap"
     return ledger.event("mutant", (batch, mutant.id), repo=log.main.name, commit=commit,
                         mutant=mutant.id, assumption=mutant.assumes, flip=mutant.flip,
-                        file=str(mutant.file), outcome=outcome, detail=detail, tests=list(runs))
+                        file=str(mutant.file), line=applied.line, outcome=outcome, detail=detail,
+                        classification=applied.classification, flip_disagreement=disagreement,
+                        tests=runs)
 
 
-def replay_mutants(repository, commit, runner, mutants, cases, stale, log):
+def mutant_location(row):
+    return f"{row['file']}:{row['line']}" if row["line"] is not None else row["file"]
+
+
+def print_mutant(row, *, show_disagreement):
+    print(f"{row['mutant']} {row['outcome']} {mutant_location(row)} [{row['classification']}]"
+          + (f": {row['detail']}" if row["detail"] else ""))
+    if show_disagreement and row["flip_disagreement"]:
+        print(f"{mutant_location(row)} {row['mutant']}: {row['flip_disagreement']}")
+
+
+def replay_mutants(repository, commit, runner, mutants, cases, stale, log, *, progress=None):
     outcomes = []
     batch = uuid4().hex
     for mutant in mutants:
         runs = []
         if mutant.id in stale:
-            outcome, detail = "stale", "the replacement span changed after the pinned block"
+            applied = pinned_mutants.AppliedSwap(
+                "stale", "the replacement span changed after the pinned block", line=mutant.start + 1)
+            outcome, detail = applied.outcome, applied.detail
         else:
             with scratch.worktrees(repository) as copies:
                 broken = copies.add("broken", commit)
-                outcome, detail = pinned_mutants.apply(broken, mutant)
+                applied = pinned_mutants.apply(broken, mutant)
+                outcome, detail = applied.outcome, applied.detail
                 if outcome is None:
                     outcome = "killed"
                     for number, name in enumerate(mutant.tests, 1):
@@ -156,10 +209,11 @@ def replay_mutants(repository, commit, runner, mutants, cases, stale, log):
                                 detail += "\n" + baseline.detail
                             if mutated.detail and mutated.outcome != "assertion":
                                 detail += "\n" + mutated.detail
-        row = mutant_event(log, batch, commit, mutant, outcome, detail, runs)
+        row = mutant_event(log, batch, commit, mutant, applied, outcome, detail, runs)
         log.write([row])
         outcomes.append(row)
-        print(f"{mutant.id} {outcome} {mutant.file}" + (f": {detail}" if detail else ""))
+        if progress is not None:
+            progress(row)
     return outcomes
 
 
@@ -176,11 +230,14 @@ def mutants_check(options):
             mutants = list(pinned_mutants.changed_pins(repository, directory, base, commit, mutants))
         stale = pinned_mutants.stale_mutants(repository, commit, mutants, directory)
         cases, _ = test_cases(directory, parser) if set(mutant.id for mutant in mutants) - stale else ([], [])
-    rows = replay_mutants(repository, commit, runner, mutants, cases, stale, log)
-    return int(any(row["outcome"] != "killed" for row in rows))
+    progress = None if options.json else lambda row: print_mutant(row, show_disagreement=True)
+    rows = replay_mutants(repository, commit, runner, mutants, cases, stale, log, progress=progress)
+    if options.json:
+        print(ledger.encode({"mutants": rows}))
+    return int(any(row["outcome"] != "killed" or row["flip_disagreement"] for row in rows))
 
 
-def green_gate(repository, directory, commit, base, runner, cases, parser, reasons):
+def green_gate(repository, directory, commit, base, runner, cases, parser, reasons, advisories, progress):
     pins = pinned_mutants.discover(directory)
     inventory, _ = test_cases(directory, parser)
     referenced = set().union(*(case.catches for case in cases))
@@ -204,10 +261,19 @@ def green_gate(repository, directory, commit, base, runner, cases, parser, reaso
         selected.append(pin)
     stale = pinned_mutants.stale_mutants(repository, commit, selected, directory)
     rows = replay_mutants(repository, commit, runner, selected, inventory, stale,
-                          repository_ledger(repository))
+                          repository_ledger(repository), progress=progress)
     for row in rows:
         if row["outcome"] != "killed":
             reasons.append(f"{row['mutant']}: {row['outcome']}")
+        if row["flip_disagreement"]:
+            reasons.append(f"{mutant_location(row)} {row['mutant']}: {row['flip_disagreement']}")
+    trivial = sum(row["classification"] == "trivial" for row in rows)
+    if rows and trivial == len(rows):
+        reasons.append("every pinned mutant is trivial; the slice needs a non-trivial flip")
+    elif rows and not any(row["classification"] == "non-trivial" for row in rows):
+        reasons.append("the slice needs a classified non-trivial flip")
+    if rows and all(row["outcome"] == "killed" for row in rows):
+        advisories.append(f"all {len(rows)} killed, {trivial} trivial")
     return rows
 
 
@@ -235,7 +301,7 @@ def slice_check(options):
         raise ValueError("Use a positive slice number and a feature name without path separators")
     path = pinned_mutants.safe_path(repository, Path("slices") / feature / f"{options.number:02d}.jsonl")
     commit = repo.resolve(repository, "HEAD")
-    reasons, tests, mutants = [], [], []
+    reasons, advisories, tests, mutants = [], [], [], []
     try:
         base = repo.resolve(repository, options.base)
         runner, parser = Runner(options.cmd), ast_parser()
@@ -253,12 +319,11 @@ def slice_check(options):
             for case in cases:
                 if not case.catches:
                     reasons.append(f"{case.name}: catches: must name a mutant ID")
-                reaches = [note for note in case.notes if note.startswith("reaches:")]
-                if ((case.test.guarded or case.test.conditional or reaches)
-                        and (not reaches or not all(REACHES.fullmatch(note) for note in reaches))):
-                    reasons.append(f"{case.name}: reaches: must say 'when X, then Y'")
+                reasons.extend(reaches_reasons(case))
             if options.after_green:
-                mutants = green_gate(repository, directory, commit, base, runner, cases, parser, reasons)
+                progress = None if options.json else lambda row: print_mutant(row, show_disagreement=False)
+                mutants = green_gate(repository, directory, commit, base, runner, cases, parser,
+                                     reasons, advisories, progress)
             else:
                 for case in cases:
                     run = run_test(directory, runner, case)
@@ -269,12 +334,18 @@ def slice_check(options):
     except COMMAND_ERRORS as error:
         reasons.append(error_text(error))
     outcome = "fail" if reasons else "pass"
-    append_gate(path, dict(event="gate", feature=feature, slice=options.number, commit=commit,
-                           base=options.base, after_green=options.after_green, outcome=outcome,
-                           reasons=reasons, tests=tests, mutants=mutants))
-    print(f"Slice {feature}/{options.number:02d}: {outcome}")
-    for reason in reasons:
-        print(reason)
+    gate = dict(event="gate", feature=feature, slice=options.number, commit=commit,
+                base=options.base, after_green=options.after_green, outcome=outcome,
+                reasons=reasons, advisories=advisories, tests=tests, mutants=mutants)
+    append_gate(path, gate)
+    if options.json:
+        print(ledger.encode(gate))
+    else:
+        print(f"Slice {feature}/{options.number:02d}: {outcome}")
+        for reason in reasons:
+            print(reason)
+        for advisory in advisories:
+            print(f"advisory: {advisory}")
     return int(bool(reasons))
 
 
@@ -303,9 +374,9 @@ def revert_check(options):
                 pin = pins[mutant]
                 if pinned_mutants.stale_mutants(repository, commit, [pin], broken):
                     raise ValueError(f"{mutant}: stale")
-                outcome, detail = pinned_mutants.apply(broken, pin)
-                if outcome:
-                    raise ValueError(f"{mutant}: {outcome}: {detail}")
+                applied = pinned_mutants.apply(broken, pin)
+                if applied.outcome:
+                    raise ValueError(f"{mutant}: {applied.outcome}: {applied.detail}")
             else:
                 mutant = repo.resolve(repository, options.revert)
                 repo.git(broken, "-c", "core.hooksPath=/dev/null", "-c", "rerere.enabled=false",
