@@ -10,7 +10,7 @@ from .ast_grep_lint import COMPARISONS
 from .ast_grep_dart_imports import Modules, imports
 from .ast_grep_dart_syntax import (
     COLLECTIONS, between, calls, collection_entries, comments, contents, final_call, identifier,
-    kind, named, names, plain_literal, register_grammar, signature, split, string, tokens, unwrap,
+    kind, member, named, names, plain_literal, register_grammar, signature, split, string, tokens, unwrap,
 )
 from .source import Test
 
@@ -19,6 +19,8 @@ FRAMEWORKS = {"package:test/test.dart", "package:flutter_test/flutter_test.dart"
               "package:test_core/test_core.dart"}
 MOCKITO = {"verify", "verifyInOrder", "verifyNoMoreInteractions", "verifyZeroInteractions"}
 REGISTRATIONS = {"test", "testWidgets", "group"}
+ASYNC_EXPECTATIONS = {"expectAsync", *(f"expectAsync{arity}" for arity in range(7))}
+FUNCTION_BODIES = {"function_expression_body", "function_body"}
 SCOPES = {"source_file", "block", "function_expression", "for_statement", "class_body"}
 BOOLEAN = {"isTrue": True, "isFalse": False}
 CHANGING_COLLECTION = {"add", "addAll", "insert", "insertAll", "putIfAbsent"}
@@ -131,6 +133,7 @@ class Binding:
     initializer: tuple
     final: bool
     const: bool = False
+    iterable: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -193,13 +196,32 @@ class File:
         self.path = path
         self.modules = modules or Modules(path)
         self.imports = tuple(imports(syntax.root))
+        self.exports = tuple(imports(syntax.root, exports=True))
         self.frameworks = {entry.prefix for entry in self.imports if entry.uri in FRAMEWORKS}
         self.functions = defaultdict(list)
         self.methods = {}
         self.bindings = defaultdict(list)
         self.collection_writes = {}
-        self.enums = {identifier(node.field("name")) for node in query(syntax.root, "enum_declaration")
-                      if node.field("name") is not None}
+        self.static_constants = {}
+        self.constructors = {}
+        self.final_fields = defaultdict(set)
+        self.enum_members = {}
+        for enum in query(syntax.root, "enum_declaration"):
+            if (name := enum.field("name")) is not None:
+                self.enum_members[name.text()] = tuple(
+                    child.text() for entry in query(enum, "enum_constant")
+                    for child in contents(entry)[:1] if child.kind() == "identifier")
+        for constructor in query(syntax.root, "constant_constructor_signature", "constructor_signature"):
+            declaration = next((owner for owner in constructor.ancestors()
+                                if owner.kind() == "class_declaration"), None)
+            params = next((node for node in contents(constructor) if node.kind() == "formal_parameter_list"), None)
+            if declaration is None or params is None or len(tuple(query(declaration, "class_body"))) != 1:
+                continue
+            keys = tuple(child.text() for child in contents(constructor) if child.kind() == "identifier")
+            signature = constructor.parent()
+            if not keys or query(signature, "initializers") or constructor.next() is not None:
+                continue
+            self.constructors[keys] = params
         self.equality_classes = {identifier(node.field("name")) for node in query(syntax.root, "class_declaration")
                                  if node.field("name") is not None and any(
                                      child.text() == "==" for child in query(node, "binary_operator")
@@ -224,16 +246,26 @@ class File:
             self.index_variable(node)
         for parameter in query(syntax.root, "formal_parameter"):
             target = parameter_name(parameter)
+            definition = next((owner for owner in parameter.ancestors()
+                               if owner.kind() in {"function_expression", "function_signature"}), None)
+            if target is None or definition is None:
+                continue
+            if definition.kind() == "function_expression":
+                scope = definition
+            else:
+                holder = definition.parent() if definition.parent().kind() == "method_signature" else definition
+                scope = holder.next()
+            if scope is not None and scope.kind() in {"function_expression", "function_body"}:
+                self.bindings[target.text()].append(Binding(target, scope, (), False))
+        for loop in query(syntax.root, "for_statement", "for_element"):
+            parts = next((child for child in contents(loop) if child.kind() == "for_loop_parts"), loop)
+            items = between(tokens(parts), "(", ")")
+            target = next((child for child in reversed(items[:next(
+                (i for i, child in enumerate(items) if child.kind() == "in"), 0)])
+                           if child.kind() == "identifier"), None)
             if target is not None:
-                scope = next((owner for owner in parameter.ancestors() if owner.kind() == "function_expression"), None)
-                if scope is None:
-                    definition = next((owner for owner in parameter.ancestors()
-                                       if owner.kind() == "function_signature"), None)
-                    if definition is not None:
-                        holder = definition.parent() if definition.parent().kind() == "method_signature" else definition
-                        scope = holder.next()
-                if scope is not None:
-                    self.bindings[target.text()].append(Binding(target, scope, (), False))
+                self.bindings[target.text()].append(Binding(target, loop, (), False,
+                                                            iterable=named(between(items, "in"))))
 
     def scope(self, node):
         return next((owner for owner in node.ancestors() if owner.kind() in SCOPES), self.syntax.root)
@@ -245,17 +277,27 @@ class File:
                                 len(elements))]
         target = next((child for child in reversed(before) if child.kind() == "identifier"), None)
         if target is not None:
-            if node.kind() == "static_final_declaration":
-                parent = node.parent()
-                siblings = tokens(parent.parent())
-                index = siblings.index(parent)
-                preceding = siblings[:index]
-                start = next((i + 1 for i, item in reversed(list(enumerate(preceding))) if item.kind() == ";"), 0)
-                before = preceding[start:]
+            if node.kind() in {"static_final_declaration", "initialized_identifier"}:
+                holder = node.parent()
+                declaration = holder.parent()
+                if declaration.kind() in {"declaration", "source_file"}:
+                    siblings = tokens(declaration)
+                    index = siblings.index(holder)
+                    start = next((i + 1 for i in range(index - 1, -1, -1)
+                                  if siblings[i].kind() in {";", "class_declaration", "function_body"}), 0)
+                    before = siblings[start:index]
             qualifiers = {child.text() for child in before}
+            scope = self.scope(node)
             immutable = bool(qualifiers & {"final", "const"})
-            self.bindings[target.text()].append(Binding(target, self.scope(node), initial, immutable,
-                                                       "const" in qualifiers))
+            if scope.kind() == "class_body":
+                owner = scope.parent().field("name")
+                if owner is not None:
+                    if "const" in qualifiers and "static" in qualifiers:
+                        self.static_constants[owner.text(), target.text()] = initial
+                        return
+                    if immutable and "static" not in qualifiers:
+                        self.final_fields[owner.text()].add(target.text())
+            self.bindings[target.text()].append(Binding(target, scope, initial, immutable, "const" in qualifiers))
 
     def binding(self, nodes):
         path = names(nodes)
@@ -263,9 +305,11 @@ class File:
             return None
         site = nodes[0]
         visible = (entry for entry in self.bindings[path[0]] if is_within(site, entry.scope)
+                   and (not entry.iterable or offset(site) >= entry.iterable[-1].range().end.index)
                    and (offset(entry.node) < offset(site)
                         or entry.const and entry.scope.kind() == "source_file"
-                        and kind(unwrap(entry.initializer)) in COLLECTIONS))
+                        and (kind(unwrap(entry.initializer)) in COLLECTIONS
+                             or type(constant(entry.initializer)) in {int, float})))
         return max(visible, key=lambda entry: (offset(entry.scope), offset(entry.node)), default=None)
 
     def callback(self, nodes, supplied=None, active=frozenset()):
@@ -308,15 +352,32 @@ class File:
             if visible:
                 return Callback(self, max(visible, key=lambda entry: offset(entry[0]))[1], supplied)
         if len(path) == 2:
-            constructor = final_call(binding.initializer) if binding and binding.final else None
-            owner = constructor.name if constructor is not None else path[:1] if binding is None else ()
-            if len(owner) == 1 and (body := self.methods.get((owner[0], path[-1]))) is not None:
+            if binding is not None:
+                owner = self.receiver_owner(binding.initializer) if binding.final else ()
+                return self.type_method(owner, path[-1], supplied) if owner else None
+            if (body := self.methods.get(path)) is not None:
                 return Callback(self, body, supplied)
-            if binding:
-                if constructor is not None:
-                    return self.imported_callback((*constructor.name, path[-1]))
-                return None
         return self.imported_callback(path)
+
+    def type_method(self, owner, method, supplied):
+        if len(owner) == 1 and (body := self.methods.get((owner[0], method))) is not None:
+            return Callback(self, body, supplied)
+        return self.imported_callback((*owner, method))
+
+    def receiver_owner(self, nodes):
+        call = final_call(nodes)
+        if call is None or call.optional:
+            return ()
+        if call.name:
+            qualified = any(entry.prefix == call.name[0] for entry in self.imports)
+            return call.name[:2] if qualified else call.name[:1]
+        owner = self.receiver_owner(call.receiver)
+        if owner and (method := self.type_method(owner, call.method, {})) is not None:
+            returned = final_call(returned_expression(method.body))
+            if (returned is not None and not returned.optional and returned.name[:1] == owner[-1:]
+                    and (owner[-1], call.method) in method.file.methods):
+                return owner
+        return ()
 
     def imported_modules(self, path):
         if len(path) > 3:
@@ -325,13 +386,22 @@ class File:
             if entry.prefix and entry.prefix != path[0]:
                 continue
             parts = path[bool(entry.prefix):]
-            if parts and entry.exposes(parts[0]) and not parts[0].startswith("_"):
-                module = self.modules.load(self.path, entry.uri)
-                if module is not None:
-                    yield module, parts
+            if parts and not parts[0].startswith("_"):
+                yield from self.exported_modules(entry, parts, {self.path.resolve()})
+
+    def exported_modules(self, entry, parts, seen):
+        if not entry.exposes(parts[0]):
+            return
+        module = self.modules.load(self.path, entry.uri)
+        if module is None or module.path in seen:
+            return
+        seen.add(module.path)
+        yield module, parts
+        for export in module.exports:
+            yield from module.exported_modules(export, parts, seen)
 
     def imported_callback(self, path):
-        targets = []
+        targets = {}
         for module, parts in self.imported_modules(path):
             if len(parts) == 2:
                 body = module.methods.get(parts)
@@ -341,14 +411,18 @@ class File:
             else:
                 continue
             if body is not None:
-                targets.append(Callback(module, body, {}))
-        return targets[0] if len(targets) == 1 else None
+                callback = Callback(module, body, {})
+                targets[callback.key] = callback
+        return next(iter(targets.values())) if len(targets) == 1 else None
 
-    def is_enum(self, path, site):
-        if self.binding((site,)):
-            return False
-        return (len(path) == 1 and path[0] in self.enums or any(
-            len(parts) == 1 and parts[0] in module.enums for module, parts in self.imported_modules(path)))
+    def imported_values(self, path, attribute):
+        values = {(module.path, parts): getattr(module, attribute)[parts[0] if len(parts) == 1 else parts]
+                  for module, parts in self.imported_modules(path)
+                  if (parts[0] if len(parts) == 1 else parts) in getattr(module, attribute)}
+        if len(values) == 1:
+            (path, _), value = next(iter(values.items()))
+            return self.modules.loaded[path], value
+        return None
 
     def library_name(self, path, package):
         if len(path) not in {1, 2}:
@@ -367,13 +441,19 @@ class File:
                 if use.text() == binding.node.text() and self.binding((use,)) == binding)
         return not self.collection_writes[site]
 
-    def mutates_collection(self, use):
+    def writes_binding(self, use):
         parent = use.parent()
         if parent.kind() == "assignable_expression":
             operation = parent.parent()
-            if operation.kind() in {"assignment_expression", "postfix_expression", "unary_expression"}:
-                return operation.kind() == "assignment_expression" or any(
-                    child.text() in {"++", "--"} for child in tokens(operation))
+            return operation.kind() == "assignment_expression" or (
+                operation.kind() in {"postfix_expression", "unary_expression"}
+                and any(child.text() in {"++", "--"} for child in tokens(operation)))
+        return False
+
+    def mutates_collection(self, use):
+        if self.writes_binding(use):
+            return True
+        parent = use.parent()
         nodes = contents(parent)
         if names(nodes) == (use.text(),) and parent.kind() in {
                 "argument", "named_argument", "initialized_variable_definition", "static_final_declaration"}:
@@ -404,10 +484,23 @@ class File:
         return callback is not None and callback.key not in seen and callback.file.builds_value(
             returned_expression(callback.body), seen | {callback.key})
 
-    def fixed_number(self, nodes):
-        binding = self.binding(nodes)
-        if binding and binding.final and len(names(nodes)) == 1:
-            return self.fixed_number(binding.initializer)
+    def fixed_number(self, nodes, bindings=None, seen=frozenset()):
+        nodes = unwrap(nodes)
+        if kind(nodes) == "additive_expression":
+            operator, left, right = split(tokens(nodes[0]), {"additive_operator", "+", "-"})
+            first = self.fixed_number(left, bindings, seen)
+            second = self.fixed_number(right, bindings, seen)
+            if type(first) in {int, float} and type(second) in {int, float} and operator in {"+", "-"}:
+                return first + second if operator == "+" else first - second
+            return lint.UNKNOWN
+        if len(names(nodes)) == 1 and (binding := self.binding(nodes)) is not None:
+            key = self, offset(binding.node)
+            if bindings and key in bindings:
+                return bindings[key]
+            if key in seen:
+                return lint.UNKNOWN
+            if binding.final:
+                return self.fixed_number(binding.initializer, bindings, seen | {key})
         return constant(nodes)
 
     def framework_name(self, path):
@@ -423,11 +516,7 @@ class File:
         if len(call.name) == 1 and (self.binding((call.node,)) or self.functions[call.name[0]]):
             return None
         title_nodes, target = call.args[:2]
-        title = string(title_nodes[0], display=True) if kind(title_nodes) == "string_literal" else None
-        if title is None:
-            title = self.syntax.source[offset(title_nodes[0]):title_nodes[-1].range().end.index]
-        if not title:
-            title = "<unnamed>"
+        title = self.title(title_nodes)
         skip = constant(call.keywords.get("skip", ()))
         callback = self.callback(target)
         span = callback.body if callback is not None and callback.file is self and final_call(target) is None else None
@@ -435,10 +524,14 @@ class File:
             span = next((body for node in target for body in query(node, "function_expression_body")), call.node)
         return Registration(call, title, callback, span, skip is True or type(skip) is str)
 
-    def inventory(self):
-        registrations = []
+    def title(self, nodes):
+        title = string(nodes[0], display=True) if kind(nodes) == "string_literal" else None
+        if title is None:
+            title = self.syntax.source[offset(nodes[0]):nodes[-1].range().end.index]
+        return title or "<unnamed>"
+
+    def call_sites(self):
         seen = set()
-        owners = {}
         for arguments in query(self.syntax.root, "arguments"):
             selector = arguments.parent().parent()
             if selector.kind() != "selector":
@@ -448,22 +541,75 @@ class File:
             if site in seen:
                 continue
             seen.add(site)
-            for call in calls(contents(container)):
-                if entry := self.registration(call):
-                    registrations.append(entry)
-                    if entry.callback is not None and kind(call.args[1]) == "function_expression":
-                        owners[offset(entry.span)] = entry
+            yield from calls(contents(container))
+
+    def inventory(self):
+        from .ast_grep_dart_setup import Setups
+
+        calls = tuple(self.call_sites())
+        registrations = [entry for call in calls if (entry := self.registration(call))]
+        owners = {offset(entry.span): entry for entry in registrations
+                  if entry.callback is not None and kind(entry.call.args[1]) == "function_expression"}
+        definitions = {offset(body) for entries in self.functions.values() for _, body in entries
+                       if contents(body.prev()) and any(child.kind() == "formal_parameter_list"
+                                                        and contents(child) for child in contents(body.prev()))}
+        enclosing_functions = {offset(entry.call.node): next(
+            (offset(node) for node in entry.call.node.ancestors() if offset(node) in definitions
+             and node.kind() == "function_body"), None) for entry in registrations}
+
+        def caller_callback(nodes):
+            callback = self.callback(nodes)
+            return callback if callback is not None and callback.file is self else None
+
+        contexts = defaultdict(list)
+        relevant = set(enclosing_functions.values()) - {None}
+        if relevant:
+            for call in calls:
+                if len(call.name) != 1 or call.name[0] not in self.functions:
+                    continue
+                target = self.resolve_name((call.node,), {})
+                if target is not None and target.file is self and offset(target.body) in relevant:
+                    bound = target.bind([caller_callback(arg) for arg in call.args],
+                                        {name: caller_callback(arg) for name, arg in call.keywords.items()})
+                    contexts[offset(target.body)].append((call, target, bound))
+        setups = Setups(self, calls)
         for entry in registrations:
             if entry.call.method == "group":
                 continue
-            enclosing = [owners[offset(node)] for node in entry.call.node.ancestors()
-                         if node.kind() == "function_expression_body" and offset(node) in owners]
-            qualified = "::".join([*(item.title for item in reversed(enclosing)), entry.title])
-            span = entry.span.range()
-            columns = span.start.column, span.end.column
-            test = Test(entry.title, entry.title, line(entry.call.node), span.start.line + 1,
-                        span.end.line + 1, columns[0], qualified=qualified, span_columns=columns)
-            yield test, entry.callback, entry.span, entry.ignored or any(item.ignored for item in enclosing)
+            calls_with_tests = contexts.get(enclosing_functions[offset(entry.call.node)], ())
+            if calls_with_tests and any(bound.supplied for _, _, bound in calls_with_tests):
+                title = self.binding(entry.call.args[0]) if len(names(entry.call.args[0])) == 1 else None
+                inline = []
+                callbacks = []
+                for caller, target, bound in calls_with_tests:
+                    callback = self.callback(entry.call.args[1], bound.supplied)
+                    callbacks.append(callback)
+                    supplied = target.bind(caller.args, caller.keywords).supplied if title else {}
+                    label = supplied.get(offset(title.node)) if title else None
+                    if label:
+                        inline.append((caller, self.title(label), callback))
+                if len(inline) == len(calls_with_tests):
+                    for caller, label, callback in inline:
+                        yield self.test_instance(entry, caller.node, caller.node.parent(), label,
+                                                 [callback], owners, setups)
+                else:
+                    yield self.test_instance(entry, entry.call.node, entry.span, entry.title,
+                                             callbacks, owners, setups)
+            else:
+                yield self.test_instance(entry, entry.call.node, entry.span, entry.title,
+                                         [entry.callback], owners, setups)
+
+    def test_instance(self, entry, site, span, title, callbacks, owners, setups):
+        scopes = (site,) if site == entry.call.node else (site, entry.call.node)
+        enclosing = {offset(node): owners[offset(node)] for scope in reversed(scopes) for node in scope.ancestors()
+                     if node.kind() == "function_expression_body" and offset(node) in owners}
+        qualified = "::".join([*(item.title for item in reversed(enclosing.values())), title])
+        bounds = span.range()
+        columns = bounds.start.column, bounds.end.column
+        test = Test(title, title, line(site), bounds.start.line + 1,
+                    bounds.end.line + 1, columns[0], qualified=qualified, span_columns=columns)
+        return (test, callbacks, span, entry.ignored or any(item.ignored for item in enclosing.values()),
+                setups.callbacks_for(*scopes))
 
     def check(self, call):
         method = self.framework_name(call.name)
@@ -495,8 +641,7 @@ class File:
             return Check(call.node)
         if self.library_name(call.name, "package:mockito/") in MOCKITO:
             return Check(call.node)
-        if method in {"expectAsync", "expectAsync0", "expectAsync1", "expectAsync2", "expectAsync3",
-                      "expectAsync4", "expectAsync5", "expectAsync6"}:
+        if method in ASYNC_EXPECTATIONS:
             count = self.fixed_number(call.keywords.get("count", ()))
             if "count" not in call.keywords or type(count) is int and count >= 0:
                 return Check(call.node)
@@ -577,31 +722,32 @@ def parse(source, path, *, inventory=False, observe=None):
     tests = []
     absence = Absence(file)
     candidates = file.inventory() if file.frameworks or path.name.endswith("_test.dart") else ()
-    for test, callback, span, ignored in candidates:
+    for test, callbacks, span, ignored, setup_callbacks in candidates:
         tests.append(test)
-        if ignored or callback is None:
+        if ignored:
             continue
-        flow = Flow(file, callback)
-        incomplete = flow.run()
-        micro_snapshot(file, test, flow.checks)
-        test.checks = len(flow.checks)
-        if not flow.checks:
-            test.issues.append((test.line, "no-assert"))
-        test.guarded = bool(flow.checks and incomplete)
-        if inventory:
-            body = (span,)
-            if span.kind() == "identifier":
-                body = contents(span.parent())
+        if inventory and any(callback is not None for callback in callbacks):
+            body = contents(span.parent()) if span.kind() == "identifier" else (span,)
             test.body_hash = hashlib.sha256(repr(signature(body)).encode()).hexdigest()
-        for check in flow.checks:
-            if check.file is not file:
+        for callback in callbacks:
+            if callback is None:
                 continue
-            site = line(check.node)
-            if check.constant_success():
-                test.issues.append((site, "const-truth"))
-            if flow.compares_itself(check, test.name, line_comments):
-                test.issues.append((site, "self-compare"))
-        absence.collect(test, flow)
+            flow = Flow(file, callback, setup_callbacks)
+            incomplete = flow.run()
+            micro_snapshot(file, test, flow.checks)
+            test.checks = max(test.checks, len(flow.checks))
+            if not flow.checks:
+                test.issues.append((test.line, "no-assert"))
+            test.guarded |= bool(flow.checks and incomplete)
+            for check in flow.checks:
+                if check.file is not file:
+                    continue
+                site = line(check.node)
+                if check.constant_success():
+                    test.issues.append((site, "const-truth"))
+                if flow.compares_itself(check, test.name, line_comments):
+                    test.issues.append((site, "self-compare"))
+            absence.collect(test, flow)
     absence.finish()
     if observe is not None:
         observe(path, tests, syntax_errors(syntax.root, missing=True), [])

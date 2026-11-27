@@ -19,8 +19,10 @@ class Import:
         return (not self.show or name in self.show) and name not in self.hide
 
 
-def imports(root):
-    for entry in query(root, "import_specification"):
+def imports(root, *, exports=False):
+    for entry in query(root, "library_export" if exports else "import_specification"):
+        if entry.find(kind="configuration_uri") is not None:
+            continue
         uri = entry.find(kind="string_literal")
         if uri is None or (uri := string(uri)) is None:
             continue
