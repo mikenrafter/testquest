@@ -160,3 +160,308 @@ class AstGrepJvm(TqCase):
         paths = [self.copy(FIXTURES / "jvm" / name, f"src/test/kotlin/example/{name}")
                  for name in ("RigSibling.kt", "RigSupport.kt")]
         self.assertEqual(self.locations(*paths), [(8, "absence-no-control")])
+
+    def test_typed_mock_and_capture_controls(self):
+        # WHY: ConsentedUsageObserverTest.kt:61 proves delegate.start in a sibling,
+        # and LocationOutputContainmentTest.kt:131 observes a capture on the same mock.
+        # catches: requiring local binding identity or accepting a positive on an unrelated mock type
+        path = self.write("Controls.kt", """
+            import org.junit.Assert.assertTrue
+            class Controls {
+                @Test fun active() {
+                    val observer = mockk<Observer>()
+                    verify(exactly = 1) { observer.start() }
+                    val manager = mockk<Manager>()
+                    val captured = mutableListOf<Fix>()
+                    every { manager.publish(capture(captured)) } just Runs
+                    exercise(manager)
+                    assertTrue("recorded a fix", captured.isNotEmpty())
+                }
+
+                @Test fun inactive() {
+                    val renamed = mockk<Observer>()
+                    val manager = mockk<Manager>()
+                    val unrelated = mockk<OtherObserver>()
+                    verify(exactly = 0) { renamed.start() }
+                    verify(exactly = 0) { manager.publish("gps") }
+                    verify(exactly = 0) { unrelated.start() }
+                }
+            }
+        """)
+        self.assertEqual(self.locations(path.name), [(19, "absence-no-control")])
+
+    def test_spy_activity_and_on_off_twins_are_controls(self):
+        # WHY: ConnoisseurBatchEncodeTest.java:158 witnesses actual activity on the
+        # spy; PersonaCharacterTest.kt:160 explicitly checks the on and off results.
+        # catches: requiring the exact field on a recording spy or missing a conjunction's positive check
+        java = self.write("EncoderTest.java", """
+            class EncoderTest {
+                static class SpyEncoder implements FrameEncoder {
+                    final List<Integer> batchCalls = new ArrayList<>();
+                    final List<Integer> oldCalls = new ArrayList<>();
+                    void batch(int n) { batchCalls.add(n); }
+                    void perFrame(int n) { oldCalls.add(n); }
+                }
+
+                @Test void noOldCalls() {
+                    SpyEncoder spy = new SpyEncoder();
+                    SpyEncoder other = new SpyEncoder();
+                    run(spy);
+                    assertThat(spy.batchCalls).hasSize(3);
+                    assertThat(spy.oldCalls).isEmpty();
+                    assertThat(other.oldCalls).isEmpty();
+                }
+            }
+        """)
+        kotlin = self.write("CharacterTest.kt", """
+            class CharacterTest {
+                @Test fun off() {
+                    val on = Behavior.view(persona, true)!!
+                    val off = Behavior.view(persona, false)!!
+                    val different = Behavior.view(otherPersona, false)!!
+                    assertTrue(on.flavour.isNotEmpty() && on.visible)
+                    assertTrue(off.flavour.isEmpty())
+                    assertTrue(different.flavour.isEmpty())
+                }
+            }
+        """)
+        self.assertEqual([(row["path"], row["line"], row["rule"]) for row in self.findings(java.name, kotlin.name)],
+                         [(kotlin.name, 8, "absence-no-control"), (java.name, 15, "absence-no-control")])
+
+    def test_single_file_lint_finds_support_control_in_another_package(self):
+        # WHY: PersonaEgressConnectorTest witnesses the rig's lookup recorder.
+        # catches: looking only in the selected files or in the requesting test's package
+        base = "src/test/kotlin/example"
+        self.write(f"{base}/support/Rig.kt", """
+            package example.support
+            class Rig { val lookups = mutableListOf<String>() }
+        """)
+        negative = self.write(f"{base}/road/RoadTest.kt", """
+            package example.road
+            import example.support.Rig
+            class RoadTest {
+                @Test fun offline() {
+                    val rig = Rig()
+                    assertTrue(rig.lookups.isEmpty())
+                }
+            }
+        """)
+        self.write(f"{base}/dns/ConnectorTest.kt", """
+            package example.dns
+            import example.support.Rig
+            class ConnectorTest {
+                @Test fun online() {
+                    val differentName = Rig()
+                    connect(differentName)
+                    assertEquals(listOf("target.invalid"), differentName.lookups)
+                }
+            }
+        """)
+        self.assertEqual(self.locations(negative.relative_to(self.repo)), [])
+
+    def test_literal_false_precondition_requires_wiring(self):
+        # WHY: PoisonEngineFailClosedTest.kt:118 passes a profile with two flags off,
+        # but a true isEnabled override makes those collaborators eligible for dispatch.
+        # catches: treating the false flag as decisive even when the tested mock ignores it
+        path = self.write("DispatchTest.kt", """
+            class DispatchTest {
+                private val profile = Profile(cookieEnabled = false, signalEnabled = false)
+                @Test fun actionsStop() {
+                    val cookie = mockk<CookieModule> {
+                        every { isEnabled() } returns profile.cookieEnabled
+                    }
+                    val signal = mockk<SignalModule> {
+                        every { isEnabled() } returns true
+                    }
+                    dispatch(cookie, signal)
+                    coVerify(exactly = 0) { cookie.onAction() }
+                    coVerify(exactly = 0) { signal.onAction() }
+                }
+            }
+        """)
+        rows = self.findings(path.name)
+        self.assertEqual([(row["line"], row["rule"]) for row in rows],
+                         [(11, "absence-no-control"), (12, "absence-no-control")])
+        self.assertIn("fixture disables the collaborator", rows[0]["message"])
+        self.assertIn("can report a result", rows[1]["message"])
+
+    def test_try_fail_only_catches_the_expected_exception(self):
+        # WHY: AndroidImportJournalTest.kt:57 rejects every malformed input; a catch
+        # that also catches the assertion's failure would make acceptance pass.
+        # catches: counting a swallowed AssertionError as a successful expected-failure check
+        path = self.write("JournalTest.kt", """
+            class JournalTest {
+                @Test fun wrongType() {
+                    for (record in listOf("duplicate", "truncated")) {
+                        try { read(record); fail("accepted") }
+                        catch (_: JournalUnreadableException) {}
+                    }
+                }
+                @Test fun catchesAssertion() {
+                    try { read("truncated"); fail("accepted") }
+                    catch (_: Throwable) {}
+                }
+            }
+        """)
+        self.assertEqual(self.locations(path.name), [(8, "guarded-assert")])
+
+    def test_sibling_size_contract_and_fixed_kotlin_inputs(self):
+        # WHY: FakeRouteGeneratorTest.kt:55 checks a range derived from a sized result;
+        # QueryBlocklistAnyLocaleTest.kt:47 iterates an enum and a fixed map's values.
+        # catches: ignoring witnessed cardinality, or granting it to an unrelated filtered result
+        path = self.write("RouteTest.kt", """
+            class RouteTest {
+                @Test fun length() {
+                    val route = generator.generateRoute(city, count = 10)
+                    assertEquals(10, route.size)
+                }
+                @Test fun order() {
+                    val route = generator.generateRoute(city, count = 10)
+                    for (index in 1 until route.size) assertTrue(route[index] > route[index - 1])
+                }
+                @Test fun fixedRange() {
+                    val fixture = Fixture()
+                    (0..23).forEach { assertTrue(valid(fixture, it)) }
+                }
+                @Test fun fixedCollections() {
+                    repeat(2) { assertTrue(valid(it)) }
+                    val samples = mapOf(Locale.EN to "en", Locale.RU to "ru")
+                    for (locale in Locale.entries) {
+                        samples.values.forEach { assertTrue(valid(locale, it)) }
+                    }
+                }
+                @Test fun possiblyEmpty() {
+                    val route = generator.generateRoute(city, count = 10)
+                    route.mapNotNull { runCatching { parse(it) }.getOrNull() }
+                        .forEach { assertTrue(valid(it)) }
+                }
+            }
+            enum class Locale { EN, RU }
+        """)
+        rows = self.findings(path.name)
+        self.assertEqual([(row["line"], row["rule"]) for row in rows], [(21, "guarded-assert")])
+        self.assertIn("filter", rows[0]["message"])
+
+    def test_literal_java_fixtures_reach_the_check_past_continue(self):
+        # WHY: ScribeStoreCompactOpusTest.java:289 and :336 each have a literal
+        # fixture item that reaches the assertion regardless of product behavior.
+        # catches: accepting a product-controlled filter or requiring all fixtures to reach the assertion
+        path = self.write("StoreTest.java", """
+            class StoreTest {
+                enum Encoding { PCM, OPUS }
+                record Item(Encoding encoding) {}
+
+                static List<Item> mix() {
+                    List<Item> items = new ArrayList<>();
+                    items.add(new Item(Encoding.OPUS));
+                    items.add(new Item(Encoding.PCM));
+                    return items;
+                }
+                @Test void raw() {
+                    for (Item item : mix()) {
+                        boolean clean = item.encoding() == Encoding.OPUS && isFramed(item);
+                        if (clean) continue;
+                        assertTrue(matches(item));
+                    }
+                }
+                @Test void opus() {
+                    for (Item item : mix()) {
+                        if (item.encoding() != Encoding.OPUS) continue;
+                        assertTrue(matches(item));
+                    }
+                }
+                @Test void productFiltered() {
+                    for (Item item : mix()) {
+                        if (!isFramed(item)) continue;
+                        assertTrue(matches(item));
+                    }
+                }
+            }
+        """)
+        self.assertEqual(self.locations(path.name), [(24, "guarded-assert")])
+
+    def test_callback_control_follows_the_constructor_argument(self):
+        # WHY: ModuleSilentFailureTest.kt:150 observes the same outcome sink in
+        # sibling tests. A collector wired to another argument has a separate path.
+        # catches: keying callback evidence by local variable name or by constructor alone
+        path = self.write("SinkTest.kt", """
+            class SinkTest {
+                @Test fun online() {
+                    val observed = mutableListOf<String>()
+                    Service(onEvent = { event -> observed += event }, onError = {}).run()
+                    assertEquals(listOf("event"), observed)
+                }
+                @Test fun offline() {
+                    val renamed = mutableListOf<String>()
+                    val errors = mutableListOf<String>()
+                    Service(onEvent = { renamed += it }, onError = { errors += it }).run()
+                    assertTrue(renamed.isEmpty())
+                    assertTrue(errors.isEmpty())
+                }
+            }
+        """)
+        self.assertEqual(self.locations(path.name), [(12, "absence-no-control")])
+
+    def test_checked_capture_slot_witnesses_invocation(self):
+        # WHY: FacebookDyiImporterTest.kt:134 is backed by a sibling test that
+        # reads the DAO's captured row. Installing an unused stub supplies no control.
+        # catches: requiring a collection size check, or accepting an unread capture
+        path = self.write("ImporterTest.kt", """
+            class ImporterTest {
+                private val dao = mockk<Dao>()
+                private val unrelated = mockk<Dao>()
+                @Test fun validImport() {
+                    val saved = slot<Row>()
+                    val unused = slot<Row>()
+                    coEvery { dao.save(capture(saved)) } returns Unit
+                    coEvery { unrelated.save(capture(unused)) } returns Unit
+                    importRows()
+                    assertEquals("campaign", saved.captured.name)
+                }
+                @Test fun invalidImport() {
+                    importRows()
+                    coVerify(exactly = 0) { dao.save(any()) }
+                    coVerify(exactly = 0) { unrelated.save(any()) }
+                }
+            }
+        """)
+        self.assertEqual(self.locations(path.name), [(15, "absence-no-control")])
+
+    def test_java_mocks_keep_factory_and_type_controls(self):
+        # WHY: TrackMediatorTest.java:240 shares the provider factory and
+        # PlaybackManagerMediaSessionTrimTest.java:82 has a sibling MediaSession mock.
+        # catches: requiring one Java mock binding in cases that deliberately build several
+        path = self.write("SessionsTest.java", """
+            class SessionsTest {
+                private Session session(boolean armed) {
+                    Session session = mock(Session.class);
+                    when(session.isArmed()).thenReturn(armed);
+                    return session;
+                }
+
+                @Test void activeOnly() {
+                    Session active = session(true);
+                    Session inactive = session(true);
+                    Session different = session(false);
+                    dispatch(active, inactive, different);
+                    verify(active, times(1)).release();
+                    verify(inactive, never()).release();
+                    verify(different, never()).release();
+                }
+
+                @Test void playback() {
+                    Player player = mock(Player.class);
+                    play(player);
+                    verify(player).start();
+                }
+
+                @Test void idle() {
+                    Player player = mock(Player.class);
+                    Session session = mock(Session.class);
+                    idle(player, session);
+                    verifyNoInteractions(player);
+                    verifyNoInteractions(session);
+                }
+            }
+        """)
+        self.assertEqual(self.locations(path.name), [(15, "absence-no-control"), (29, "absence-no-control")])
