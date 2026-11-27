@@ -1979,6 +1979,10 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
 
         return parse_ecmascript(source, path, ECMASCRIPT_LANGUAGES[path.suffix],
                                 inventory=inventory, observe=observe)
+    if path.suffix == ".dart":
+        from .ast_grep_dart import parse as parse_dart
+
+        return parse_dart(source, path, inventory=inventory, observe=observe)
     file = File(source, "rust" if path.suffix == ".rs" else "python", path, scan_root)
     if file.syntax.language == "python" and (errors := syntax_errors(file.syntax.root)):
         if observe is not None:
