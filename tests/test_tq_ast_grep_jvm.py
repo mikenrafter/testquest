@@ -343,7 +343,7 @@ class AstGrepJvm(TqCase):
         self.assertIn("filter", rows[0]["message"])
 
     def test_literal_java_fixtures_reach_the_check_past_continue(self):
-        # WHY: ScribeStoreCompactOpusTest.java:289 and :336 each have a literal
+        # WHY: two tests in a private Java store suite each have a literal
         # fixture item that reaches the assertion regardless of product behavior.
         # catches: accepting a product-controlled filter or requiring all fixtures to reach the assertion
         path = self.write("StoreTest.java", """
