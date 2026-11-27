@@ -25,6 +25,7 @@ RULES = {
     "parse-error",
     "self-compare",
     "self-derived-expected",
+    "too-deep",
 }
 
 

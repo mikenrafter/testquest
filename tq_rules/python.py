@@ -2,6 +2,7 @@ import ast
 import builtins
 from bisect import bisect_left
 from collections import ChainMap, Counter, defaultdict
+from functools import cache, cached_property
 import hashlib
 import io
 from pathlib import Path
@@ -89,6 +90,8 @@ def file_parameters(definitions):
 
 
 def nonempty_literal(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return bool(node.value)
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         return any(not isinstance(item, ast.Starred) for item in node.elts)
     if isinstance(node, ast.Dict):
@@ -1008,9 +1011,14 @@ class Inspect(ast.NodeVisitor):
             if len(uses[name]) != 1:
                 continue
             usage, = uses[name]
-            parent, field = self.iterables.parents[usage]
-            if isinstance(parent, ast.Call) and field == "args":
-                yield parent.lineno
+            call, field = self.iterables.parents[usage]
+            if not isinstance(call, ast.Call) or field != "args":
+                continue
+            parent, field = self.iterables.parents[call]
+            if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not) and field == "operand":
+                parent, field = self.iterables.parents[parent]
+            if isinstance(parent, ast.Assert) and field == "test":
+                yield call.lineno
 
     def failure_collector(self, name):
         sites = self.recorder_sites[name]
@@ -1139,11 +1147,14 @@ def test_functions(nodes, parents=()):
 
 
 def body_nodes(statements):
-    for node in statements:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue
-        yield node
-        yield from body_nodes(ast.iter_child_nodes(node))
+    stack = [iter(statements)]
+    while stack:
+        node = next(stack[-1], None)
+        if node is None:
+            stack.pop()
+        elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            yield node
+            stack.append(ast.iter_child_nodes(node))
 
 
 SHRINKING_METHODS = {"clear", "discard", "difference_update", "intersection_update",
@@ -1288,6 +1299,8 @@ class Iterables:
             return bool(node.args) and all(self.nonempty(arg) for arg in node.args)
         if name == "enumerate" and 1 <= len(node.args) <= 2 and keywords <= {"start"}:
             return self.nonempty(node.args[0])
+        if name in {"reversed", "list", "tuple", "set"} and len(node.args) == 1 and not keywords:
+            return nonempty_literal(node.args[0])
         return (name == "sorted" and len(node.args) == 1 and keywords <= {"key", "reverse"}
                 and self.nonempty(node.args[0]))
 
@@ -1392,6 +1405,37 @@ def imports_in(statements):
     return imports
 
 
+class ImportedModule:
+    def __init__(self, tree):
+        self.tree = tree
+
+    @cached_property
+    def guard_tables(self):
+        try:
+            changed = scope_changes(self.tree.body)
+            return changed, dict(file_iterables(self.tree.body, changed)), imports_in(self.tree.body)
+        except (RecursionError, MemoryError):
+            return None
+
+
+def imported_module(path):
+    try:
+        path = path.resolve()
+        return parse_imported_module(path, path.stat().st_mtime_ns)
+    except (OSError, RecursionError):
+        return None
+
+
+@cache
+def parse_imported_module(path, mtime_ns):
+    """Cache the parsed module for this path and modification time, including parse failures."""
+    try:
+        with tokenize.open(path) as stream:
+            return ImportedModule(ast.parse(stream.read(), filename=str(path)))
+    except (OSError, SyntaxError, UnicodeError, LookupError, RecursionError, MemoryError):
+        return None
+
+
 class ModuleConstants:
     def __init__(self, path):
         self.path = Path(path).absolute()
@@ -1423,12 +1467,8 @@ class ModuleConstants:
         source = self.source(module)
         if source is None or source == self.path:
             return None
-        try:
-            with tokenize.open(source) as stream:
-                tree = ast.parse(stream.read(), filename=str(source))
-        except (OSError, SyntaxError, UnicodeError, LookupError):
-            return None
-        return tree
+        parsed = imported_module(source)
+        return parsed.tree if parsed else None
 
     def tree(self, module):
         if module not in self.trees:
@@ -1531,33 +1571,25 @@ class ModuleConstants:
         return constant in self.modules[module].get(name, ())
 
 
-class GuardIterables(Iterables):
-    def __init__(self, test, scope, tables, module_names, tree, path, scan_root):
-        super().__init__(test, scope, tables, module_names)
+class GuardFile:
+    def __init__(self, tree, path, scan_root, imports, tables, module_names):
         self.root = project_root(path, scan_root, (".git", "pyproject.toml", "setup.py"))
         self.path = path.resolve()
-        self.imports = imports_in(tree.body)
-        self.local_imports = {name: (binding, qualified)
-                              for binding in self.parents if isinstance(binding, (ast.Import, ast.ImportFrom))
-                              for name, qualified in imports_in((binding,)).items()
-                              if self.changed[name] == 1}
+        self.imports = imports
         self.table_cache = {}
         self.scripts = {}
         self.module_calls = {name_of(node.value.func): node.value
                              for node in tree.body if isinstance(node, ast.Expr)
                              and isinstance(node.value, ast.Call)}
-        self.locals.update((target.id, node)
-                           for node, target, _ in assignments(self.parents)
-                           if isinstance(target, ast.Name) and self.changed[target.id] == 1)
+        self.tables = tables.copy()
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
                 changed = scope_changes(node.body)
                 for _, target, value in assignments(node.body):
                     if isinstance(target, ast.Name) and changed[target.id] == 1:
-                        self.tables = {**self.tables, (node.name, target.id): value}
+                        self.tables[node.name, target.id] = value
         self.module_bindings = {target.id: value for _, target, value in assignments(tree.body)
                                 if isinstance(target, ast.Name) and module_names[target.id] == 1}
-        self.loop_rows = {}
 
     def module_source(self, source, module):
         relative = len(module) - len(module.lstrip("."))
@@ -1588,17 +1620,14 @@ class GuardIterables(Iterables):
         if key in self.table_cache:
             return self.table_cache[key]
         self.table_cache[key] = None
-        try:
-            with tokenize.open(path) as stream:
-                tree = ast.parse(stream.read(), filename=str(path))
-        except (OSError, SyntaxError, UnicodeError, LookupError):
+        parsed = imported_module(path)
+        if parsed is None or parsed.guard_tables is None:
             return None
-        changed = scope_changes(tree.body)
+        changed, values, imports = parsed.guard_tables
         if changed[name] == 1:
-            values = dict(file_iterables(tree.body, changed))
             value = values.get((name,))
             if not nonempty_literal(value):
-                value = self.imported_table(path, imports_in(tree.body).get(name, ""))
+                value = self.imported_table(path, imports.get(name, ""))
             self.table_cache[key] = value
         return self.table_cache[key]
 
@@ -1636,6 +1665,20 @@ class GuardIterables(Iterables):
         self.scripts[alias] = path
         return path
 
+
+class GuardIterables(Iterables):
+    def __init__(self, test, scope, module_names, file):
+        super().__init__(test, scope, file.tables, module_names)
+        self.file = file
+        self.local_imports = {name: (binding, qualified)
+                              for binding in self.parents if isinstance(binding, (ast.Import, ast.ImportFrom))
+                              for name, qualified in imports_in((binding,)).items()
+                              if self.changed[name] == 1}
+        self.locals.update((target.id, node)
+                           for node, target, _ in assignments(self.parents)
+                           if isinstance(target, ast.Name) and self.changed[target.id] == 1)
+        self.loop_rows = {}
+
     def definition(self, node):
         name = binding_path(node)
         if not name:
@@ -1653,14 +1696,14 @@ class GuardIterables(Iterables):
             if local:
                 imported_at, imported = local
                 if self.precedes(imported_at, node):
-                    return self.imported_table(self.path, imported + dot + member)
+                    return self.file.imported_table(self.file.path, imported + dot + member)
             return None
         if self.module_names[root] != 1:
             return None
-        if imported := self.imports.get(root):
-            return self.imported_table(self.path, imported + dot + member)
-        if member.isupper() and (path := self.script(root)):
-            return self.source_table(path, member)
+        if imported := self.file.imports.get(root):
+            return self.file.imported_table(self.file.path, imported + dot + member)
+        if member.isupper() and (path := self.file.script(root)):
+            return self.file.source_table(path, member)
         return None
 
     def rows(self, node):
@@ -1797,7 +1840,9 @@ def status_only(evidence):
     return True
 
 
-def setup_only(node):
+def setup_only(node, assertion_count):
+    if sum(isinstance(statement, ast.Assert) for statement in node.body) != assertion_count:
+        return False
     checked = set()
     unchecked = False
     for statement in node.body:
@@ -1846,7 +1891,7 @@ def has_outcome_evidence(node, scope, checks_call):
             and part.test.func.attr == "is_ok" and not part.test.args and not part.test.keywords
             for part in evidence):
         return False
-    return not setup_only(node)
+    return not setup_only(node, len(evidence))
 
 
 def body_fingerprint(node, tokens, lines):
@@ -1885,6 +1930,7 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
     tables = dict(file_iterables(tree.body, module_names))
     tests = []
     inspected = []
+    guard_file = None
     for node, parents in functions:
         iterables = Iterables(node, parents, tables, module_names)
         local_parameters = {local.name: parameter_names(local) for local in node.body
@@ -1922,7 +1968,9 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
         inspected.append((test, inspector, node))
         test.guarded = bool(inspector.checks) and all(guards for _, _, guards in inspector.checks)
         if test.guarded and scan_root is not None:
-            guard_iterables = GuardIterables(node, parents, tables, module_names, tree, path, scan_root)
+            if guard_file is None:
+                guard_file = GuardFile(tree, path, scan_root, imports, tables, module_names)
+            guard_iterables = GuardIterables(node, parents, module_names, guard_file)
             guard_inspector = Inspect(imports, checks_in(parents), local_helpers, guard_iterables,
                                       test_parameters, oracle_imports, module_constants, definitions, parents)
             for statement in node.body:

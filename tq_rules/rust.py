@@ -1065,7 +1065,7 @@ def module_items(path):
         tokens, _ = tokenize(path.read_text(encoding="utf-8"))
         grouped = group(tokens)
         return FileIterables(grouped, path, dict(file_parameters(grouped)))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError, MemoryError):
         return None
 
 
@@ -1074,7 +1074,7 @@ def module_functions(path):
     try:
         tokens, _ = tokenize(path.read_text(encoding="utf-8"))
         return {name: return_expression(body) for name, body in function_bodies(group(tokens))}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError, MemoryError):
         return {}
 
 

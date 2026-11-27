@@ -57,6 +57,11 @@ class CollectionControls:
         else:
             self.pending.append((key, path, test, line))
 
+    def merge(self, other):
+        for key, paths in other.witnesses.items():
+            self.witnesses[key].update(paths)
+        self.pending.extend(other.pending)
+
     def finish(self):
         for key, path, test, line in self.pending:
             if not self.witnesses.get(key, set()) - {path}:
@@ -67,7 +72,7 @@ IGNORED = {".git", "__pycache__", ".venv", "node_modules", "target"}
 
 
 def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None, inventory=False):
-    """Yield parsed files; append a parse-error finding to `errors` for each unreadable one."""
+    """Yield parsed files and append a diagnostic for each skipped file."""
     from . import python, rust
 
     paths = {}
@@ -86,22 +91,32 @@ def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None,
                         paths[candidate] = directory_root
         elif path.suffix in {".py", ".rs"} and not path.is_symlink():
             paths.setdefault(path, cwd if refine_guards else None)
-    for path in sorted(paths, key=str):
-        if not path.is_file():
-            continue
-        try:
-            if path.suffix == ".py":
-                with tokenize.open(path) as stream:
-                    parsed = python.parse(stream.read(), path, scan_root=paths[path],
-                                          collection_controls=collection_controls, inventory=inventory)
-            else:
-                parsed = rust.parse(path.read_text(encoding="utf-8"), path, scan_root=paths[path],
-                                    collection_controls=collection_controls, inventory=inventory)
-        except (SyntaxError, ValueError, UnicodeDecodeError) as error:
-            errors.append(finding(path, getattr(error, "lineno", None) or 1, "parse-error",
-                                  f"Cannot parse: {error}"))
-            continue
-        yield path, *parsed
+    try:
+        for path in sorted(paths, key=str):
+            if not path.is_file():
+                continue
+            controls = CollectionControls() if collection_controls is not None else None
+            try:
+                if path.suffix == ".py":
+                    with tokenize.open(path) as stream:
+                        parsed = python.parse(stream.read(), path, scan_root=paths[path],
+                                              collection_controls=controls, inventory=inventory)
+                else:
+                    parsed = rust.parse(path.read_text(encoding="utf-8"), path, scan_root=paths[path],
+                                        collection_controls=controls, inventory=inventory)
+            except (RecursionError, MemoryError):
+                errors.append(finding(path, 1, "too-deep",
+                                      "advisory: Scan skipped after exceeding parser limits.", "advisory"))
+                continue
+            except (SyntaxError, ValueError, UnicodeDecodeError) as error:
+                errors.append(finding(path, getattr(error, "lineno", None) or 1, "parse-error",
+                                      f"Cannot parse: {error}"))
+                continue
+            if controls is not None:
+                collection_controls.merge(controls)
+            yield path, *parsed
+    finally:
+        python.parse_imported_module.cache_clear()
 
 
 def finding(path, line, rule, message, level="error"):

@@ -15,6 +15,10 @@ DIAGNOSTIC_RULES = {
         "A conditional test has no evidence that its condition is reached.",
         "Name another scanned test that reaches the condition, or measure coverage in this test.",
     ),
+    "too-deep": (
+        "The scan skipped a source file after exceeding parser limits.",
+        "This advisory diagnostic does not require a suppression.",
+    ),
     "parse-error": (
         "A source file could not be parsed.",
         "Fix the source or its encoding before scanning. This diagnostic cannot be suppressed.",
@@ -99,7 +103,7 @@ def main():
                         print("  {source} ({section})".format(**citation))
         if options.command == "rules":
             for name, (message, allowed) in sorted((lint.RULES | DIAGNOSTIC_RULES).items()):
-                level = "advisory" if name in lint.ADVISORY else "error"
+                level = "advisory" if name in lint.ADVISORY or name == "too-deep" else "error"
                 print(f"{name}  {message}\n  level: {level}\n  allowed-when: {allowed}")
     except (OSError, ValueError, SyntaxError, subprocess.SubprocessError) as error:
         print(f"tq: {error}", file=sys.stderr)

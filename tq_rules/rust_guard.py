@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from functools import lru_cache
 import operator
+import re
 import tomllib
 
 from .rust import (FileIterables, absolute_path, comparison, directly_checks, group,
@@ -85,8 +86,18 @@ def iterable(tokens, lookup, *, vector=False):
         if entries and len(list(split(entries, ";"))) == 1:
             rows = tuple(split(entries))
         return Iterable(size, size, rows)
-    if len(tokens) == 1 and tokens[0].text == "(":
-        return iterable(tokens[0].children, lookup)
+    if len(tokens) == 1:
+        token = tokens[0]
+        if token.text == "(":
+            return iterable(token.children, lookup)
+        if token.kind == "raw" and token.text.startswith("br"):
+            size = len(literal(tokens))
+            return Iterable(size, size)
+        if token.kind == "quoted" and token.text.startswith('b"'):
+            content = token.text[2:-1]
+            if re.fullmatch(r"(?:\\\r?\n[ \t\r\n]*)*", content):
+                return Iterable(0, 0)
+            return Iterable(1)
     if len(tokens) >= 2 and tokens[-1].text == "[":
         base = iterable(tokens[:-1], lookup)
         parts = range_parts(tokens[-1].children)
@@ -125,6 +136,11 @@ def iterable(tokens, lookup, *, vector=False):
 def adapted(receiver, method, args, lookup, *, vector):
     if method in {"iter", "iter_mut", "into_iter", "rev", "copied", "cloned"} and not args:
         return iterable(receiver, lookup)
+    if method == "step_by" and (step := integer_literal(args)) is not None and step > 0:
+        facts = iterable(receiver, lookup)
+        if facts:
+            length = (facts.length + step - 1) // step if facts.length is not None else None
+            return Iterable((facts.minimum + step - 1) // step, length, facts.rows[::step])
     if method == "enumerate" and not args:
         facts = iterable(receiver, lookup)
         if facts:
@@ -315,7 +331,7 @@ def module_items(path):
     try:
         tokens, _ = tokenize(path.read_text(encoding="utf-8"))
         return FileIterables(group(tokens), path, {})
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError, MemoryError):
         return None
 
 
@@ -331,8 +347,9 @@ class GuardIterables:
         self.package = ""
         try:
             config = tomllib.loads((self.root / "Cargo.toml").read_text(encoding="utf-8"))
-            self.package = config.get("lib", {}).get("name", config.get("package", {}).get("name", ""))
-            self.package = self.package.replace("-", "_")
+            name = config.get("lib", {}).get("name", config.get("package", {}).get("name"))
+            if isinstance(name, str):
+                self.package = name.replace("-", "_")
         except (OSError, ValueError):
             pass
         self.module = ()

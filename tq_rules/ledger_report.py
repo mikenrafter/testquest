@@ -103,7 +103,7 @@ def summarize(events):
 
 def print_report(report):
     def percent(fraction):
-        return "—" if fraction is None else f"{fraction:.1%}"
+        return "n/a" if fraction is None else f"{fraction:.1%}"
 
     print("Phase              Born  Died  Survived")
     for phase, row in sorted(report["phases"].items()):

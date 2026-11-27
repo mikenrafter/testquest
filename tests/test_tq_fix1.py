@@ -198,7 +198,7 @@ class AdvisoryRules(contract.TqCase):
         ends = [start.start() for start in starts[1:]] + [len(output)]
         levels = {start[1]: "level: advisory" in output[start.start():end]
                   for start, end in zip(starts, ends)}
-        self.assertEqual({rule for rule, advisory in levels.items() if advisory}, self.ADVISORY)
+        self.assertEqual({rule for rule, advisory in levels.items() if advisory}, self.ADVISORY | {"too-deep"})
 
     def test_advisory_findings_show_but_only_gating_findings_fail(self):
         # WHY: an advisory-only file must not break a build, and a gating finding still must.
