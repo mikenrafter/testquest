@@ -10,4 +10,6 @@ ECMASCRIPT_LANGUAGES = {
 }
 ECMASCRIPT_OUTPUT = {"node_modules", "dist", "build", "coverage"}
 
-CALLBACK_SUFFIXES = frozenset(ECMASCRIPT_LANGUAGES) | {".dart"}
+JVM_LANGUAGES = {".kt": "kotlin", ".kts": "kotlin", ".java": "java"}
+# Every language beyond the legacy Python and Rust readers, by file suffix.
+EXTENDED_LANGUAGES = ECMASCRIPT_LANGUAGES | JVM_LANGUAGES | {".dart": "dart"}

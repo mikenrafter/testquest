@@ -1972,7 +1972,7 @@ class File:
 
 
 def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
-    from .ast_grep_languages import ECMASCRIPT_LANGUAGES
+    from .ast_grep_languages import ECMASCRIPT_LANGUAGES, JVM_LANGUAGES
 
     if path.suffix in ECMASCRIPT_LANGUAGES:
         from .ast_grep_ts import parse as parse_ecmascript
@@ -1983,6 +1983,10 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
         from .ast_grep_dart import parse as parse_dart
 
         return parse_dart(source, path, inventory=inventory, observe=observe)
+    if path.suffix in JVM_LANGUAGES:
+        from .ast_grep_jvm import parse as parse_jvm
+
+        return parse_jvm(source, path, JVM_LANGUAGES[path.suffix], inventory=inventory, observe=observe)
     file = File(source, "rust" if path.suffix == ".rs" else "python", path, scan_root)
     if file.syntax.language == "python" and (errors := syntax_errors(file.syntax.root)):
         if observe is not None:

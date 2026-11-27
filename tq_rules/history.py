@@ -9,7 +9,7 @@ import tempfile
 import tokenize
 
 from . import repo
-from .ast_grep_languages import CALLBACK_SUFFIXES
+from .ast_grep_languages import EXTENDED_LANGUAGES
 from .source import scan_paths
 
 
@@ -88,7 +88,7 @@ class ChangedTests:
         self.untracked = repo.untracked(repository)
         self.changed = {
             new: (old, blob) for old, new, blob, _ in
-            repo.differences(repository, self.ref, renames=True) if source_path(new) or (parser is not None and new.suffix in CALLBACK_SUFFIXES)
+            repo.differences(repository, self.ref, renames=True) if source_path(new) or (parser is not None and new.suffix in EXTENDED_LANGUAGES)
         }
 
     def __call__(self, path, tests):
