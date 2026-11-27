@@ -40,13 +40,34 @@ class AstGrepDart(TqCase):
         # catches: accepting an unrelated await or an awaited list as completing a Future
         path = self.copy(FIXTURES / "dart" / "async_test.dart")
         self.assertEqual(self.locations(path.name),
-                         [(site, "guarded-assert") for site in (4, 6, 8, 10, 16, 18)])
+                         [(site, "guarded-assert") for site in (8, 10)])
 
     def test_recorder_control(self):
         # catches: accepting a different recorder or a conditional check as a positive control
         path = self.copy(FIXTURES / "dart" / "absence_test.dart")
         self.assertEqual(self.locations(path.name),
                          [(site, "absence-no-control") for site in (7, 21, 27, 37)])
+
+    def test_callbacks_across_helpers_and_scheduling(self):
+        # catches: skipping resolved wrapper bodies or counting unrelated completion
+        self.copy(FIXTURES / "dart" / "round_one_support.dart")
+        self.copy(FIXTURES / "dart" / "round_one_support.dart", "lib/support.dart")
+        self.write("pubspec.yaml", "name: dart_fixtures\n")
+        path = self.copy(FIXTURES / "dart" / "round_one_callbacks_test.dart")
+        self.assertEqual(self.locations(path.name), [(15, "no-assert"), (38, "no-assert"), (48, "no-assert")])
+
+    def test_fixed_inputs_and_value_equality(self):
+        # catches: confusing fixed input with product output or two calls with one value
+        path = self.copy(FIXTURES / "dart" / "round_one_loops_test.dart")
+        self.assertEqual(self.locations(path.name), [(25, "guarded-assert"), (30, "guarded-assert")])
+
+    def test_absence_controls_and_unproven_detectors(self):
+        # catches: accepting a witness for the wrong detector or a swallowed error
+        path = self.copy(FIXTURES / "dart" / "round_one_absence_test.dart")
+        self.assertEqual(self.locations(path.name), [
+            (31, "absence-no-control"), (57, "absence-no-control"),
+            (66, "absence-no-control"), (85, "absence-no-control"), (104, "absence-no-control"),
+        ])
 
     def test_comment_consumers(self):
         # catches: separating Dart's block comments or qualified names from the shared note consumers

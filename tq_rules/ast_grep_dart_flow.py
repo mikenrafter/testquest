@@ -4,10 +4,9 @@ from . import lint
 from .ast_grep import line, offset, query
 from .ast_grep_dart import CHANGING_COLLECTION, Check, collection_size, constant, expression_operator
 from .ast_grep_dart_syntax import (
-    CALLBACKS, COLLECTIONS, between, collection_entries, contents, final_call, identifier, kind,
-    named, names, signature, split, tokens, unwrap,
+    CALLBACKS, COLLECTIONS, between, call_arguments, collection_entries, contents, final_call, identifier, kind,
+    member, named, names, signature, split, tokens, unwrap,
 )
-from .ast_grep_lint import range_size
 
 
 NEXT, RETURN, BREAK, CONTINUE, THROW = 1, 2, 4, 8, 16
@@ -30,18 +29,8 @@ def as_tuple(node):
     return (node,) if node is not None else ()
 
 
-def future_returns(body):
-    if body is None:
-        return False
-    if any(child.kind() == "async" for child in tokens(body)):
-        return True
-    definition = body.prev()
-    if definition is not None and definition.kind() == "function_signature":
-        if any(child.kind() == "type_identifier" and child.text() in {"Future", "FutureOr"}
-               for child in contents(definition)):
-            return True
-    call = final_call(contents(body))
-    return call is not None and (call.method == "expectLater" or call.name[:1] == ("Future",))
+def is_async(body):
+    return any(child.kind() == "async" for child in tokens(body))
 
 
 def variable_definition(node):
@@ -83,28 +72,54 @@ def generic_future_callback(node):
     return None
 
 
+def fixed_duration(nodes):
+    nodes = unwrap(nodes)
+    if kind(nodes) == "const_object_expression":
+        parts = contents(nodes[0])
+        if len(parts) != 2 or identifier(parts[0]) != "Duration":
+            return False
+        _, units = call_arguments(parts[1])
+    elif (call := final_call(nodes)) is not None and call.name == ("Duration",):
+        units = call.keywords
+    else:
+        return False
+    values = [constant(amount) for amount in units.values()]
+    return bool(values) and all(type(value) is int and value >= 0 for value in values) and any(values)
+
+
 class Flow:
     def __init__(self, file, callback):
         self.file = file
         self.callback = callback
         self.checks = []
-        self.recorders = set()
+        self.writes = []
+        self.completions = {}
+        self.escaped_completers = set()
         self.active = set()
+        self.supplied = {}
+        self.reply_joined = True
+        self.sink = None
+        self.event = None
 
     def run(self):
         return self.body(self.callback, False, True)
 
     def body(self, callback, conditional, completed):
-        if callback is None or offset(callback) in self.active:
+        if callback is None or callback.key in self.active:
             return NEXT
-        if any(child.kind() in {"async*", "sync*"} for child in tokens(callback)):
+        body = callback.body
+        if any(child.kind() in {"async*", "sync*"} for child in tokens(body)):
             return NEXT
-        self.active.add(offset(callback))
-        block = next((child for child in contents(callback) if child.kind() == "block"), None)
-        result = (self.visit(block, conditional, completed=completed) if block is not None else
-                  self.expression(contents(callback), conditional, completed))
-        self.active.remove(offset(callback))
-        return result
+        self.active.add(callback.key)
+        outer = self.file, self.supplied, self.reply_joined
+        self.file, self.supplied, self.reply_joined = callback.file, callback.supplied, completed
+        try:
+            block = next((child for child in contents(body) if child.kind() == "block"), None)
+            return (self.visit(block, conditional) if block is not None else
+                    self.expression(contents(body), conditional, completed))
+        finally:
+            self.file, self.supplied, self.reply_joined = outer
+            self.active.remove(callback.key)
 
     def sequence(self, nodes, conditional, completed=False):
         remaining = NEXT
@@ -122,6 +137,7 @@ class Flow:
 
     def record(self, check, conditional, detached=False):
         check.guarded = conditional or detached
+        check.file = self.file
         self.checks.append(check)
         return NEXT if detached else 0
 
@@ -132,7 +148,9 @@ class Flow:
         if node_kind == "block":
             return self.sequence(contents(node), conditional)
         if node_kind in {"if_statement", "if_element"}:
-            condition = as_tuple(node.field("condition")) or named(between(tokens(node), "(", ")"))
+            condition = as_tuple(node.field("condition")) or named(between(tokens(node), "(", "case"))
+            if not any(child.kind() == "case" for child in tokens(node)):
+                condition = as_tuple(node.field("condition")) or named(between(tokens(node), "(", ")"))
             value = constant(condition)
             leading = self.expression(condition, conditional)
             first = self.visit(node.field("consequence"), conditional or value is not True,
@@ -155,7 +173,7 @@ class Flow:
         if node_kind == "switch_statement":
             return self.switch(node, conditional)
         if node_kind in EXITS:
-            result = self.expression(contents(node), conditional, completed=node_kind == "return_statement")
+            result = self.expression(contents(node), conditional, completed=node_kind == "return_statement" and self.reply_joined)
             return EXITS[node_kind] if result else 0
         if node_kind == "assertion":
             args = next((child for child in contents(node) if child.kind() == "assertion_arguments"), None)
@@ -163,7 +181,21 @@ class Flow:
             operator, left, right = expression_operator(condition)
             return self.record(Check(node, left, right, operator, condition, True), conditional)
         if node_kind == "await_expression":
-            return self.expression(contents(node), conditional, True)
+            target = contents(node)
+            outcome = self.expression(target, conditional, True)
+            path = names(target)
+            if path[-1:] == ("future",) and (key := self.completer(target[:-1])) is not None:
+                writers = self.completions.get(key, {})
+                if len(writers) == 1 and all(writers.values()) and key not in self.escaped_completers:
+                    return followed_by(outcome, self.record(Check(node), conditional))
+            return outcome
+        if node_kind == "assignment_expression":
+            assignment = next((child.kind() for child in tokens(node) if child.kind() in {"=", "??="}), None)
+            if assignment:
+                target = next(iter(contents(node)), None)
+                if (key := self.completer(contents(target))) is not None:
+                    self.escaped_completers.add(key)
+                return self.expression(named(between(tokens(node), assignment)), conditional or assignment == "??=")
         if node_kind in EXPRESSIONS:
             nodes = contents(node)
             if node_kind.startswith("initialized_"):
@@ -181,7 +213,8 @@ class Flow:
             right = self.expression(second, conditional or truth is not False, completed)
             return followed_by(leading, left if truth is True else right if truth is False else left | right)
         if callback := generic_future_callback(node):
-            result = self.body(callback, conditional or not completed, completed)
+            target = self.file.callback((callback.parent(),), self.supplied)
+            result = self.body(target, conditional or not completed, completed)
             return NEXT if not completed or result else 0
         operator, left, right = expression_operator((node,))
         if operator in {"&&", "||", "??"}:
@@ -203,6 +236,8 @@ class Flow:
         nodes = unwrap(nodes)
         if not nodes or kind(nodes) in CALLBACKS:
             return NEXT
+        if completed and len(nodes) == 2 and kind(nodes[:1]) == "list_literal" and member(nodes[1]) == "wait":
+            return self.join_list(nodes[0], conditional)
         call = final_call(nodes)
         if call is not None:
             return self.call(call, conditional, completed)
@@ -210,6 +245,12 @@ class Flow:
         for node in nodes:
             visited = self.visit(node, conditional or bool(outcome & ~NEXT), completed=completed)
             outcome = followed_by(outcome, visited)
+        return outcome
+
+    def join_list(self, node, conditional, completed=True):
+        outcome = NEXT
+        for item in collection_entries(node):
+            outcome = followed_by(outcome, self.expression(item, conditional, completed))
         return outcome
 
     def call(self, call, conditional, completed):
@@ -220,67 +261,168 @@ class Flow:
         guarded = conditional or optional
         chained = call.method in FUTURE_CHAINS and bool(call.receiver)
         out = self.expression(call.receiver, conditional, completed and chained)
-        for argument in (*call.args, *call.keywords.values()):
+        arguments = (*enumerate(call.args), *call.keywords.items())
+        for _, argument in arguments:
             arg = unwrap(argument)
             if call.name == ("Future", "wait") and kind(arg) == "list_literal":
-                for element in collection_entries(arg[0]):
-                    out = followed_by(out, self.expression(element, guarded, completed))
+                visited = self.join_list(arg[0], guarded, completed)
             else:
-                out = followed_by(out, self.expression(arg, guarded, completed and call.name == ("Future", "value")))
-            self.record_input(arg)
-        if call.method in CHANGING_COLLECTION and (key := self.file.recorder(call.receiver)) is not None:
-            self.recorders.add(key)
-        check = self.file.check(call)
-        if check is not None:
-            return followed_by(out, self.record(check, guarded, optional or method == "expectLater" and not completed))
+                visited = self.expression(arg, guarded, completed and call.name == ("Future", "value"))
+            out = followed_by(out, visited)
+            if (key := self.completer(arg)) is not None:
+                self.escaped_completers.add(key)
+        if call.method in CHANGING_COLLECTION:
+            self.write(call.receiver, call.node)
+        if call.method in {"complete", "completeError"} and (key := self.completer(call.receiver)) is not None:
+            self.complete(key, call.node, on_event=self.event is not None and call.method == "complete")
+        if (check := self.file.check(call)) is not None:
+            return followed_by(out, self.record(check, guarded, optional))
+        if any(self.is_unreachable(arg) for _, arg in arguments):
+            out = followed_by(out, self.record(Check(call.node), guarded, optional))
+
+        receiver = final_call(call.receiver)
+        fake_time = (self.file.library_name(call.name, "package:fake_async/") == "fakeAsync"
+                     or call.name == ("fakeAsync",) and not self.file.binding((call.node,))
+                     and not self.file.functions.get("fakeAsync")
+                     or call.method == "run" and receiver is not None and (
+                         self.file.library_name(receiver.name, "package:fake_async/") == "FakeAsync"
+                         or receiver.name == ("FakeAsync",) and not self.file.binding((receiver.node,))
+                         and not self.file.functions.get("FakeAsync")))
+        zone_method = (call.method if len(call.name) == 1 else
+                       self.file.library_name(call.name, "dart:async"))
+        zone = (zone_method in {"runZoned", "runZonedGuarded"}
+                or call.method == "runZoned"
+                and self.file.library_name(call.name[:-1], "dart:io") == "IOOverrides")
+        widget_async = call.method == "runAsync" and completed
+        if fake_time or zone or widget_async:
+            callback = self.file.callback(call.args[0], self.supplied) if call.args else None
+            joined = completed or callback is not None and not is_async(callback.body)
+            result = self.body(callback, guarded or not joined, completed)
+            if not result and joined and not optional:
+                out = followed_by(out, 0)
+            if zone_method == "runZonedGuarded" and len(call.args) > 1:
+                self.external_callback(call, 1, call.args[1])
+            return out
 
         if call.name in FUTURE_CONSTRUCTORS or chained or call.method in ITERATORS:
-            callback = next((candidate for arg in reversed((*call.args, *call.keywords.values()))
-                             if (candidate := self.file.callback(arg)) is not None), None)
+            callback = next((candidate for _, arg in reversed(arguments)
+                             if (candidate := self.file.callback(arg, self.supplied)) is not None), None)
             lazy = call.method in {"map", "where", "expand"}
             async_iterator = call.name == ("Future", "forEach")
             iterator = call.method in ITERATORS and not async_iterator
             bypass = (call.method in {"catchError", "timeout"} or optional or lazy
                       or iterator and not self.nonempty(call.receiver)
                       or async_iterator and not self.nonempty(call.args[0] if call.args else ()))
-            awaited = (completed if call.name in FUTURE_CONSTRUCTORS or chained else not future_returns(callback))
+            awaited = completed if call.name in FUTURE_CONSTRUCTORS or chained else (
+                callback is not None and not is_async(callback.body))
+            self.record_callback_inputs(call, arguments)
             result = self.body(callback, guarded or bypass or not awaited, awaited)
+            if (call.method == "timeout" and completed and not optional and "onTimeout" not in call.keywords
+                    and call.args and fixed_duration(call.args[0])):
+                return followed_by(out, self.record(Check(call.node), conditional))
             return followed_by(out, NEXT if bypass or not awaited or result else 0)
-        if call.name and len(call.name) == 1:
-            callback = self.file.callback((call.node,))
-            if callback is not None:
-                joined = completed or not future_returns(callback)
-                result = self.body(callback, guarded or not joined, joined)
-                return followed_by(out, NEXT if optional or not joined or result else 0)
-        for arg in (*call.args, *call.keywords.values()):
-            if kind(arg) == "function_expression":
-                callback = self.file.callback(arg)
-                self.body(callback, True, False)
+        if (callback := self.file.resolve_call(call, self.supplied)) is not None:
+            joined = completed or not is_async(callback.body)
+            result = self.body(callback, guarded or not joined, completed)
+            return followed_by(out, NEXT if optional or not joined or result else 0)
+        self.record_callback_inputs(call, arguments)
+        for slot, arg in arguments:
+            self.external_callback(call, slot, arg)
         if method and lint.helper(method) and (len(call.name) != 1 or not self.file.binding((call.node,))):
             return followed_by(out, self.record(Check(call.node), guarded, optional))
         return out
 
-    def record_input(self, nodes):
-        path = names(nodes)
-        if path and path[-1] in CHANGING_COLLECTION:
-            key = self.file.recorder(unwrap(nodes)[:-1])
-            if key is not None:
-                self.recorders.add(key)
+    def is_unreachable(self, nodes):
+        call = final_call(nodes)
+        path = call.name if call is not None else names(nodes)
+        if self.file.framework_name(path) != "unreachable":
+            return False
+        if (callback := self.file.callback(nodes, self.supplied)) is None:
+            return (not self.file.binding(unwrap(nodes))
+                    and self.file.resolve_name(unwrap(nodes), self.supplied, path=path) is None)
+        body = contents(callback.body)
+        if kind(body) == "block":
+            body = contents(body[0])
+            if kind(body) == "expression_statement":
+                body = contents(body[0])
+        failure = final_call(body)
+        return kind(body) in {"throw_statement", "throw_expression"} or (
+            failure is not None and callback.file.framework_name(failure.name) == "fail")
+
+    def completer(self, nodes):
+        if len(names(nodes)) != 1 or (binding := self.file.binding(nodes)) is None:
+            return None
+        if len(names(binding.initializer)) == 1:
+            return self.completer(binding.initializer) if binding.final else None
+        initializer = final_call(binding.initializer)
+        if initializer is not None and initializer.name in {("Completer",), ("Completer", "sync")}:
+            return self.file, offset(binding.node)
+        return None
+
+    def complete(self, key, node, *, on_event):
+        writers = self.completions.setdefault(key, {})
+        site = self.file, offset(node)
+        writers[site] = writers.get(site, True) and on_event
+
+    def is_event_callback(self, call, slot):
+        return call.method == "listen" or isinstance(slot, str) and slot.startswith("on") and slot[2:3].isupper()
+
+    def external_callback(self, call, slot, nodes):
+        if kind(unwrap(nodes)) != "function_expression" and call.method != "listen":
+            return
+        callback = self.file.callback(nodes, self.supplied)
+        if callback is None:
+            return
+        outer = self.sink, self.event
+        self.sink = self.sink_for(call, slot)
+        self.event = (self.file, offset(call.node), slot) if self.is_event_callback(call, slot) else None
+        if call.method == "listen" and slot != "onError" and (handler := call.keywords.get("onError")):
+            error_callback = self.file.callback(handler, self.supplied)
+            if error_callback is not None and kind(body := contents(error_callback.body)) == "block" and not contents(body[0]):
+                self.sink = ()
+        self.body(callback, True, False)
+        self.sink, self.event = outer
+
+    def sink_for(self, call, slot):
+        if not call.receiver:
+            return (call.name, slot) if isinstance(slot, str) else ()
+        receiver = names(call.receiver)
+        binding = self.file.binding(call.receiver)
+        initializer = final_call(binding.initializer) if binding else None
+        if receiver and initializer is not None and initializer.name:
+            receiver = (*initializer.name, *receiver[1:])
+        return (receiver, call.method, slot) if receiver else ()
+
+    def record_callback_inputs(self, call, arguments):
+        for slot, nodes in arguments:
+            path = names(nodes)
+            if path and path[-1] in CHANGING_COLLECTION:
+                self.write(unwrap(nodes)[:-1], call.node, self.sink_for(call, slot))
+            if path[-1:] == ("complete",) and (key := self.completer(unwrap(nodes)[:-1])) is not None:
+                self.complete(key, nodes[0], on_event=self.is_event_callback(call, slot))
+
+    def write(self, nodes, site, sink=None):
+        if (key := self.file.recorder(nodes)) is not None:
+            self.writes.append((self.file, key, site, self.sink if sink is None else sink))
 
     def nonempty(self, nodes):
         nodes = unwrap(nodes)
-        if size := collection_size(nodes):
-            return size > 0
+        if collection_size(nodes):
+            return True
+        path = names(nodes)
+        if path[-1:] == ("values",) and self.file.is_enum(path[:-1], nodes[0]):
+            return True
+        if nodes and member(nodes[-1]) in {"entries", "values", "keys"}:
+            nodes = unwrap(nodes[:-1])
+            path = names(nodes)
+            if kind(nodes) == "set_or_map_literal":
+                return bool(collection_size(nodes))
         binding = self.file.binding(nodes)
-        if binding and binding.final and len(names(nodes)) == 1 and collection_size(binding.initializer):
-            declaration = binding.node.parent()
-            statement = declaration.parent()
-            following = statement.next()
-            return following is not None and any(offset(parent) == offset(following)
-                                                  for parent in nodes[0].ancestors())
+        if binding and binding.final and len(path) == 1 and collection_size(binding.initializer):
+            return binding.const or self.file.unchanged(binding)
         call = final_call(nodes)
         if call and call.name in {("Iterable", "generate"), ("List", "filled"), ("List", "generate")} and call.args:
-            count = constant(call.args[0])
+            count = self.file.fixed_number(call.args[0])
             return type(count) is int and count > 0
         return False
 
@@ -319,17 +461,12 @@ class Flow:
         definition = variable_definition(initial)
         if definition is None:
             return False
-        first = constant(named(between(tokens(definition), "=", ",")))
+        first = self.file.fixed_number(named(between(tokens(definition), "=", ",")))
         operator, left, right = expression_operator(condition)
-        bound = constant(right)
-        name = declared_name(definition)
-        if names(left) != (name,) or type(first) is not int or type(bound) is not int:
+        bound = self.file.fixed_number(right)
+        if names(left) != (declared_name(definition),) or type(first) not in {int, float} or type(bound) not in {int, float}:
             return False
-        if operator in {"<", "<="}:
-            return bool(range_size(first, bound + (operator == "<=")))
-        if operator in {">", ">="}:
-            return bool(range_size(first, bound - (operator == ">="), -1))
-        return False
+        return {"<": first < bound, "<=": first <= bound, ">": first > bound, ">=": first >= bound}.get(operator, False)
 
     def switch(self, node, conditional):
         leading = self.visit(node.field("condition"), conditional)
@@ -357,13 +494,16 @@ class Flow:
             return first is not None and first == second
         has_call = any(final_call(nodes) is not None or any(query(node, "argument_part") for node in nodes)
                        for nodes in (check.actual, check.expected))
-        if not has_call or check.operator == "!=":
+        if not has_call:
+            return not (check.predicate and check.operator == "==" and self.file.overloads_equality(check.actual, test_name))
+        if check.operator == "!=":
             return True
         site = line(check.node)
         near = " ".join(notes.get(position, "") for position in (site - 1, site))
         if any(lint.describes_distinct_inputs(text) for text in (test_name, near)):
             return True
-        if any(lint.suggests_repeatability(text) for text in (test_name, near)):
+        if (any(lint.suggests_repeatability(text) for text in (test_name, near))
+                or check.operator == "==" and self.file.builds_value(check.actual)):
             return False
         subject = signature(check.actual)
         for other in self.checks:
