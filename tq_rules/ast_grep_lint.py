@@ -93,18 +93,20 @@ def literal(syntax, node):
     return UNKNOWN
 
 
-def tri_truth(syntax, node):
+def tri_truth(syntax, node, known=None):
     node = unwrap(node)
     value = literal(syntax, node)
+    if value is UNKNOWN and known is not None:
+        value = known(node)
     if type(value) is bool or syntax.language == "python" and value is not UNKNOWN:
         return bool(value)
     negated = opposite(node)
     if negated is not None:
-        result = tri_truth(syntax, negated)
+        result = tri_truth(syntax, negated, known)
         return UNKNOWN if result is UNKNOWN else not result
     operator, left, right = split_operands(node)
     if operator in {"&&", "||", "and", "or"}:
-        first, second = (tri_truth(syntax, child) for child in (left, right))
+        first, second = (tri_truth(syntax, child, known) for child in (left, right))
         decisive = operator in {"||", "or"}
         if decisive in (first, second):
             return decisive
@@ -112,6 +114,9 @@ def tri_truth(syntax, node):
             return not decisive
     if operator in {"==", "!="}:
         first, second = (literal(syntax, child) for child in (left, right))
+        if known is not None:
+            first = known(left) if first is UNKNOWN else first
+            second = known(right) if second is UNKNOWN else second
         if UNKNOWN not in (first, second):
             return (first == second) == (operator == "==")
     return UNKNOWN
@@ -134,12 +139,15 @@ class Check:
     def location(self):
         return self.syntax.absolute(self.source)
 
-    def truth(self):
+    def truth(self, known=None):
         if self.predicate is not None:
-            value = tri_truth(self.syntax, self.predicate)
+            value = tri_truth(self.syntax, self.predicate, known)
             return not value if self.kind == "assertFalse" and value is not UNKNOWN else value
         if self.operator in {"==", "!="}:
             first, second = (literal(self.syntax, child) for child in (self.left, self.right))
+            if known is not None:
+                first = known(self.left) if first is UNKNOWN else first
+                second = known(self.right) if second is UNKNOWN else second
             if UNKNOWN not in (first, second):
                 return (first == second) == (self.operator == "==")
         return UNKNOWN
@@ -235,6 +243,7 @@ class Flow:
         self.checked_collections = {}
         self.vector_collections = set()
         self.active_closures = set()
+        self.reaching_facts = None
 
     def record(self, check):
         self.checks.append(check)
@@ -478,6 +487,10 @@ class Flow:
         name = parts(node)
         if not name or name in seen:
             return None
+        if self.reaching_facts is not None and len(name) == 1:
+            joined, minimum = self.reaching_facts.path_minimum(name[0], before)
+            if joined:
+                return None if exact else minimum
         entries = self.bindings.get(name, ())
         if not entries and name in self.loop_values:
             sizes = [self.size(item, before=before, exact=exact, seen=seen | {name})
@@ -691,6 +704,15 @@ class Flow:
         before = len(self.checks)
         condition = node.field("condition")
         primary = self.visit(condition)
+        if self.reaching_facts is not None and tri_truth(self.syntax, condition) is UNKNOWN:
+            site = self.syntax.absolute(node)
+            decision = tri_truth(self.syntax, condition, lambda value: self.reaching_facts.branch_boolean(value, site))
+            if decision is True:
+                proved = self.isolated(node.field("consequence"))
+                for arm in children(node):
+                    if arm.kind() in {"elif_clause", "else_clause"}:
+                        self.conditional(arm)
+                return primary or proved
         if witness := self.branch_witness(condition):
             name, value = witness
             domains = self.loop_ranges
@@ -907,8 +929,12 @@ class Flow:
             condition = node.field("condition")
             evaluated = self.visit(iterator) if iterator is not None else self.visit(condition)
             size = self.size(iterator)
+            known_boolean = None
+            if self.reaching_facts is not None:
+                site = self.syntax.absolute(node)
+                known_boolean = lambda value: self.reaching_facts.branch_boolean(value, site)
             runs = (size is not None and size > 0 and not any(child.kind() == "async" for child in node.children())
-                    or condition is not None and tri_truth(self.syntax, condition) is True
+                    or condition is not None and tri_truth(self.syntax, condition, known_boolean) is True
                     or kind == "loop_expression")
             runs |= self.while_has_work(condition)
             if self.syntax.language == "rust" and condition is not None and condition.kind() == "let_condition":
@@ -2187,6 +2213,8 @@ def no_crash_test(flow, test, comments, missing):
 
 
 def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
+    from .ast_grep_catches import swallowed_assertions
+    from .ast_grep_origins import ReachingFacts, different_python_products, same_product, stage_helpers
     from . import ast_grep_literals as literals
     from .ast_grep_languages import ECMASCRIPT_LANGUAGES, JVM_LANGUAGES
 
@@ -2226,7 +2254,15 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
             while test.end + 1 in trailing:
                 test.end += 1
         flow = Flow(file, syntax, body_of(fn), tuple(test.qualified.split("::")), initial)
+        kinds = ("call", "assert_statement") if syntax.language == "python" else flow.call_kinds
+        sites = query(flow.body, *kinds)
+        flow.reaching_facts = ReachingFacts(
+            syntax, flow.body, literal, helper=stage_helpers(file, flow.scope),
+            captures=(syntax.absolute(site) for site in sites),
+        )
         guaranteed = flow.visit(flow.body)
+        test.issues.extend((site, "swallowed-assertion") for site in
+                           swallowed_assertions(flow.body, syntax.language, (check.source for check in flow.checks)))
         should_panic = ("should_panic",) in attrs
         ignored = ("ignore",) in attrs
         ignored_diagnostic = ignored and any(
@@ -2244,10 +2280,20 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
             lint.record_completion(test, missing, no_crash_test(flow, test, comments, missing))
         for check in flow.checks:
             check_line = file.line_at(check.location)
-            if check.truth() is True:
+            if check.truth(lambda node: flow.reaching_facts.branch_boolean(node, check.location)) is True:
                 test.issues.append((check_line, "const-truth"))
-            if flow.compares_itself(check, test.name, line_comments):
+            compares_itself = flow.compares_itself(check, test.name, line_comments)
+            if check.operator == "==" and not compares_itself and (
+                same_product(flow.reaching_facts, check)
+                or syntax.language == "python" and different_python_products(file, flow, check)
+            ):
+                test.issues.append((check_line, "self-derived-expected"))
+            if compares_itself:
                 test.issues.append((check_line, "self-compare"))
+        if file.syntax.language == "rust":
+            from .ast_grep_rust_oracles import Oracles
+
+            test.issues.extend((file.line_at(site), "self-derived-expected") for site in Oracles(file, flow).issues())
         if not ignored:
             control_helpers.update(target for _, call in flow.calls if not call.macro
                                    and (target := file.resolve_function(call.name, flow.scope)) is not None)

@@ -1,0 +1,10 @@
+import java.util.function.BiConsumer;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+class MethodReferenceTest {
+    @Test void alias() {
+        BiConsumer<Integer, Integer> compare = Assertions::assertEquals;
+        compare.accept(3, parser.decode("3"));
+    }
+}

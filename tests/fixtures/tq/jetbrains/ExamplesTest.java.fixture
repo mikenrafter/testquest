@@ -1,0 +1,65 @@
+import org.junit.jupiter.api.Test;
+import org.assertj.core.api.SoftAssertions;
+import static org.junit.jupiter.api.Assertions.*;
+
+class ExamplesTest {
+    @Test void diagnosedSwallow() { // guarded-assert
+        try {
+            fail("the operation succeeded"); // swallowed-assertion
+        } catch (AssertionError | IllegalArgumentException ignored) { }
+    }
+
+    @Test void catchRethrows() {
+        try {
+            assertEquals(3, parse("3"));
+        } catch (Throwable error) {
+            throw error;
+        }
+    }
+
+    @Test void aggregate() {
+        assertAll("decoded fields", () -> assertEquals(3, parse("3")));
+    }
+
+    @Test void soft() {
+        SoftAssertions.assertSoftly(softly -> softly.assertThat(parse("3")).isEqualTo(3));
+    }
+
+    @Test void softCollector() {
+        SoftAssertions collector = new SoftAssertions();
+        collector.assertThat(parse("3")).isEqualTo(3);
+        collector.assertAll();
+    }
+
+    @Test void reversedOverload() {
+        int observed = parse("3");
+        assertEquals(observed, 3, "decoded count"); // misordered-expected
+        assertEquals(3, observed, "decoded count");
+    }
+
+    @Test void independentFixtureCall() {
+        assertEquals(expectedValue(), 3);
+    }
+
+    @Test void junitFourMessage() {
+        org.junit.Assert.assertEquals(message(), 3, parse("3"));
+    }
+
+    @Test void directReversal() {
+        assertEquals(parse("3"), 3); // misordered-expected
+    }
+
+    @Test void handlerChecksFailure() {
+        try {
+            assertEquals(3, parse("3"));
+        } catch (AssertionError failure) {
+            fail("decode failed");
+        }
+    }
+
+    private String message() { return "decoded count"; }
+
+    private int expectedValue() { return 3; }
+
+    private int parse(String input) { return Integer.parseInt(input); }
+}

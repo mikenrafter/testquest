@@ -1,0 +1,82 @@
+#[test]
+fn catches_panics() {
+    let failure = std::panic::catch_unwind(|| {
+        assert_eq!(decode("3"), 3);
+    });
+    assert!(failure.is_err());
+}
+
+#[test]
+fn uses_same_report() {
+    let report = product::decode("3");
+    let alias = &report;
+    assert_eq!(alias.observed, report.expected); // self-derived-expected
+}
+
+#[test]
+fn path_agreement() {
+    let ready;
+    if flag() {
+        ready = true;
+    } else {
+        ready = true;
+    }
+    assert!(ready); // const-truth
+}
+
+#[test]
+fn filled_on_both_paths() {
+    let mut rows = vec![];
+    if flag() {
+        rows.push(5);
+    } else {
+        rows.push(9);
+    }
+    for row in rows {
+        assert!(valid(row));
+    }
+}
+
+fn fixture_key(path: &str) -> String {
+    format!("cache/{path}")
+}
+
+fn persist(key: String, bytes: &[u8]) -> Result<String, std::io::Error> {
+    std::fs::write(&key, bytes)?;
+    Ok(key)
+}
+
+fn write_entry(path: &str) -> Result<String, std::io::Error> {
+    persist(fixture_key(path), b"hello")
+}
+
+#[test]
+fn path_is_expected_location() {
+    let actual = write_entry("3").unwrap();
+    assert_eq!(actual, fixture_key("3")); // self-derived-expected
+}
+
+#[test]
+fn empty_implementations_match() {
+    assert_eq!(one::count(&[]), two::count(&[])); // self-derived-expected
+    assert_eq!(one::count(&[2]), two::count(&[2]));
+}
+
+#[test]
+fn snapshot_before_mutation() {
+    let mut report = product::decode("3");
+    let before = report.count;
+    product::reset(&mut report);
+    assert_eq!(report.count, before);
+}
+
+#[test]
+fn previously_proved_fixed_growth() {
+    let mut cases = Vec::new();
+    for size in [4, 7] {
+        cases.extend([(size, size + 1)]);
+    }
+    for (input, expected) in cases {
+        assert_eq!(product::next(input), expected);
+    }
+}

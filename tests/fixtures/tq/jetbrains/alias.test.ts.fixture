@@ -1,0 +1,6 @@
+import { expect, test } from 'vitest';
+
+test('alias', () => {
+  const check = expect;
+  check(parser.decode('3')).toBe(3);
+});

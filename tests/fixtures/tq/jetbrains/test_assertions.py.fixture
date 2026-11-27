@@ -1,0 +1,150 @@
+from unittest import TestCase
+import service
+from service import analyze
+
+
+def test_masked():
+    try:
+        assert analyze("3").count == 3  # swallowed-assertion
+    except (ValueError, AssertionError):
+        pass
+
+
+def test_first_matching_handler():
+    try:
+        assert analyze("3").count == 3
+    except AssertionError:
+        raise
+    except Exception:
+        pass
+
+
+def test_nonterminal():
+    try:
+        assert analyze("3").count == 3
+        do_more()
+    except:
+        pass
+
+
+def left(report):
+    return report.rows
+
+
+def test_same_invocation():
+    report = analyze("3")
+    alias = report
+    assert left(alias) == report.expected_rows  # self-derived-expected
+
+
+def test_reassigned():
+    report = analyze("3")
+    alias = report
+    if other():
+        alias = fixture()
+    assert left(alias) == report.expected_rows
+
+
+def test_agree(flag):
+    rows = []
+    if flag:
+        ready = True
+        rows.append("3")
+    else:
+        ready = True
+        rows.append("4")
+    assert ready  # const-truth
+    for row in rows:
+        assert analyze(row).count > 0
+
+
+def test_growth(flag):
+    rows = []
+    if flag:
+        rows.append("3")
+    else:
+        rows.append("4")
+    for row in rows:
+        assert analyze(row).count > 0
+
+
+def test_disagree(flag):
+    rows = []
+    if flag:
+        ready = False
+        rows.append("3")
+    else:
+        ready = True
+    assert ready
+
+
+def test_may_be_empty(flag):  # guarded-assert
+    rows = []
+    if flag:
+        rows.append("3")
+    for row in rows:
+        assert analyze(row).count > 0
+
+
+class Examples(TestCase):
+    def test_subtests(self):
+        with self.subTest(field="rows"):
+            self.assertEqual(analyze("3").count, 3)
+
+    def test_fail_in_handler(self):
+        try:
+            self.assertEqual(analyze("3").count, 3)
+        except:
+            self.fail("count regression")
+
+def test_empty_after_alias_write(flag):  # guarded-assert
+    rows = []
+    if flag:
+        rows.append("3")
+    else:
+        rows.append("4")
+    alias = rows
+    alias.clear()
+    for row in rows:
+        assert analyze(row).count > 0
+
+
+def test_agree_before_if(flag):
+    if flag:
+        ready = True
+    else:
+        ready = True
+    if ready:
+        assert analyze("3").count == 3
+
+
+def test_operand_from_same_module():
+    assert service.decode("3") == service.oracle("3")  # self-derived-expected
+
+
+def test_bare_assertion_failure():
+    try:
+        assert analyze("3").count == 3  # swallowed-assertion
+    except:
+        logger.debug("decode failed")
+
+def test_handler_can_run_before_assignment(flag):
+    ready = False
+    try:
+        analyze("bad")
+        if flag:
+            ready = True
+        else:
+            ready = True
+    except Exception:
+        assert ready
+
+
+def test_loop_can_rebind_the_proven_boolean(flag):
+    if flag:
+        ready = True
+    else:
+        ready = True
+    for ready in read_actual_statuses():
+        assert parse_status(ready)
+    assert ready

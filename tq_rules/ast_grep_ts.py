@@ -976,6 +976,7 @@ def no_crash_test(flow, test, notes):
 
 
 def parse(source, path, language, *, scan_root=None, inventory=False, observe=None):
+    from .ast_grep_catches import swallowed_assertions
     from .ast_grep_ts_flow import Flow
 
     syntax = Syntax.parse(source, language)
@@ -995,6 +996,8 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
             continue
         flow = Flow(file, callback, parameters(callback))
         incomplete = flow.visit(body)
+        test.issues.extend((site, "swallowed-assertion") for site in
+                           swallowed_assertions(body, language, (check.node for check in flow.checks)))
         micro_snapshot(file, test, flow.checks)
         test.checks = len(flow.checks)
         lint.record_completion(test, not flow.checks, no_crash_test(flow, test, notes))

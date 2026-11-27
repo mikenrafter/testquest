@@ -21,12 +21,14 @@ RULES = {
     "invalid-suppression",
     "micro-snapshot",
     "missing-witness",
+    "misordered-expected",
     "no-assert",
     "no-crash",
     "nondistinguishing-literal",
     "parse-error",
     "self-compare",
     "self-derived-expected",
+    "swallowed-assertion",
     "too-deep",
 }
 

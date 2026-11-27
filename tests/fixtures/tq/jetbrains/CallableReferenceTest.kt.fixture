@@ -1,0 +1,9 @@
+import kotlin.test.Test
+import kotlin.test.assertEquals as equal
+
+class CallableReferenceTest {
+    @Test fun alias() {
+        val verify = ::equal
+        verify(3, parser.decode("3"))
+    }
+}

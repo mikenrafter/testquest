@@ -175,7 +175,8 @@ class RustTestShapes(contract.TqCase):
 
 
 class AdvisoryRules(contract.TqCase):
-    ADVISORY = {"micro-snapshot", "no-crash", "nondistinguishing-literal", "self-derived-expected"}
+    ADVISORY = {"micro-snapshot", "misordered-expected", "no-crash", "nondistinguishing-literal",
+                "self-derived-expected", "swallowed-assertion"}
 
     def test_equal_positionals_fire_but_keyword_pairs_do_not(self):
         # WHY: equal positional values hide a swap of parameters; named arguments fix which is which.
