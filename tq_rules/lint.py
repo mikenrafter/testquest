@@ -326,34 +326,6 @@ def apply_suppressions(rows, allows):
                 break
 
 
-def micro_snapshot(test, fragments, whole, *, key, display):
-    """Record the first group of three or more literal checks lacking whole-output coverage.
-
-    Fragments pair source sites with subjects. A site starts with line and
-    column and can include the original span of a check that shares that start.
-    A source assertion can appear more than once in the flow, so count sites once.
-    Whole-output checks provide their subject expressions separately.
-    """
-    groups = {}
-    for site, subject in fragments:
-        sites = groups.setdefault(key(subject), {})
-        sites[site] = subject
-    candidates = {subject: sites for subject, sites in groups.items() if len(sites) >= 3}
-    if not candidates:
-        return
-    covered = {key(subject) for subject in whole}
-    uncovered = (sites for subject, sites in candidates.items() if subject not in covered)
-    sites = min(uncovered, key=min, default=None)
-    if sites is not None:
-        site = min(sites)
-        issue = (site[0], "micro-snapshot")
-        test.issues.append(issue)
-        if test.issue_messages is None:
-            test.issue_messages = {}
-        subject = " ".join(part.strip() for part in display(sites[site]).splitlines())
-        test.issue_messages[issue] = f"{len(sites)} substring checks on {subject} pin only parts of the output."
-
-
 def find(paths, *, select=None, owners=None, parser=None):
     """Scan with one parser and keep suppressed matches alongside visible findings.
 

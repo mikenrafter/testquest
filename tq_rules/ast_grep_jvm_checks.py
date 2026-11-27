@@ -181,6 +181,8 @@ class Check:
     observations: tuple = ()
     fragment_subject: object = None
     snapshot_subject: object = None
+    fragment_needle: object = None
+    fragment_negative: bool = False
 
     def constant(self, syntax):
         if self.predicate is not None:
@@ -356,6 +358,8 @@ def hamcrest_check(file, node, subject, matcher):
     if inverse and method in {"equalTo", "isEmpty", "empty", "emptyIterable"}:
         method = "notEqualTo" if method == "equalTo" else "isNotEmpty"
     check = equality(node, method, subject, expected)
+    if inverse and method == "contains":
+        check.fragment_negative = True
     return collect_observations(file, check, method, subject, expected)
 
 
@@ -414,6 +418,8 @@ def string_needle(node):
 def collect_observations(file, check, method="", subject=None, expected=None):
     if method in {"contains", "doesNotContain", "shouldContain", "shouldNotContain"} and string_needle(expected):
         check.fragment_subject = unwrap(subject)
+        check.fragment_needle = expected
+        check.fragment_negative |= check.negated or method in {"doesNotContain", "shouldNotContain"}
 
     def observe(receiver, present):
         if (target := file.collection_recorder(receiver)) is not None:
@@ -435,6 +441,8 @@ def collect_observations(file, check, method="", subject=None, expected=None):
         if (call := call_of(opposite or tested)) is not None and call.receiver is not None:
             if call.method == "contains" and len(call.args) == 1 and string_needle(call.args[0]):
                 check.fragment_subject = unwrap(call.receiver)
+                check.fragment_needle = call.args[0]
+                check.fragment_negative = check.negated != (opposite is not None)
             positive = (not check.negated) != (opposite is not None)
             if call.method in {"isEmpty", "isNotEmpty"} and not call.args:
                 return observe(call.receiver, positive == (call.method == "isNotEmpty"))

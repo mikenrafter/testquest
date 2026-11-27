@@ -10,14 +10,14 @@ class MicroSnapshot {
     void whole() {
         assertThat(out).contains("alpha", "beta");
         assertThat(out).contains("end");
-        assertThat(out).doesNotContain("gamma");
+        assertThat(out).contains("gamma");
         assertThat(out).isEqualTo(expected);
     }
 
     @Test
     void chained() {
         assertThat(response.text()).contains("alpha")
-            .doesNotContain("beta")
+            .contains("beta")
             .contains("gamma");
     }
 }

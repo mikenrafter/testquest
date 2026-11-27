@@ -562,36 +562,11 @@ class File:
         return None, None
 
 
-def string_needle(nodes):
-    nodes = unwrap(nodes)
-    return kind(nodes) == "string_literal" and nodes[0].find(kind="template_substitution") is None
-
-
-def subject_text(nodes):
-    return "".join(node.text() for node in nodes)
-
-
-def micro_snapshot(file, test, checks):
-    fragments = []
-    whole = []
-    for check in checks:
-        matcher, args = check.matcher, check.matcher_args
-        if matcher == "isNot" and args:
-            nested = final_call(args[0])
-            if nested:
-                matcher, args = file.framework_name(nested.name), nested.args
-        if matcher == "contains" and args and string_needle(args[0]):
-            fragments.append((location(check.node), check.actual))
-        elif check.operator in {"==", "is"} and matcher != "contains":
-            whole.extend((check.actual, check.expected))
-        elif matcher in {"matchesGoldenFile", "matchesReferenceImage"} and check.matcher == matcher:
-            whole.append(check.actual)
-    lint.micro_snapshot(test, fragments, whole, key=signature, display=subject_text)
-
-
 def parse(source, path, *, inventory=False, observe=None):
     from .ast_grep_dart_absence import Absence
     from .ast_grep_dart_flow import Flow
+
+    from .ast_grep_dart_micro import micro_snapshot
 
     register_grammar()
     syntax = Syntax.parse(source, "dart")

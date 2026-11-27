@@ -659,6 +659,8 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
     from .ast_grep_jvm_checks import compares_itself
     from .ast_grep_jvm_flow import Flow, merge
 
+    from .ast_grep_jvm_micro import micro_snapshot
+
     syntax = parse_syntax(source, language)
     resolved = path.resolve()
     file = File(syntax, resolved, project_root(resolved, scan_root, MODULE_MARKERS))
@@ -682,12 +684,7 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
             if recorder.shared is not None:
                 shared_controls.add((channel, recorder.shared))
         checks = list(flow.checks.values())
-        fragments = (((*location(check.node), *origin[1:]), check.fragment_subject)
-                     for (_, origin), check in flow.checks.items() if check.fragment_subject is not None)
-        whole = (subject for check in checks
-                 for subject in ((check.left, check.right) if check.operator == "==" else (check.snapshot_subject,))
-                 if subject is not None)
-        lint.micro_snapshot(test, fragments, whole, key=shape, display=text)
+        micro_snapshot(file, test, flow.checks)
         test.checks = len(checks) + int(expected_exception)
         if not test.checks and not flow.opaque_check:
             test.issues.append((test.line, "no-assert"))

@@ -160,11 +160,16 @@ def test_parse_port():
 
 ### `micro-snapshot`
 
-**Advisory, ast-grep engine.** Reports the first group of three or more literal
-substring checks on the same expression in a test. Positive and negative
-checks count together. Variable needles are ignored. A whole-output equality
-check or a recognized golden or snapshot of the same expression exempts that
-group.
+**Advisory, ast-grep engine.** Reports the first group of three or more positive
+literal substring checks on one output. Reassignment, separate branches and
+calls separated by an intervening action can establish separate observations.
+Recognized collection membership, diagnostics and source scans are excluded.
+Whole equality, a golden or a snapshot covers the output it compares.
+
+A short diff or hook response can qualify when a negative check also describes
+the complete output. A joined Python report can qualify with two substring
+checks and a count over the same lines. In Rust, a fragment can qualify when it
+already occurs in fixture text written to the file the test later reads.
 
 **Rework.** Compare the complete text to one golden reviewed by a person when
 the whole text is the contract. When only a property matters, assert it over

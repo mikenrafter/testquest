@@ -5,8 +5,9 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import PurePosixPath
 
-from . import lint
+from . import ast_grep_micro as micro, lint
 from .ast_grep import Syntax, children, line, location, offset, opposite, query, shape, split_operands, syntax_errors, text, unwrap
+from .ast_grep_languages import ECMASCRIPT_LANGUAGES
 from .source import Comment, Test
 
 
@@ -242,8 +243,12 @@ class Registration:
 
 
 class File:
-    def __init__(self, syntax):
+    def __init__(self, syntax, path, scan_root):
         self.syntax = syntax
+        self.path = path
+        self.scan_root = scan_root
+        self.local_imports = {}
+        self.imported_returns = {}
         self.imports = {}
         self.imported_helpers = {}
         self.namespace_imports = set()
@@ -286,8 +291,9 @@ class File:
                                                   if child.kind() == "namespace_import" and children(child))
                     for specifier in query(clause, "import_specifier"):
                         original = name(specifier.field("name"))
-                        helper_module = PurePosixPath(source).stem
                         local = name(specifier.field("alias")) or original
+                        self.local_imports[local] = source, original
+                        helper_module = PurePosixPath(source).stem
                         if helper_module == "must" and original in {"must", "mustFail"}:
                             self.imported_helpers[local] = "result helper"
                         elif lint.helper(original):
@@ -371,6 +377,40 @@ class File:
             if candidate is not None and candidate.kind() in FUNCTIONS:
                 return candidate
         return None
+
+    def imported_return_type(self, node):
+        key = name(node)
+        if key not in self.local_imports or self.binding(node) is not None or self.scan_root is None:
+            return None
+        source, exported = self.local_imports[key]
+        target = self.path.parent / source
+        if source not in self.imported_returns:
+            self.imported_returns[source] = self.read_return_types(target)
+        return self.imported_returns[source].get(exported)
+
+    def read_return_types(self, target):
+        candidates = [target]
+        if target.suffix in {".js", ".jsx"}:
+            candidates.extend(target.with_suffix(suffix) for suffix in (".ts", ".tsx"))
+        if not target.suffix:
+            candidates.extend(target.with_suffix(suffix) for suffix in (".ts", ".tsx"))
+            candidates.extend(target / filename for filename in ("index.ts", "index.tsx"))
+        for candidate in candidates:
+            language = ECMASCRIPT_LANGUAGES.get(candidate.suffix)
+            if not language:
+                continue
+            try:
+                candidate = candidate.resolve()
+                if not candidate.is_relative_to(self.scan_root.resolve()) or not candidate.is_file():
+                    continue
+                source = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            syntax = Syntax.parse(source, language)
+            return {name(declaration.field("name")): declaration.field("return_type")
+                    for entry in children(syntax.root) if entry.kind() == "export_statement"
+                    for declaration in children(entry) if declaration.kind() == "function_declaration"}
+        return {}
 
     def destructuring(self, node):
         use = offset(node)
@@ -807,28 +847,102 @@ def string_needle(node):
     )
 
 
-def micro_snapshot(test, checks):
+def collection_type(annotation):
+    if annotation is None:
+        return False
+    kind = annotation.kind()
+    if kind in {"array_type", "tuple_type"}:
+        return True
+    if kind in {"type_annotation", "readonly_type", "parenthesized_type"}:
+        return any(collection_type(child) for child in children(annotation))
+    if kind == "generic_type":
+        return text(annotation.field("name")) in {"Array", "ReadonlyArray", "Set", "ReadonlySet", "Map", "ReadonlyMap"}
+    return False
+
+
+def membership_collection(file, node):
+    binding = file.binding(node)
+    if binding is not None and collection_type(binding.field("type")):
+        return True
+    value = expression(binding.field("value")) if binding is not None and binding.kind() == "variable_declarator" else node
+    if value is not None and value.kind() == "call_expression":
+        callee = value.field("function")
+        helper = file.helper(callee)
+        annotation = helper.field("return_type") if helper is not None else file.imported_return_type(callee)
+        if collection_type(annotation):
+            return True
+    fixed, _ = file.fixed(node)
+    if fixed is None:
+        return False
+    if fixed.kind() == "array":
+        return True
+    if fixed.kind() == "new_expression":
+        constructor = fixed.field("constructor")
+        return name(constructor) in {"Array", "Set", "Map"} and file.binding(constructor) is None
+    if fixed.kind() != "call_expression":
+        return False
+    receiver, methods = chain(fixed.field("function"))
+    return (name(receiver) in {"Array", "Object"} and methods in {
+                ("from",), ("keys",), ("values",), ("entries",),
+            } or methods[-1:] in {("split",), ("map",), ("flatMap",), ("filter",)})
+
+
+def string_fixture(file, node):
+    node = expression(node)
+    while (binding := file.binding(node)) is not None and binding.kind() == "variable_declarator":
+        if not const_declaration(binding) or not file.fixture_unchanged(node, binding):
+            return None
+        node = expression(binding.field("value"))
+    return node if string_needle(node) else None
+
+
+def constant_membership(file, check):
+    if check.method not in {"toContain", "toMatch"} or not string_needle(check.expected):
+        return False
+    haystack, needle = literal(string_fixture(file, check.actual)), literal(check.expected)
+    return isinstance(haystack, str) and isinstance(needle, str) and (needle in haystack) != check.negated
+
+
+def micro_snapshot(file, test, checks):
+    reads = micro.Reads(check.node for check in checks)
     fragments = []
     whole = []
+
+    def key(node, subject):
+        root, _ = chain(subject)
+        binding = file.binding(root)
+        position = micro.offset(binding) if binding is not None else -1
+        target = subject.text() if subject is not None else ""
+        return reads.key(node, shape(subject), reads.assignment(node, target, position),
+                         reread=micro.has_call(subject))
+
     for check in checks:
         actual = expression(check.actual)
         if actual is None:
             continue
         if check.method in {"toContain", "toMatch"} and string_needle(check.expected):
-            fragments.append((location(check.node), actual))
+            binding = file.binding(actual)
+            initial = expression(binding.field("value")) if binding is not None else actual
+            if (string_fixture(file, actual) is not None or check.method == "toContain" and membership_collection(file, actual)
+                    or micro.excluded(text(actual), text(initial) if initial is not None else "", test.name)
+                    or "rejects" in check.modifiers):
+                continue
+            fragments.append(micro.Fragment(location(check.node), text(actual), key(check.node, actual),
+                                            text(check.expected), check.negated))
         elif check.operator in {"==", "==="}:
-            whole.extend((actual, expression(check.expected)))
+            whole.extend((check.node, subject) for subject in (actual, expression(check.expected))
+                         if subject is not None)
         elif not check.negated and check.method in {"snapshot", "toMatchSnapshot", "toMatchInlineSnapshot",
                                                     "toMatchFileSnapshot"}:
-            whole.append(actual)
-    lint.micro_snapshot(test, fragments, whole, key=shape, display=text)
+            whole.append((check.node, actual))
+    micro.report(test, fragments, whole, key)
 
 
-def parse(source, path, language, *, inventory=False, observe=None):
+def parse(source, path, language, *, scan_root=None, inventory=False, observe=None):
     from .ast_grep_ts_flow import Flow
 
     syntax = Syntax.parse(source, language)
-    file = File(syntax)
+    file = File(syntax, path, scan_root)
     notes = list(comments(syntax))
     line_comments = {comment.line: comment.text for comment in notes}
     entries = list(file.inventory())
@@ -844,7 +958,7 @@ def parse(source, path, language, *, inventory=False, observe=None):
             continue
         flow = Flow(file, callback, parameters(callback))
         incomplete = flow.visit(body)
-        micro_snapshot(test, flow.checks)
+        micro_snapshot(file, test, flow.checks)
         test.checks = len(flow.checks)
         if not flow.checks:
             test.issues.append((test.line, "no-assert"))
@@ -858,7 +972,7 @@ def parse(source, path, language, *, inventory=False, observe=None):
             site = line(check.node)
             if flow.compares_itself(check, test.name, line_comments):
                 test.issues.append((site, "self-compare"))
-            if check.constant() or file.constant_length(check):
+            if check.constant() or file.constant_length(check) or constant_membership(file, check):
                 test.issues.append((site, "const-truth"))
                 continue
             counter, subject, presence = check.observation()
