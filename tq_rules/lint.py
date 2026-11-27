@@ -75,6 +75,14 @@ class SuffixedNumber:
     suffix: str
 
 
+def agree_on_paths(paths, merge):
+    """Keep only facts that can be proved for a binding on every incoming path."""
+    names = paths[0].keys() & paths[-1].keys()
+    for path in paths[1:-1]:
+        names &= path.keys()
+    return {name: merge([path[name] for path in paths]) for name in names}
+
+
 def literal_key(value, *, keep_suffix=True):
     if isinstance(value, (list, tuple)):
         return type(value), tuple(literal_key(item, keep_suffix=keep_suffix) for item in value)

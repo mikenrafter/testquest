@@ -417,6 +417,82 @@ RULES = {
         command="lint",
         level="advisory",
     ),
+    "swallowed-assertion": Rule(
+        "A catch can absorb the failure from this final assertion.",
+        "The handler observes the failure and the test checks that observation.",
+        Recipe(
+            (
+                "Move the assertion outside the try block so its failure reaches the test runner.",
+                "For an expected exception, wrap only the operation in the framework's exception assertion.",
+                "Check the returned exception outside that assertion if its details matter.",
+            ),
+            "Reject catch handlers that only log the failed assertion.",
+            {
+                "py": ("""
+                    def test_decode():
+                        try:
+                            assert decode("3") == 3
+                        except Exception:
+                            pass
+                    """, """
+                    def test_decode():
+                        assert decode("3") == 3
+                    """),
+                "ts": ("""
+                    test("decodes an integer", () => {
+                      const result = decode("3");
+                      try {
+                        expect(result.count).toBe(3);
+                      } catch {}
+                      expect(result.kind).toBe("integer");
+                    });
+                    """, """
+                    test("decodes an integer", () => {
+                      const result = decode("3");
+                      expect(result.count).toBe(3);
+                      expect(result.kind).toBe("integer");
+                    });
+                    """),
+            },
+        ),
+        command="lint",
+        level="advisory",
+    ),
+    "misordered-expected": Rule(
+        "The equality check puts the product result in the expected slot and a literal in the actual slot.",
+        "The framework signature assigns the operands different roles from the recognized signature.",
+        Recipe(
+            (
+                "Look up the equality assertion's operand order.",
+                "Pass the literal to the expected slot and the product result to the actual slot.",
+                "Use named arguments when the framework supports them.",
+            ),
+            "Reject changing the expected value or selecting a different check just to silence the finding.",
+            {
+                "java": ("""
+                    import org.junit.jupiter.api.Test;
+                    import static org.junit.jupiter.api.Assertions.assertEquals;
+
+                    class DecodeTest {
+                        @Test void decodesCount() {
+                            assertEquals(parser.decode("3"), 3);
+                        }
+                    }
+                    """, """
+                    import org.junit.jupiter.api.Test;
+                    import static org.junit.jupiter.api.Assertions.assertEquals;
+
+                    class DecodeTest {
+                        @Test void decodesCount() {
+                            assertEquals(3, parser.decode("3"));
+                        }
+                    }
+                    """),
+            },
+        ),
+        command="lint",
+        level="advisory",
+    ),
     "self-derived-expected": Rule(
         "The expected value reuses production code from the module under test.",
         "The test checks repeatability, a before-and-after observation, or a declared relation between different inputs or entry points.",
@@ -539,7 +615,7 @@ RULES = {
     ),
 }
 
-LANGUAGES = {"py": "Python", "rs": "Rust", "ts": "TypeScript", "dart": "Dart"}
+LANGUAGES = {"py": "Python", "rs": "Rust", "ts": "TypeScript", "dart": "Dart", "java": "Java"}
 
 
 def fix_for(name):

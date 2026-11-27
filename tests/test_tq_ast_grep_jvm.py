@@ -303,7 +303,7 @@ class AstGrepJvm(TqCase):
                 }
             }
         """)
-        self.assertEqual(self.locations(path.name), [(8, "guarded-assert")])
+        self.assertEqual(self.locations(path.name), [(8, "guarded-assert"), (9, "swallowed-assertion")])
 
     def test_sibling_size_contract_and_fixed_kotlin_inputs(self):
         # WHY: FakeRouteGeneratorTest.kt:55 checks a range derived from a sized result;

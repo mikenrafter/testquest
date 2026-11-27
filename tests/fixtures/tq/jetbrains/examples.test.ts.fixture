@@ -1,0 +1,35 @@
+import { expect, test } from 'vitest';
+
+test('swallowed', () => { // guarded-assert
+  try {
+    expect(decode('3')).toBe(3); // swallowed-assertion
+  } catch {}
+});
+
+test('named catch', () => { // guarded-assert
+  try {
+    expect(decode('3')).toBe(3);
+  } catch (error) {
+    logger.debug(error);
+  }
+});
+
+test('rethrows', () => {
+  try {
+    expect.fail('operation should reject');
+  } catch {
+    throw new Error('operation succeeded');
+  }
+});
+
+test('soft checks', () => {
+  expect.soft(decode('3')).toBe(3);
+});
+
+test('failed write', () => { // guarded-assert
+  try {
+    expect.fail('storage accepted an invalid key'); // swallowed-assertion
+  } catch {
+    logger.debug('write failed');
+  }
+});

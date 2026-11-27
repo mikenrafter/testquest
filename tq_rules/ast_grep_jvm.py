@@ -720,11 +720,13 @@ def no_crash_test(file, test, body, checks, notes, missing, checked):
 
 
 def parse(source, path, language, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
+    from .ast_grep_catches import swallowed_assertions
     from .ast_grep_jvm_checks import compares_itself
     from .ast_grep_jvm_controls import (
         analyze, answer_controls, capture_controls, shared_keys, sibling_controls, split_collection_controls,
     )
     from .ast_grep_jvm_micro import micro_snapshot
+    from .ast_grep_jvm_origins import misordered_expected
     from .ast_grep_jvm_profiles import disabled_output, observed_mock_controls
 
     syntax = parse_syntax(source, language)
@@ -757,6 +759,9 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
         controls_by_test.append(shared_keys(witnesses))
         checked_reads = observed_mock_controls(evidence.witnesses)
         checks = list(flow.checks.values())
+        test.issues.extend((site, "swallowed-assertion") for site in
+                           swallowed_assertions(body, language, (check.node for check in checks)))
+        test.issues.extend((site, "misordered-expected") for site in misordered_expected(file, body, checks))
         micro_snapshot(file, test, flow.checks)
         test.checks = len(checks) + int(expected_exception)
         missing = not test.checks and not flow.opaque_check

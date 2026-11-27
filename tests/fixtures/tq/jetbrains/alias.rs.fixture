@@ -1,0 +1,6 @@
+use pretty_assertions::assert_eq as equal;
+
+#[test]
+fn checks_decoded_count() {
+    equal!(parser::decode("3"), 3);
+}

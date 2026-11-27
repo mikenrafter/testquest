@@ -40,7 +40,9 @@ class AstGrepTypeScript(TqCase):
         # catches: assuming that either one branch or a nonempty loop covers every path
         path = self.fixture("guards.test.ts")
         self.assertEqual(self.locations(path.name), [
-            *((line, "guarded-assert") for line in (1, 3, 5, 6, 7, 8, 9, 11, 13, 14, 16)),
+            *((line, "guarded-assert") for line in (1, 3, 5, 6, 7, 8)),
+            (8, "swallowed-assertion"),
+            *((line, "guarded-assert") for line in (9, 11, 13, 14, 16)),
             (17, "no-assert"),
         ])
 

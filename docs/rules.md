@@ -7,7 +7,7 @@ Rules have two levels:
 - `error` (gating): causes `tq lint` or `tq witness` to exit with status 1.
 - `advisory`: prints the finding prefixed with `advisory:` without causing a non-zero exit code on its own.
 
-Run `tq rules` to list the rules and their levels. Each gating finding includes a `fix:` line. Run `tq rules RULE --lang py|rs|ts|dart` to get the full recipe, examples for your language, and shortcuts to reject in review.
+Run `tq rules` to list the rules and their levels. Each gating finding includes a `fix:` line. Run `tq rules RULE --lang py|rs|ts|dart|java` to get the full recipe, examples for your language, and shortcuts to reject in review.
 
 ## Suppressing a finding
 
@@ -277,6 +277,18 @@ def test_total_cents():
 ```
 
 **Exemptions.** Exempt when the test checks repeatability, a before-and-after observation, inverse codecs (such as `encode` / `decode` or `compress` / `decompress`), or a declared relation between different inputs or entry points. Suppress with `# tq: allow self-derived-expected REASON` when the relation is intentional and not recognized automatically.
+
+### `swallowed-assertion`
+
+The ast-grep engine flags a final assertion or `fail()` in a try block if its failure can be caught and the handler neither throws nor fails. It checks Java and Kotlin handlers for `AssertionError`, `Error` or `Throwable`, Python handlers for `AssertionError`, `Exception` or bare `except`, and TypeScript and JavaScript handlers with no catch binding.
+
+Move the assertion outside the try block so the runner sees its failure. When testing an expected exception, put only the operation under test in the framework's exception assertion.
+
+### `misordered-expected`
+
+The ast-grep engine flags a recognized expected-first equality assertion when the expected slot holds a product result and the actual slot holds a literal. Reversed operands can make a failure report identify the observed output as the intended value.
+
+Pass the literal as the expected value and the observed result as the actual value. Use named arguments where the framework supports them.
 
 ## Witness and diagnostic rules
 

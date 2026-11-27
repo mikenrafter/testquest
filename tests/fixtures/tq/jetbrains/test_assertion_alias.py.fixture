@@ -1,0 +1,7 @@
+from unittest import TestCase
+
+
+class Examples(TestCase):
+    def test_alias(self):
+        compare = self.assertEqual
+        compare(parser.decode("3"), 3)

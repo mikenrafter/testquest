@@ -1,0 +1,59 @@
+import kotlin.test.Test
+import org.junit.jupiter.api.assertAll
+import kotlin.test.assertEquals
+import kotlin.test.assertEquals as equal
+import io.kotest.assertions.assertSoftly
+
+class ExamplesTest {
+    @Test fun swallowed() { // guarded-assert
+        try {
+            assertEquals(3, parser.decode("3")) // swallowed-assertion
+        } catch (ignored: Throwable) {
+            logger.debug(ignored)
+        }
+    }
+
+    @Test fun unrelatedException() { // guarded-assert
+        try {
+            assertEquals(3, parser.decode("3"))
+        } catch (ignored: Exception) {
+            logger.debug(ignored)
+        }
+    }
+
+    @Test fun reversed() {
+        val actual = parser.decode("3")
+        assertEquals(actual, 3, "decoded count") // misordered-expected
+        assertEquals(actual = actual, expected = 3)
+        equal(actual, 3) // misordered-expected
+    }
+
+    @Test fun soft() {
+        assertSoftly {
+            assertEquals(3, parser.decode("3"))
+        }
+    }
+
+    @Test fun bareFailure() { // guarded-assert
+        try {
+            kotlin.test.fail("the decoder accepted malformed input") // swallowed-assertion
+        } catch (ignored: Error) {
+            logger.debug(ignored)
+        }
+    }
+
+    @Test fun conditionalFixtureValue() {
+        var actual = parser.decode("3")
+        if (useFixture()) {
+            actual = 3
+        }
+        assertEquals(actual, 3)
+    }
+
+    @Test fun jupiterAggregate() {
+        assertAll(
+            { assertEquals(3, parser.decode("3")) },
+            { assertEquals(5, parser.decode("5")) }
+        )
+    }
+}
