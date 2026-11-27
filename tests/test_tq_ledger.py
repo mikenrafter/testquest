@@ -333,7 +333,7 @@ class LedgerTests(TqCase):
         self.commit("Remove test")
         self.tq("log", "record", "--since", after_birth, env=env)
         self.write("test_lint.py", "def test_lint():\n    assert True\n")
-        row, = json.loads(self.tq("log", "lint", "--since", "HEAD", "--json", env=env, code=(1,)))
+        row, = json.loads(self.tq("log", "lint", "--since", "HEAD", "--json", env=env, code=(1,)))["findings"]
         self.tq("log", "verdict", "--row", row["row"], "--verdict", "real", "--why", "Constant",
                 env=env)
         events = self.read_ledger(self.scratch / "all.jsonl")
@@ -447,7 +447,7 @@ class LedgerTests(TqCase):
                 assert True
                 assert not False
         """)
-        rows = json.loads(self.log("lint", "--since", self.base, "--json", code=(1,)))
+        rows = json.loads(self.log("lint", "--since", self.base, "--json", code=(1,)))["findings"]
         self.log("lint", "--since", self.base, code=(1,))
         self.assertEqual(len(rows), 2)
         self.log("verdict", "--row", rows[0]["row"], "--verdict", "real", "--why", "Cannot fail")

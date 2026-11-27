@@ -11,7 +11,7 @@ from test_tq import FIXTURES, TqCase
 @unittest.skipUnless(importlib.util.find_spec("ast_grep_py"), "ast-grep-py is optional")
 class AstGrepTypeScript(TqCase):
     def rows(self, *args):
-        return json.loads(self.tq("lint", "--engine", "ast-grep", "--json", *args, code=(0, 1)))
+        return json.loads(self.tq("lint", "--engine", "ast-grep", "--json", *args, code=(0, 1)))["findings"]
 
     def fixture(self, name):
         return self.copy(FIXTURES / "ts" / name)
@@ -71,7 +71,7 @@ class AstGrepTypeScript(TqCase):
         self.assertEqual([(row["path"], row["rule"]) for row in rows], [
             (f"test.{suffix}", "no-assert") for suffix in ("cjs", "js", "jsx", "mjs", "ts", "tsx")
         ])
-        self.assertEqual(json.loads(self.tq("lint", "--json", ".")), [])
+        self.assertEqual(json.loads(self.tq("lint", "--json", "."))["findings"], [])
 
     def test_notes_use_callback_ownership(self):
         # WHY: both line and block comments must reach the existing note consumers.

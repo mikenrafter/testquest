@@ -1,17 +1,17 @@
 # Rules reference
 
-`tq lint` checks Python (`.py`) and Rust (`.rs`) test files against seven rules and two input diagnostics. `tq witness` adds one reachability rule.
+`tq lint` checks Python and Rust test files. The ast-grep engine also scans TypeScript and JavaScript. `tq witness` checks that conditional tests reach the case they claim to verify.
 
 Rules have two levels:
 
 - `error` (gating): causes `tq lint` or `tq witness` to exit with status 1.
 - `advisory`: prints the finding prefixed with `advisory:` without causing a non-zero exit code on its own.
 
-Run `tq rules` to print the current rule list, levels, and allowed-when guidance from the binary.
+Run `tq rules` to list the rules and their levels. Each gating finding includes a `fix:` line. Run `tq rules RULE --lang py|rs|ts` to get the full recipe, examples for your language, and shortcuts to reject in review.
 
 ## Suppressing a finding
 
-Add a suppression comment on the flagged line or on a standalone comment line immediately above it. Use `#` in Python and `//` in Rust:
+Add a suppression comment on the flagged line or on a standalone comment line immediately above it. Use `#` in Python and `//` in Rust or TypeScript.
 
 ```python
 # tq: allow no-assert verifies parse_port accepts a valid string without raising
@@ -24,7 +24,9 @@ def test_parse_port_accepts_valid_input():
 assert_eq!(a.clone(), a.clone());
 ```
 
-For function-level rules (`no-assert` and `guarded-assert`), `tq` reports the finding on the `def` or `fn` line, so place the comment on that line or the line directly above it. Every suppression must name a supported lint rule and include a reason. Otherwise `tq lint` reports `invalid-suppression`. `parse-error` cannot be suppressed.
+For function-level rules (`no-assert` and `guarded-assert`), `tq` reports the finding on the `def` or `fn` line, so place the comment on that line or the line directly above it. Use a supported lint rule and explain the exception in at least three words beyond the rule name. An invalid allow produces an `invalid-suppression` finding. `parse-error` cannot be suppressed.
+
+An allow applies to one matching finding. It moves that row to `suppressed` in the JSON output, alongside the `findings` list. Each suppressed row includes its `reason`. Text output reports the count of suppressed rows. Only gating rows in `findings` affect the exit status.
 
 ## Gating rules
 
@@ -224,27 +226,19 @@ def test_nonzero_items():
 Fix:
 
 ```python
-def test_fetch_items_returns_values():
-    assert len(fetch_items()) > 0
-
-
-# tq: allow guarded-assert test_fetch_items_returns_values shows the list is non-empty
 def test_nonzero_items():
-    # reaches: test_fetch_items_returns_values
-    items = fetch_items()
-    for item in items:
-        assert item > 0
+    assert fetch_items() == [3, 7]
 ```
 
-The `reaches:` comment satisfies `tq witness`; `tq lint` still needs the allow line, or an unconditional check, for `guarded-assert`.
+The expected result checks that the call returned items and pins which items it returned.
 
 **Exemptions.** Exempt when the test measures coverage itself or names a different scanned test in a `reaches:` comment.
 
 ### `invalid-suppression`
 
-Flags a `# tq: allow` (or `// tq: allow`) comment that names an unknown rule or gives no reason.
+Flags a `# tq: allow` (or `// tq: allow`) comment that names an unknown rule or lacks a reason of at least three words beyond the rule name.
 
-**Fix.** Name one of the seven lint rules and write a short reason explaining why the exception is valid.
+**Fix.** Name a supported lint rule and explain why the exception is valid.
 
 ### `parse-error`
 

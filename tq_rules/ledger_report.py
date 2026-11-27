@@ -101,7 +101,10 @@ def kills(events, aliases, versions, current, dead):
 def summarize(events):
     phases, aliases, versions, current, dead = lifecycle(events)
     tests, candidates = kills(events, aliases, versions, current, dead)
-    return dict(phases=phases, precision=precision(events), tests=tests, deletion_candidates=candidates)
+    allows = {(entry["repo"], entry["rule"], entry["path"], entry["hash"], entry["offset"])
+              for entry in events if entry["event"] == "lint" and "reason" in entry}
+    return dict(phases=phases, precision=precision(events), tests=tests, deletion_candidates=candidates,
+                allows=dict(sorted(Counter(rule for _, rule, _, _, _ in allows).items())))
 
 
 def summarize_global(events, selection):
@@ -129,6 +132,9 @@ def print_report(report):
         for version, row in versions.items():
             print(f"{rule}  {version}  {row['real']}  {row['intended']}  {row['false']}"
                   f"  {row['unjudged']}  {percent(row['strict'])}  {percent(row['loose'])}")
+    print("\nRule  Allows")
+    for rule, count in report["allows"].items():
+        print(f"{rule}  {count}")
     print("\nKills  Unique  Test")
     for test, row in report["tests"].items():
         print(f"{row['kills']:>5}  {row['unique_kills']:>6}  {test}")

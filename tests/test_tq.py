@@ -81,6 +81,8 @@ class TqCase(unittest.TestCase):
 
     def findings(self, subcommand, *paths):
         rows = json.loads(self.tq(subcommand, *paths, "--json", code=(0, 1)))
+        if subcommand == "lint":
+            rows = rows["findings"]
         return [
             (Path(row["path"]).name, row["line"], row["rule"], row["message"])
             for row in rows
@@ -448,9 +450,13 @@ class LintTests(TqCase):
             ("z_test.py", 2, "const-truth"),
         ])
         output = self.tq("lint", "z_test.py", "a_test.py", code=(0, 1))
-        self.assertEqual(output.splitlines(), [
+        lines = output.splitlines()
+        self.assertEqual(lines[::2], [
             f"{name}:{line} {rule} {message}" for name, line, rule, message in findings
         ])
+        for fix, (_, _, rule, _) in zip(lines[1::2], findings, strict=True):
+            self.assertTrue(fix.startswith("  fix: "))
+            self.assertIn(f"tq rules {rule}", fix)
         for _, _, _, message in findings:
             self.assertTrue(message.strip())
 

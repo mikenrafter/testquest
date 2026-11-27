@@ -14,12 +14,12 @@ class InstallReview(contract.TqCase):
         self.write("b_deep.rs", "#[test]\nfn deep() { assert!(" + "(" * 1_200
                    + "flag()" + ")" * 1_200 + "); }\n")
         self.write("c_bad.py", "def test_bad():\n    assert True\n")
-        rows = json.loads(self.tq("lint", "a_deep.py", "b_deep.rs", "--json"))
+        rows = json.loads(self.tq("lint", "a_deep.py", "b_deep.rs", "--json"))["findings"]
         self.assertEqual([(row["path"], row["rule"], row["level"]) for row in rows], [
             ("a_deep.py", "too-deep", "advisory"),
             ("b_deep.rs", "too-deep", "advisory"),
         ])
-        rows = json.loads(self.tq("lint", ".", "--json", code=(1,)))
+        rows = json.loads(self.tq("lint", ".", "--json", code=(1,)))["findings"]
         self.assertEqual([(row["path"], row["rule"]) for row in rows], [
             ("a_deep.py", "too-deep"), ("b_deep.rs", "too-deep"), ("c_bad.py", "const-truth"),
         ])
@@ -29,7 +29,7 @@ class InstallReview(contract.TqCase):
         # catches: containing recursion errors without fixing the recursive module scope walk.
         self.write("test_chain.py", "VALUE = " + " + ".join(["'part'"] * 1_500)
                    + "\n\ndef test_bad():\n    assert True\n")
-        rows = json.loads(self.tq("lint", ".", "--json", code=(1,)))
+        rows = json.loads(self.tq("lint", ".", "--json", code=(1,)))["findings"]
         self.assertEqual([(row["line"], row["rule"]) for row in rows], [(4, "const-truth")])
 
     def test_deep_python_import_adds_no_diagnostic(self):
@@ -44,7 +44,7 @@ class InstallReview(contract.TqCase):
                 for case in CASES:
                     assert render(case) == "1"
             """)
-        rows = json.loads(self.tq("lint", "tests/test_cases.py", "--json", code=(1,)))
+        rows = json.loads(self.tq("lint", "tests/test_cases.py", "--json", code=(1,)))["findings"]
         self.assertEqual([(row["path"], row["line"], row["rule"]) for row in rows], [
             ("tests/test_cases.py", 3, "guarded-assert"),
         ])
@@ -64,7 +64,7 @@ class InstallReview(contract.TqCase):
                 rows = [5, 9]
                 assert core.analyze(rows).count == adapter.analyze(rows).count
             """)
-        self.assertEqual(json.loads(self.tq("lint", "test_cases.py", "--json")), [])
+        self.assertEqual(json.loads(self.tq("lint", "test_cases.py", "--json"))["findings"], [])
 
     def test_deep_rust_import_adds_no_diagnostic(self):
         # WHY: a crate's deep imported module should only leave its iterable unproven.
@@ -78,7 +78,7 @@ class InstallReview(contract.TqCase):
             #[test]
             fn test_cases() { for value in CASES { assert!(valid(value)); } }
             """)
-        rows = json.loads(self.tq("lint", "src/checks.rs", "--json", code=(1,)))
+        rows = json.loads(self.tq("lint", "src/checks.rs", "--json", code=(1,)))["findings"]
         self.assertEqual([(row["path"], row["line"], row["rule"]) for row in rows], [
             ("src/checks.rs", 3, "guarded-assert"),
         ])
@@ -261,10 +261,10 @@ sys.path.insert(0, sys.argv[1])
 from tq_rules import lint
 
 with patch.object(ast, "parse", wraps=ast.parse) as parse:
-    rows = lint.find(["test_first.py", "test_second.py"])
+    result = lint.find(["test_first.py", "test_second.py"])
     reads = sum(Path(call.kwargs.get("filename", "")).name == "core.py"
                 for call in parse.call_args_list)
-print(json.dumps([reads, rows]))
+print(json.dumps([reads, result.findings]))
 """, str(contract.ROOT)], cwd=self.repo, capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -280,5 +280,5 @@ print(json.dumps([reads, rows]))
         for manifest in ('[package]\nname = 7\n', '[package]\nname = "sample"\n[lib]\nname = 7\n'):
             with self.subTest(manifest=manifest):
                 self.write("Cargo.toml", manifest)
-                rows = json.loads(self.tq("lint", "tests/checks.rs", "--json", code=(1,)))
+                rows = json.loads(self.tq("lint", "tests/checks.rs", "--json", code=(1,)))["findings"]
                 self.assertEqual([(row["line"], row["rule"]) for row in rows], [(2, "guarded-assert")])

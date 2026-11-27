@@ -46,7 +46,7 @@ Six event types are recorded today. Three more (`run`, `escape`, and `cost`) are
 | `born` | recorded | `tq log record` | `commit`, `date`, `phase`, `author`, `co_authors`, `test`, `test_id`, `hash`, `claim`, `catches` |
 | `changed` | recorded | `tq log record` | `commit`, `date`, `phase`, `before`, `after`, `checks_before`, `checks_after`, `loosened` |
 | `died` | recorded | `tq log record` | `commit`, `date`, `phase`, `reason`, `lifetime_seconds`, `kills` |
-| `lint` | recorded | `tq log lint` | `run`, `row`, `path`, `line`, `rule`, `rule_version`, `level`, `test`, `hash`, `offset` |
+| `lint` | recorded | `tq log lint` | `run`, `row`, `path`, `line`, `rule`, `rule_version`, `level`, `test`, `hash`, `offset`, optional `reason` |
 | `verdict` | recorded | `tq log verdict`, `tq log import-verdicts` | `row`, `rule`, `rule_version`, `verdict` (`real`, `intended`, `false`), `why`, `pattern`, `judge` |
 | `kill` | recorded | `tq log kill` | `run`, `commit`, `mutant`, `operator`, `worktree`, `red`, `green`, `bodies` |
 | `run` | not yet recorded | none yet | per-test duration, peak memory, status (`passed`, `failed`, `flaky`) |
@@ -105,10 +105,10 @@ Walks git history from `REF` to `HEAD` in topological order and appends `born`, 
 ### `tq log lint`
 
 ```sh
-tq log lint --since REF [--json] [--ledger PATH] [paths ...]
+tq log lint --since REF [--engine legacy|ast-grep] [--json] [--ledger PATH] [paths ...]
 ```
 
-Runs `tq lint --since REF` on changed tests, appends one `lint` event per finding (tagged with the current `rule_version` and a stable `row` id), and prints the findings with `[row <id>]`. Exits with status 1 if any gating (`error`) finding is reported.
+Scans changed tests and records one `lint` event per finding with the current `rule_version` and a stable `row` ID. It records suppressed findings too, with the allow comment's `reason`. JSON returns `findings` and `suppressed` lists with row IDs. Text output shows the IDs on visible findings and counts suppressed rows. A visible gating finding gives exit status 1.
 
 ### `tq log verdict`
 
@@ -140,11 +140,12 @@ Replays every `# catches: ... [patch: PATH]` fault patch in the repository and a
 tq log report [--global [--repo NAME|URL]] [--json]
 ```
 
-Summarizes the ledger into four sections:
+The report covers five kinds of evidence.
 
 1. Phase survival (`Born`, `Died`, `Survived` by `Test-Phase`).
 2. Rule precision (`Real`, `Intended`, `False`, `Unjudged`, `Strict`, `Loose` by rule and rule version).
-3. Test kills (`Kills` and `Unique` kills per test).
-4. Deletion candidates (living tests observed in `kill` events with zero unique kills and no recorded failure).
+3. Allows per rule. The count covers distinct suppressed findings recorded in the ledger. Rerunning lint on the same test body and finding location leaves the count unchanged.
+4. Test kills (`Kills` and `Unique` kills per test).
+5. Deletion candidates (living tests observed in `kill` events with zero unique kills and no recorded failure).
 
 With `--global`, the report includes the combined summary and a breakdown for each repository. In JSON, the breakdown is under `repositories`, keyed by the global `repo` identifier. Use `--repo` with `--global` to select by identifier, checkout directory name, or remote repository name. A name shared by several repositories includes all matches. A global report works outside a Git worktree when the global path is available there.

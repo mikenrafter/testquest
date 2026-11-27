@@ -10,7 +10,7 @@ from test_tq import TqCase
 class AstGrepLint(TqCase):
     def lint_rows(self, *paths):
         rows = self.tq("lint", "--engine", "ast-grep", "--json", *paths, code=(0, 1))
-        return [(row["line"], row["rule"]) for row in json.loads(rows)]
+        return [(row["line"], row["rule"]) for row in json.loads(rows)["findings"]]
 
     def test_rust_operand_reparse_and_template_locations(self):
         # WHY: the commas in turbofish and closures belong to the first operand.

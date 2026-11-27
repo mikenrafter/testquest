@@ -28,6 +28,7 @@ def add_commands(parser):
     scan = commands.add_parser("lint", help="Lint changed tests and record their findings.")
     scan.add_argument("--since", required=True)
     scan.add_argument("paths", nargs="*", default=["."])
+    scan.add_argument("--engine", choices=("legacy", "ast-grep"), default="legacy")
     scan.add_argument("--json", action="store_true")
     verdict = commands.add_parser("verdict", help="Record a judgment on a lint row.")
     verdict.add_argument("--row", required=True)

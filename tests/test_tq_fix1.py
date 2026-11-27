@@ -21,7 +21,7 @@ class ParseErrors(contract.TqCase):
         (self.repo / "d_bytes.py").write_bytes(b"# coding: utf-8\nx = '\xff\xfe'\n")
         (self.repo / "e_bytes.rs").write_bytes(b"fn \xff\xfe() {}\n")
         self.write("f_real_test.py", "def test_real():\n    assert True\n")
-        rows = json.loads(self.tq("lint", ".", "--json", code=(1,)))
+        rows = json.loads(self.tq("lint", ".", "--json", code=(1,)))["findings"]
         pairs = sorted((contract.Path(row["path"]).name, row["rule"]) for row in rows)
         self.assertEqual(pairs, [
             ("a_good.rs", "const-truth"), ("a_good.rs", "const-truth"), ("a_good.rs", "self-compare"),
@@ -212,7 +212,7 @@ class AdvisoryRules(contract.TqCase):
         output = self.tq("lint", "advice_test.py")
         self.assertIn("nondistinguishing-literal", output)
         self.assertIn("advisory", output)
-        rows = json.loads(self.tq("lint", "advice_test.py", "--json"))
+        rows = json.loads(self.tq("lint", "advice_test.py", "--json"))["findings"]
         self.assertEqual([(row["rule"], row["level"]) for row in rows],
                          [("nondistinguishing-literal", "advisory")])
         self.write("advice_test.py", """
@@ -222,7 +222,7 @@ class AdvisoryRules(contract.TqCase):
                 assert f(2, 2) == 3
                 assert True
             """)
-        rows = json.loads(self.tq("lint", "advice_test.py", "--json", code=(1,)))
+        rows = json.loads(self.tq("lint", "advice_test.py", "--json", code=(1,)))["findings"]
         self.assertEqual(sorted((row["rule"], row["level"]) for row in rows),
                          [("const-truth", "error"), ("nondistinguishing-literal", "advisory")])
 
@@ -237,7 +237,7 @@ class AdvisoryRules(contract.TqCase):
                 expected = codec.reference_bytes(1)
                 assert actual == expected
             """)
-        rows = json.loads(self.tq("lint", "derived_test.py", "--json"))
+        rows = json.loads(self.tq("lint", "derived_test.py", "--json"))["findings"]
         self.assertEqual([(row["rule"], row["level"]) for row in rows],
                          [("self-derived-expected", "advisory")])
 

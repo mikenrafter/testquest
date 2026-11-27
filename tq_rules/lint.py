@@ -2,40 +2,10 @@ from dataclasses import dataclass
 from itertools import groupby
 import re
 
+from .rules import RULES, fix_for
 from .source import CollectionControls, finding, scan_paths
 
 
-RULES = {
-    "const-truth": (
-        "Assertion contains a predicate that is always true.",
-        "A deliberately trivial assertion checks framework plumbing.",
-    ),
-    "self-compare": (
-        "Assertion compares the same expression on both sides.",
-        "The stated property is reflexivity or repeatability, and both operands are independently evaluated.",
-    ),
-    "no-assert": (
-        "Test has no check that verifies the outcome under test.",
-        "The stated check is successful execution, such as passing output through a strict parser.",
-    ),
-    "guarded-assert": (
-        "Every check is conditional and the test can skip them all.",
-        "The branch is exercised by a named witness, or zero matching items is explicitly a valid case.",
-    ),
-    "absence-no-control": (
-        "No check shows that the recorder or detector can report a result.",
-        "An independent observation establishes that the recorder can fire.",
-    ),
-    "self-derived-expected": (
-        "The expected value reuses production code from the module under test.",
-        "The test checks repeatability, a before-and-after observation, or a declared relation between different inputs or entry points.",
-    ),
-    "nondistinguishing-literal": (
-        "The fixture or assertion can let a wrong implementation pass.",
-        "The test's WHY explains the symmetric or fixed input. Examples include equal weights, a zero-write case, or a test that isolates another parameter.",
-    ),
-}
-ADVISORY = {"nondistinguishing-literal", "self-derived-expected"}
 ORDERED_NAME = re.compile(r"reverse|order|swap|endian|rotate|crc|encode", re.I)
 UNKNOWN = object()
 
@@ -307,7 +277,60 @@ def helper(name):
     return name.lower().startswith(("assert", "check", "expect")) or name in {"raises", "fail"}
 
 
+@dataclass
+class LintResult:
+    findings: list[dict]
+    suppressed: list[dict]
+
+
+def suppression_notes(path, comments, diagnostics):
+    allows = {}
+    for comment in comments:
+        if not comment.text.startswith("tq:"):
+            continue
+        words = comment.text[3:].split(maxsplit=2)
+        if not words or words[0] != "allow":
+            continue
+        name = words[1] if len(words) > 1 else ""
+        reason = words[2] if len(words) > 2 else ""
+        if not name:
+            message = "Name the lint rule to suppress."
+        elif name not in RULES or RULES[name].command != "lint":
+            message = f"Unknown lint rule {name}."
+        elif not valid_reason(name, reason):
+            message = f"Suppression for {name} needs a reason of at least three words beyond the rule name."
+        else:
+            allows[comment.line, name] = (comment.standalone, reason)
+            continue
+        diagnostics.append(finding(path, comment.line, "invalid-suppression", message))
+    return allows
+
+
+def valid_reason(name, reason):
+    if "\n" in reason:
+        return False
+    words = " ".join(re.findall(r"[^\W_]+", reason.casefold()))
+    name_words = name.replace("-", " ")
+    explanation = re.sub(rf"\b{re.escape(name_words)}\b", "", words)
+    return sum(any(letter.isalpha() for letter in word) for word in explanation.split()) >= 3
+
+
+def apply_suppressions(rows, allows):
+    for row in rows:
+        line, rule = row["line"], row["rule"]
+        for key in ((line, rule), (line - 1, rule)):
+            allow = allows.get(key)
+            if allow is not None and (key[0] == line or allow[0]):
+                del allows[key]
+                row["reason"] = allow[1]
+                break
+
+
 def find(paths, *, select=None, owners=None, parser=None):
+    """Scan with one parser and keep suppressed matches alongside visible findings.
+
+    When selecting tests, populate owners for both lists if the caller needs ledger IDs.
+    """
     rows = []
     controls = CollectionControls()
     files = list(scan_paths(paths, rows, refine_guards=True, collection_controls=controls,
@@ -316,44 +339,15 @@ def find(paths, *, select=None, owners=None, parser=None):
         rows.clear()
     controls.finish()
     for path, tests, comments in files:
+        issues = {issue for test in tests for issue in test.issues}
+        issues.update((test.line, "guarded-assert") for test in tests if test.guarded)
         file_rows = []
-        allows = {}
-        for comment in comments:
-            if not comment.text.startswith("tq:"):
-                continue
-            words = comment.text[3:].split(maxsplit=2)
-            if len(words) < 2 or words[0] != "allow":
-                continue
-            rule = words[1]
-            if any(not (char.isalnum() or char in "_-") for char in rule):
-                continue
-            reason = words[2] if len(words) == 3 else ""
-            if "\n" in reason:
-                continue
-            if not reason:
-                file_rows.append(finding(path, comment.line, "invalid-suppression",
-                                    f"Suppression for {rule} needs a reason."))
-            elif rule not in RULES:
-                file_rows.append(finding(path, comment.line, "invalid-suppression",
-                                    f"Unknown rule {rule}."))
-            else:
-                allows[comment.line, rule] = comment.standalone
-
-        issues = set()
-        for test in tests:
-            issues.update(test.issues)
-            if test.guarded:
-                issues.add((test.line, "guarded-assert"))
-        for line, rule in sorted(issues):
-            nearby = [(line, rule), (line - 1, rule)]
-            for key in nearby:
-                if key in allows and (key[0] == line or allows[key]):
-                    del allows[key]
-                    break
-            else:
-                advisory = rule in ADVISORY
-                file_rows.append(finding(path, line, rule, ("advisory: " if advisory else "") + RULES[rule][0],
-                                    "advisory" if advisory else "error"))
+        for line, name in sorted(issues):
+            rule = RULES[name]
+            prefix = "advisory: " if rule.level == "advisory" else ""
+            file_rows.append(finding(path, line, name, prefix + rule.message, rule.level))
+        allows = suppression_notes(path, comments, file_rows)
+        apply_suppressions(file_rows, allows)
         if select is None:
             rows.extend(file_rows)
         elif file_rows:
@@ -365,7 +359,12 @@ def find(paths, *, select=None, owners=None, parser=None):
                     rows.append(row)
                     if owners is not None:
                         owners[row["path"], row["line"]] = owner
-    return sorted(rows, key=lambda row: (row["path"], row["line"], row["rule"]))
+
+    findings, suppressed = [], []
+    for row in sorted(rows, key=lambda row: (row["path"], row["line"], row["rule"])):
+        row["fix"] = fix_for(row["rule"])
+        (suppressed if "reason" in row else findings).append(row)
+    return LintResult(findings, suppressed)
 
 
 def different_callees(actual, expected):

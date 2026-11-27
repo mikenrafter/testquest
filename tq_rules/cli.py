@@ -3,36 +3,23 @@ import json
 import subprocess
 import sys
 
-from . import catches, history, ledger, ledger_config, ledger_report, lint, props, repo, witness
+from . import catches, history, ledger, ledger_config, ledger_report, lint, props, repo, rules, witness
 
 
-DIAGNOSTIC_RULES = {
-    "invalid-suppression": (
-        "A lint suppression names an unknown rule or gives no reason.",
-        "Name a supported lint rule and give a reason for the exception.",
-    ),
-    "missing-witness": (
-        "A conditional test has no evidence that its condition is reached.",
-        "Name another scanned test that reaches the condition, or measure coverage in this test.",
-    ),
-    "too-deep": (
-        "The scan skipped a source file after exceeding parser limits.",
-        "This advisory diagnostic does not require a suppression.",
-    ),
-    "parse-error": (
-        "A source file could not be parsed.",
-        "Fix the source or its encoding before scanning. This diagnostic cannot be suppressed.",
-    ),
-}
-
-
-def print_findings(rows, as_json):
+def print_findings(rows, as_json, *, suppressed=None):
     if as_json:
-        print(json.dumps(rows, indent=2))
+        output = rows if suppressed is None else {"findings": rows, "suppressed": suppressed}
+        print(json.dumps(output, indent=2))
     else:
         for row in rows:
             detail = f" [row {row['row']}]" if "row" in row else ""
             print("{path}:{line} {rule} {message}".format(**row) + detail)
+            if row.get("level") != "advisory" and "fix" in row:
+                print(f"  fix: {row['fix']}")
+        if suppressed:
+            count = len(suppressed)
+            noun = "finding" if count == 1 else "findings"
+            print(f"Suppressed {count} {noun}.")
     return int(any(row.get("level") != "advisory" for row in rows))
 
 
@@ -48,7 +35,9 @@ def main():
         scan.add_argument("--engine", choices=("legacy", "ast-grep"), default="legacy")
         scan.add_argument("--json", action="store_true")
     ledger.add_commands(commands.add_parser("log", help="Record and report test evidence."))
-    commands.add_parser("rules", help="Show finding rules and exceptions.")
+    catalogue = commands.add_parser("rules", help="Show finding rules and rework recipes.")
+    catalogue.add_argument("rule", nargs="?", choices=sorted(rules.RULES))
+    catalogue.add_argument("--lang", choices=rules.LANGUAGES)
     replay = commands.add_parser("catches", help="Replay named faults in a temporary copy.")
     replay.add_argument("--repo", default=".")
     replay.add_argument("--worktree", action="store_true")
@@ -71,14 +60,17 @@ def main():
         parser.error("--budget must be nonnegative")
     if options.command == "lint" and not (options.paths or options.since):
         parser.error("lint requires paths or --since")
+    if options.command == "rules" and options.lang and not options.rule:
+        parser.error("--lang requires a rule")
     try:
         parse = select_parser(getattr(options, "engine", "legacy"))
         if options.command == "lint":
             select = (history.ChangedTests(repo.root("."), options.since, parser=parse)
                       if options.since else None)
-            return print_findings(lint.find(options.paths or ["."], select=select, parser=parse), options.json)
+            result = lint.find(options.paths or ["."], select=select, parser=parse)
+            return print_findings(result.findings, options.json, suppressed=result.suppressed)
         if options.command == "log":
-            return run_log(options)
+            return run_log(options, parse)
         if options.command == "witness":
             return print_findings(witness.find(options.paths, parser=parse), options.json)
         if options.command == "catches":
@@ -108,9 +100,7 @@ def main():
                     for citation in record["evidence"]:
                         print("  {source} ({section})".format(**citation))
         if options.command == "rules":
-            for name, (message, allowed) in sorted((lint.RULES | DIAGNOSTIC_RULES).items()):
-                level = "advisory" if name in lint.ADVISORY or name == "too-deep" else "error"
-                print(f"{name}  {message}\n  level: {level}\n  allowed-when: {allowed}")
+            print(rules.describe(options.rule, options.lang))
     except (OSError, ValueError, SyntaxError, subprocess.SubprocessError) as error:
         print(f"tq: {error}", file=sys.stderr)
         return 2
@@ -143,7 +133,7 @@ def print_replays(rows, as_json):
     return 2 if statuses & {"error", "patch-failed"} else 0
 
 
-def run_log(options):
+def run_log(options, parser):
     command = options.log_command
     try:
         repository = repo.root(getattr(options, "repo", "."))
@@ -167,15 +157,15 @@ def run_log(options):
     if command == "record":
         log.update(lambda existing: ledger.record(repository, main.name, options.since, existing))
     elif command == "lint":
+        select = history.ChangedTests(repository, options.since, parser=parser)
         owners = {}
-        select = history.ChangedTests(repository, options.since)
-        rows = lint.find(options.paths, select=select, owners=owners)
+        result = lint.find(options.paths, select=select, owners=owners, parser=parser)
+        rows = result.findings + result.suppressed
         entries = list(ledger.lint_events(repository, main.name, rows, owners))
         log.write(entries)
-        return print_findings([
-            row | {"row": entry["row"], "rule_version": entry["rule_version"]}
-            for row, entry in zip(rows, entries)
-        ], options.json)
+        for row, entry in zip(rows, entries, strict=True):
+            row.update(row=entry["row"], rule_version=entry["rule_version"])
+        return print_findings(result.findings, options.json, suppressed=result.suppressed)
     elif command == "verdict":
         log.update(lambda existing: [ledger.judgment(existing, options)])
     elif command == "import-verdicts":

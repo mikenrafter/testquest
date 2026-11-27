@@ -1,6 +1,7 @@
 import re
 
 from .ast_grep_languages import ECMASCRIPT_LANGUAGES
+from .rules import RULES, fix_for
 from .source import finding, note_owners, scan_paths
 
 
@@ -36,6 +37,6 @@ def find(paths, *, parser=None):
             if test.measured or not (test.guarded or test.conditional):
                 continue
             if id(test) not in witnessed:
-                rows.append(finding(path, test.line, "missing-witness",
-                                    "Name a scanned test that reaches the condition, or measure coverage here."))
+                name = "missing-witness"
+                rows.append(finding(path, test.line, name, RULES[name].message) | {"fix": fix_for(name)})
     return sorted(rows, key=lambda row: (row["path"], row["line"], row["rule"]))
