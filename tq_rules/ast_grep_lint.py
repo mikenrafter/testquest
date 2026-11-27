@@ -4,7 +4,10 @@ from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 import hashlib
+from math import prod
+import operator
 import tokenize
+import tomllib
 
 from . import lint
 from .ast_grep import (
@@ -19,10 +22,14 @@ UNKNOWN = lint.UNKNOWN
 FAILURES = {"panic", "unreachable", "todo", "unimplemented"}
 RECORDING = {"append", "push", "extend", "insert", "add", "set"}
 SHRINKING = {"clear", "drain", "pop", "pop_front", "pop_back", "retain", "remove",
-             "truncate", "discard", "difference_update", "intersection_update", "take"}
+             "truncate", "discard", "difference_update", "intersection_update", "take", "shutdown",
+             "detach_all", "join_all"}
 RUST_NUMERIC_SUFFIXES = ("f32", "f64", "usize", "isize", *(
     prefix + size for prefix in ("u", "i") for size in ("128", "64", "32", "16", "8")
 ))
+COMPARISONS = {"==": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le,
+               ">": operator.gt, ">=": operator.ge}
+REVERSE_COMPARISON = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
 PYTHON_PREDICATES = {
     "assertEqual": "==", "assertEquals": "==", "assertNotEqual": "!=", "assertNotEquals": "!=",
     "assertGreater": ">", "assertGreaterEqual": ">=", "assertLess": "<", "assertLessEqual": "<=",
@@ -223,32 +230,72 @@ class Flow:
         self.alias_changes = defaultdict(list)
         self.collection_growth = defaultdict(list)
         self.strategies = dict(initial)
+        self.loop_values = {}
+        self.loop_ranges = {}
+        self.checked_collections = {}
+        self.vector_collections = set()
         self.active_closures = set()
 
     def record(self, check):
         self.checks.append(check)
-        return check.reachability and not check.guarded
+        if check.reachability and not check.guarded:
+            predicate = unwrap(check.predicate)
+            if predicate is not None and predicate.kind() in CALLS:
+                call = self.syntax.call(predicate)
+                if call.method == "contains" and call.receiver is not None:
+                    for source in self.positive_sources(call.receiver, check.location):
+                        name = parts(source)
+                        if any(site < check.location for site, _ in self.bindings.get(name, ())):
+                            self.checked_collections[name] = check.location
+            return True
+        return False
 
     def conditional(self, node):
         start = len(self.checks)
-        growth = {name: list(sites) for name, sites in self.collection_growth.items()}
-        self.visit(node)
-        self.collection_growth = defaultdict(list, growth)
+        self.isolated(node)
         for check in self.checks[start:]:
             check.guarded = True
         return False
 
-    def known_value(self, node, seen=frozenset()):
+    def isolated(self, node):
+        growth = {name: list(sites) for name, sites in self.collection_growth.items()}
+        checked = self.checked_collections.copy()
+        loop_values = self.loop_values
+        reaches_check = self.visit(node)
+        self.collection_growth = defaultdict(list, growth)
+        self.checked_collections = checked
+        self.loop_values = loop_values
+        return reaches_check
+
+    def known_value(self, node, seen=frozenset(), *, minimum=False):
+        node = unwrap(node)
         number = integer(self.syntax, node)
         if number is not None:
             return number
+        if node is not None and node.kind() in CALLS:
+            call = self.syntax.call(node)
+            if call.method == "len":
+                receiver = call.receiver or (call.arguments[0] if len(call.arguments) == 1 else None)
+                if self.syntax.language == "rust":
+                    source = self.resolve(parts(receiver), self.syntax.absolute(node)) or receiver
+                    if isinstance(text := literal(self.syntax, source), str):
+                        return len(text.encode())
+                return self.size(receiver, exact=not minimum, seen=seen)
         name = parts(node)
+        if minimum and name in self.loop_ranges:
+            return self.loop_ranges[name].start
         if name and name not in seen and (value := self.resolve(name, self.syntax.absolute(node))) is not None:
-            return self.known_value(value, seen | {name})
+            return self.known_value(value, seen | {name}, minimum=minimum)
         operator, left, right = split_operands(node)
-        if operator in {"+", "-", "*"}:
-            first, second = (self.known_value(item, seen) for item in (left, right))
+        if operator in {"+", "-", "*", "/", "//"}:
+            first = self.known_value(left, seen, minimum=minimum and operator == "+")
+            second = self.known_value(right, seen)
             if first is not None and second is not None:
+                if operator in {"/", "//"}:
+                    if second and (operator == "//" or self.syntax.language == "rust"):
+                        quotient = abs(first) // abs(second)
+                        return -quotient if (first < 0) != (second < 0) else quotient
+                    return None
                 return {"+": first + second, "-": first - second, "*": first * second}[operator]
         return None
 
@@ -259,7 +306,7 @@ class Flow:
             return value
         return self.file.constant(name, self.scope)
 
-    def size(self, node, *, before=None, seen=frozenset()):
+    def size(self, node, *, before=None, seen=frozenset(), exact=False):
         node = unwrap(node)
         if node is None:
             return None
@@ -269,7 +316,14 @@ class Flow:
         elements = children(node)
         if kind in {"list", "tuple", "set", "dictionary", "array_expression", "tuple_expression"}:
             if any(child.kind() in {"list_splat", "dictionary_splat"} for child in elements):
-                return sum(child.kind() not in {"list_splat", "dictionary_splat"} for child in elements)
+                return None if exact else sum(
+                    child.kind() not in {"list_splat", "dictionary_splat"} for child in elements)
+            if kind in {"set", "dictionary"}:
+                keys = [literal(self.syntax, child.field("key") if kind == "dictionary" else child)
+                        for child in elements]
+                if all(type(key) in {int, bool, str, bytes} for key in keys):
+                    return len(set(keys))
+                return None if exact else int(bool(elements))
             if any(child.kind() == ";" for child in node.children()):
                 return self.known_value(elements[-1])
             return len(elements)
@@ -278,14 +332,54 @@ class Flow:
             return len(value)
         if kind == "list_comprehension":
             clauses = children(node)[1:]
-            if len(clauses) == 1 and clauses[0].kind() == "for_in_clause":
-                return self.size(clauses[0].field("right"), before=before, seen=seen)
-        if kind in {"reference_expression", "try_expression"}:
-            return self.size(elements[-1], before=before, seen=seen)
+            if all(clause.kind() == "for_in_clause" for clause in clauses):
+                sizes = [self.size(clause.field("right"), before=before, exact=exact, seen=seen)
+                         for clause in clauses]
+                return prod(sizes) if None not in sizes else None
+        if kind in {"if_expression", "conditional_expression"}:
+            if kind == "if_expression":
+                branches = (node.field("consequence"), node.field("alternative"))
+            else:
+                branches = (elements[0], elements[-1])
+            sizes = [self.size(branch, before=before, exact=exact, seen=seen) for branch in branches]
+            if None not in sizes and (not exact or sizes[0] == sizes[1]):
+                return min(sizes)
+        if kind in {"else_clause", "block"} and elements:
+            tail = elements[-1]
+            if tail.kind() != "expression_statement":
+                return self.size(tail, before=before, exact=exact, seen=seen)
+        operator, left, right = split_operands(node)
+        if self.syntax.language == "python" and operator == "-" and not exact:
+            items = self.fixture_keys(left, before)
+            removed = self.fixture_keys(right, before)
+            if items is not None and removed is not None:
+                return len(items - removed)
+        if kind in {"reference_expression", "try_expression"} and elements:
+            return self.size(elements[-1], before=before, exact=exact, seen=seen)
+        if kind == "subscript":
+            rows = self.fixture_rows(node.field("value"), before, seen)
+            keys = self.loop_values.get(parts(node.field("subscript")), (node.field("subscript"),))
+            wanted = [literal(self.syntax, key) for key in keys]
+            if rows and all(isinstance(row, tuple) and len(row) == 2 for row in rows):
+                sizes = [self.size(row[1], before=before, exact=exact, seen=seen) for row in rows
+                         if UNKNOWN in wanted or literal(self.syntax, row[0]) in wanted]
+                if sizes and None not in sizes and (not exact or len(set(sizes)) == 1):
+                    return min(sizes)
+        if kind == "index_expression" and len(elements) == 2:
+            base, index = elements
+            if index.kind() == "range_expression" and index.text().endswith(".."):
+                terms = children(index)
+                start = self.known_value(terms[0]) if len(terms) == 1 else 0 if not terms else None
+                length = self.size(base, before=before, exact=exact, seen=seen)
+                if start is not None and start >= 0 and length is not None:
+                    return max(0, length - start)
         if kind == "range_expression":
             if len(elements) == 2:
-                ends = [self.known_value(child) for child in elements]
-                if ends[1] is None and len(name := parts(elements[1])) == 1 and name[0] in self.strategies:
+                lower = self.known_value(elements[0])
+                if lower is None and not exact:
+                    lower = self.known_value(elements[0], minimum=True)
+                ends = [lower, self.known_value(elements[1], minimum=not exact)]
+                if ends[1] is None and not exact and len(name := parts(elements[1])) == 1 and name[0] in self.strategies:
                     ends[1] = self.strategy_minimum(self.strategies[name[0]])
                 if None not in ends:
                     return range_size(ends[0], ends[1] + int(any(child.kind() == "..="
@@ -308,43 +402,62 @@ class Flow:
                     array = Syntax.parse("fn tq() { let _ = [" + tree.text()[1:-1] + "]; }", "rust")
                     repeated = array.root.find(kind="array_expression")
                     if repeated is not None and not syntax_errors(array.root, missing=True):
-                        return self.size(repeated, before=before, seen=seen)
+                        return self.size(repeated, before=before, exact=exact, seen=seen)
             if call.receiver is None:
                 if method in {"enumerate", "reversed", "iter", "list", "tuple", "sorted", "array", "repeat"} and args:
-                    return self.size(args[0], before=before, seen=seen)
+                    return self.size(args[0], before=before, exact=exact, seen=seen)
                 if method in {"once", "repeat_with"} or method == "repeat" and self.syntax.language == "rust":
-                    return 1
+                    return None if exact and method != "once" else 1
                 if method == "zip" and args:
-                    sizes = [self.size(arg, before=before, seen=seen) for arg in args]
-                    return min(sizes) if None not in sizes else None
+                    inputs = [arg for arg in args if arg.kind() != "keyword_argument"]
+                    sizes = [self.size(arg, before=before, exact=exact, seen=seen) for arg in inputs]
+                    if sizes and None not in sizes:
+                        return min(sizes)
+                    if not exact and any(arg.text().replace(" ", "") == "strict=True" for arg in args):
+                        return max((size for size in sizes if size is not None), default=None)
                 if method in {"new", "empty", "default"} and call.name[:-1] in {
                         ("Vec",), ("VecDeque",), ("HashSet",), ("HashMap",), ("BTreeSet",),
-                        ("BTreeMap",), ("std", "iter")}:
+                        ("BTreeMap",), ("std", "iter"), ("JoinSet",), ("tokio", "task", "JoinSet")}:
                     return 0
-                target = self.file.resolve_function(call.name, self.scope)
-                if target is not None and not args and target not in seen:
-                    function = self.file.functions[target]
-                    statements = list(direct_statements(body_of(function)))
-                    if len(statements) == 1:
-                        expression = statements[0]
-                        if expression.kind() in {"return_statement", "return_expression"}:
-                            expression = next(iter(children(expression)), None)
-                        return self.size(expression, before=before, seen=seen | {target})
-            else:
-                if self.syntax.language == "python" and call.name[:1] == ("self",) and not args:
-                    target = self.file.resolve_function(call.name, self.scope)
-                    if target is not None and target not in seen:
-                        statements = list(direct_statements(body_of(self.file.functions[target])))
-                        returned = statements[-1] if statements else None
-                        if returned is not None and returned.kind() == "return_statement":
-                            return self.size(next(iter(children(returned)), None), before=before,
-                                             seen=seen | {target})
-                if method in {"iter", "iter_mut", "into_iter", "chars", "bytes", "lines", "items", "keys",
-                              "values", "enumerate", "rev", "map", "cloned", "copied", "collect", "as_slice",
-                              "to_vec", "iter_rows", "by_ref", "cycle", "values_mut", "into_values"}:
-                    return self.size(call.receiver, before=before, seen=seen)
-                size = self.size(call.receiver, before=before, seen=seen)
+            if (self.syntax.language == "rust" and call.receiver is None or not args and (
+                    call.receiver is None or call.name[:1] == ("self",))) and (
+                    helper := self.file.fixture_function(call.name, self.scope)):
+                file, target, function = helper
+                identity = file.path, target
+                if identity not in seen:
+                    helper_flow = Flow(file, file.syntax, body_of(function), target)
+                    returned = helper_flow.fixture_return(function)
+                    if returned is not None:
+                        return helper_flow.size(returned, seen=seen | {identity}, exact=exact)
+            if call.receiver is not None:
+                if method == "concat" and not args:
+                    rows = self.fixture_rows(call.receiver, before, seen)
+                    sizes = [self.size(row, before=before, exact=exact, seen=seen)
+                             for row in rows if row is not None and not isinstance(row, tuple)]
+                    if rows and len(sizes) == len(rows) and None not in sizes:
+                        return sum(sizes)
+                if method == "collect" and self.syntax.language == "rust" and not self.is_vector_collect(node):
+                    count = self.size(call.receiver, before=before, seen=seen)
+                    return None if count is None or exact else min(1, count)
+                if method in {"bytes", "lines"}:
+                    source = self.resolve(parts(call.receiver), before) or call.receiver
+                    if isinstance(text := literal(self.syntax, source), str):
+                        if method == "bytes":
+                            return len(text.encode())
+                        return text.count("\n") + int(bool(text) and not text.endswith("\n"))
+                    return None
+                if method == "cycle" and exact:
+                    return None
+                if method in {"iter", "iter_mut", "into_iter", "chars", "items", "keys", "values",
+                              "enumerate", "rev", "map", "cloned", "copied", "collect", "as_slice", "to_vec",
+                              "clone", "iter_rows", "by_ref", "cycle", "values_mut", "into_values"}:
+                    return self.size(call.receiver, before=before, exact=exact, seen=seen)
+                size = self.size(call.receiver, before=before, exact=exact, seen=seen)
                 first = self.known_value(args[0]) if args else None
+                if method == "take" and first is not None and call.receiver.kind() in CALLS:
+                    base = self.syntax.call(call.receiver)
+                    if base.method == "cycle" and self.size(base.receiver, before=before, seen=seen):
+                        return first
                 if method in {"take", "skip", "step_by", "chunks", "chunks_exact", "windows"} and size is not None and first is not None:
                     if method == "take":
                         return min(first, size)
@@ -357,16 +470,21 @@ class Flow:
                             return max(0, size - first + 1)
                         return (size + first - 1) // first
                 if method == "chain" and args:
-                    other = self.size(args[0], before=before, seen=seen)
-                    return (size or 0) + (other or 0)
+                    other = self.size(args[0], before=before, exact=exact, seen=seen)
+                    return None if exact and None in (size, other) else (size or 0) + (other or 0)
                 if method == "zip" and args and size is not None:
-                    other = self.size(args[0], before=before, seen=seen)
+                    other = self.size(args[0], before=before, exact=exact, seen=seen)
                     return min(size, other) if other is not None else None
         name = parts(node)
         if not name or name in seen:
             return None
         entries = self.bindings.get(name, ())
-        if not entries and len(name) == 1 and (strategy := self.strategies.get(name[0])) is not None:
+        if not entries and name in self.loop_values:
+            sizes = [self.size(item, before=before, exact=exact, seen=seen | {name})
+                     for item in self.loop_values[name]]
+            if sizes and None not in sizes and (not exact or len(set(sizes)) == 1):
+                return min(sizes)
+        if not entries and not exact and len(name) == 1 and (strategy := self.strategies.get(name[0])) is not None:
             if strategy.kind() == "call_expression":
                 call = self.syntax.call(strategy)
                 if call.name[-2:] == ("collection", "vec") and len(call.arguments) == 2:
@@ -378,9 +496,174 @@ class Flow:
         value = self.resolve(name, before)
         if value is None:
             return None
-        initial = self.size(value, before=before, seen=seen | {name})
+        initial = self.size(value, before=before, exact=exact, seen=seen | {name})
         grown = sum(added for site, added in self.collection_growth[name] if binding_site < site < before)
+        if grown and exact:
+            return None
+        checked = self.checked_collections.get(name)
+        if not exact and checked is not None and binding_site < checked < before:
+            return max(1, (initial or 0) + grown)
         return (initial or 0) + grown if grown else initial
+
+    def is_vector_collect(self, node):
+        if offset(node) in self.vector_collections:
+            return True
+        function = node.field("function")
+        arguments = function.field("type_arguments") if function is not None else None
+        return arguments is not None and parts(next(iter(children(arguments)), None))[-1:] == ("Vec",)
+
+    def mark_vector(self, annotation, value):
+        if value is not None and value.kind() == "call_expression" and (
+                parts(annotation)[-1:] == ("Vec",) and self.syntax.call(value).method == "collect"):
+            self.vector_collections.add(offset(value))
+
+    def fixture_return(self, function):
+        parameters = function.field("parameters")
+        if parameters is not None:
+            for parameter in children(parameters):
+                pattern = parameter.field("pattern") or parameter
+                for name in query(pattern, "identifier"):
+                    self.bindings[parts(name)].append((-1, None))
+        statements = list(direct_statements(self.body))
+        if not statements:
+            return None
+        tail = statements[-1]
+        if tail.kind() in {"return_statement", "return_expression"}:
+            tail = next(iter(children(tail)), None)
+        elif self.syntax.language == "python" or list(self.body.children())[-2].kind() == "expression_statement":
+            return None
+        for statement in statements[:-1]:
+            target, value = binding(statement)
+            if statement.kind() not in {"let_declaration", "assignment", "const_item"} or not target:
+                return None
+            self.bindings[target].append((self.syntax.absolute(statement), value))
+            self.mark_vector(statement.field("type"), value)
+        self.mark_vector(function.field("return_type"), tail)
+        return tail
+
+    def fixture_keys(self, node, before):
+        seen = set()
+        while node is not None:
+            if node.kind() in {"list", "tuple", "set", "dictionary"}:
+                keys = set()
+                for item in children(node):
+                    value = literal(self.syntax, item.field("key") if node.kind() == "dictionary" else item)
+                    if not isinstance(value, (str, int)):
+                        return None
+                    keys.add(value)
+                return keys
+            if node.kind() == "call":
+                call = self.syntax.call(node)
+                if call.name == ("set",) and len(call.arguments) == 1:
+                    node = call.arguments[0]
+                    continue
+            name = parts(node)
+            if not name or name in seen:
+                return None
+            seen.add(name)
+            node = self.resolve(name, before)
+        return None
+
+    def fixture_rows(self, node, before=None, seen=frozenset()):
+        node = unwrap(node)
+        if node is None:
+            return ()
+        if before is None:
+            before = self.syntax.absolute(node)
+        kind = node.kind()
+        if kind in {"reference_expression", "try_expression"}:
+            return self.fixture_rows(children(node)[-1], before, seen)
+        if kind in {"list", "tuple", "array_expression"}:
+            if not any(part.kind() in {";", "list_splat"} for part in node.children()):
+                return children(node)
+        if kind == "dictionary":
+            pairs = [(item.field("key"), item.field("value")) for item in children(node)
+                     if item.kind() == "pair"]
+            keys = [literal(self.syntax, key) for key, _ in pairs]
+            if len(pairs) == len(children(node)) and all(type(key) in {int, bool, str, bytes} for key in keys):
+                return list(dict(zip(keys, pairs)).values())
+        if kind in CALLS:
+            call = self.syntax.call(node)
+            if call.name == ("vec",):
+                return call.arguments
+            if call.receiver is not None and self.syntax.language == "python" and call.method in {
+                    "items", "keys", "values"}:
+                rows = self.fixture_rows(call.receiver, before, seen)
+                if all(isinstance(row, tuple) for row in rows):
+                    return rows if call.method == "items" else [row[call.method == "values"] for row in rows]
+            if call.receiver is not None and call.method in {
+                    "iter", "into_iter", "iter_mut", "cloned", "copied", "enumerate"}:
+                rows = self.fixture_rows(call.receiver, before, seen)
+                return [(None, row) for row in rows] if call.method == "enumerate" else rows
+            if call.name == ("enumerate",) and len(call.arguments) == 1:
+                return [(None, row) for row in self.fixture_rows(call.arguments[0], before, seen)]
+            if (not call.arguments or self.syntax.language == "rust" and call.receiver is None) and (
+                    helper := self.file.fixture_function(call.name, self.scope)):
+                file, target, function = helper
+                identity = file.path, target
+                if identity not in seen:
+                    flow = Flow(file, file.syntax, body_of(function), target)
+                    return flow.fixture_rows(flow.fixture_return(function), seen=seen | {identity})
+        name = parts(node)
+        if name and name not in seen:
+            if name in self.loop_values:
+                return [row for value in self.loop_values[name]
+                        for row in self.fixture_rows(value, before, seen | {name})]
+            entries = self.bindings.get(name, ())
+            site = max((site for site, _ in entries if site < before), default=-1)
+            if not any(site < changed < before for changed in self.writes[name]):
+                return self.fixture_rows(self.resolve(name, before), seen=seen | {name})
+        return ()
+
+    def project_rows(self, pattern, rows):
+        if pattern is None or not rows:
+            return {}
+        if pattern.kind() in {"reference_pattern", "mut_pattern"}:
+            return self.project_rows(children(pattern)[-1], rows)
+        if pattern.kind() in {"tuple_pattern", "pattern_list", "list_pattern"}:
+            targets = children(pattern)
+            columns = []
+            for row in rows:
+                if isinstance(row, tuple):
+                    values = row
+                elif row is not None and row.kind() in {"tuple_expression", "tuple", "list"}:
+                    values = children(row)
+                else:
+                    return {}
+                if len(targets) != len(values):
+                    return {}
+                columns.append(values)
+            return {key: values for target, values_in_column in zip(targets, zip(*columns))
+                    for key, values in self.project_rows(target, values_in_column).items()}
+        if pattern.kind() == "identifier" and pattern.text() != "_" and all(
+                value is not None and not isinstance(value, tuple) for value in rows):
+            return {parts(pattern): rows}
+        return {}
+
+    def loop_range(self, node):
+        if node is None or node.kind() != "range_expression":
+            return None
+        bounds = children(node)
+        if len(bounds) != 2:
+            return None
+        start, stop = [self.known_value(bound) for bound in bounds]
+        if start is not None and stop is not None:
+            return range(start, stop + any(part.kind() == "..=" for part in node.children()))
+        return None
+
+    def while_has_work(self, condition):
+        if condition is None or condition.kind() != "let_condition":
+            return False
+        pattern = condition.field("pattern")
+        value = condition.field("value")
+        if pattern is None or value is None or not pattern.text().startswith("Some("):
+            return False
+        if value.kind() == "await_expression":
+            value = children(value)[0]
+        if value.kind() != "call_expression":
+            return False
+        call = self.syntax.call(value)
+        return call.method == "join_next" and bool(self.size(call.receiver))
 
     def strategy_minimum(self, node):
         if node.kind() != "range_expression":
@@ -406,27 +689,71 @@ class Flow:
 
     def branch(self, node):
         before = len(self.checks)
-        primary = self.visit(node.field("condition"))
+        condition = node.field("condition")
+        primary = self.visit(condition)
+        if witness := self.branch_witness(condition):
+            name, value = witness
+            domains = self.loop_ranges
+            self.loop_ranges = {**domains, name: range(value, value + 1)}
+            checked = self.isolated(node.field("consequence"))
+            self.loop_ranges = domains
+            for arm in children(node):
+                if arm.kind() == "else_clause":
+                    self.conditional(arm)
+            return primary or checked
         if primary:
             self.visit(node.field("consequence"))
             for arm in children(node):
                 if arm.kind() in {"elif_clause", "else_clause"}:
                     self.visit(arm)
             return True
-        branches = [self.visit(node.field("consequence"))]
+        branches = [self.isolated(node.field("consequence"))]
         alternatives = [child for child in children(node) if child.kind() in {"elif_clause", "else_clause"}]
         for arm in alternatives:
             if arm.kind() == "elif_clause":
-                condition = self.visit(arm.field("condition"))
-                body = self.visit(arm.field("consequence"))
+                condition = self.isolated(arm.field("condition"))
+                body = self.isolated(arm.field("consequence"))
                 branches.append(condition or body)
             else:
-                branches.append(self.visit(arm.field("body") or next(iter(children(arm)), None)))
+                branches.append(self.isolated(arm.field("body") or next(iter(children(arm)), None)))
         exhaustive = bool(alternatives and alternatives[-1].kind() == "else_clause" and all(branches))
         if not exhaustive:
             for check in self.checks[before:]:
                 check.guarded = True
         return exhaustive
+
+    def branch_witness(self, condition):
+        op, left, right = split_operands(condition)
+        if op not in COMPARISONS:
+            return None
+        name = parts(left)
+        if name not in self.loop_ranges:
+            name, right = parts(right), left
+            op = REVERSE_COMPARISON.get(op, op)
+        domain = self.loop_ranges.get(name)
+        bound = self.known_value(right)
+        if domain is not None and bound is not None:
+            for candidate in (domain.start, domain.stop - 1, bound - 1, bound, bound + 1):
+                if candidate in domain and COMPARISONS[op](candidate, bound):
+                    return name, candidate
+        return None
+
+    def reaches_match_arm(self, domain, arms, covered):
+        remaining = set()
+        for arm, (checked, _) in zip(arms, covered):
+            pattern = arm.field("pattern")
+            if pattern is None or pattern.field("condition") is not None:
+                return False
+            if pattern.text() == "_":
+                return checked and domain.stop - domain.start > len(remaining)
+            number = integer(self.syntax, next(iter(children(pattern)), None))
+            if number is None:
+                return False
+            if number in domain and number not in remaining:
+                if checked:
+                    return True
+                remaining.add(number)
+        return False
 
     def match(self, node):
         subject = node.field("value") or node.field("subject")
@@ -439,13 +766,23 @@ class Flow:
         covered = []
         for arm in arms:
             first = len(self.checks)
-            covered.append((self.visit(arm), self.checks[first:]))
+            covered.append((self.isolated(arm), self.checks[first:]))
         if self.syntax.language == "rust" and len(covered) > 1:
+            if (domain := self.loop_ranges.get(parts(subject))) is not None and (
+                    self.reaches_match_arm(domain, arms, covered)):
+                return True
             if all(checked for checked, _ in covered):
                 return True
             if sum(not checked for checked, _ in covered) == 1 and all(
                     not checked or checks and all(check.kind in FAILURES and not check.guarded for check in checks)
                     for checked, checks in covered):
+                return True
+            if self.strategies and any(check.predicate is not None and
+                                       literal(self.syntax, check.predicate) is False
+                                       for _, checks in covered for check in checks) and all(
+                    checked or arm.field("pattern") is not None
+                    and arm.field("pattern").text().replace(" ", "") == "(Err(_),Err(_))"
+                    for arm, (checked, _) in zip(arms, covered)):
                 return True
         if not condition:
             for check in self.checks[before:]:
@@ -460,8 +797,85 @@ class Flow:
         start = offset(statement)
         for jump in query(statement, *jumps):
             boundaries = SCOPES if jump.kind().startswith("return") else SCOPES | loops
-            if not any(parent.kind() in boundaries and offset(parent) >= start for parent in jump.ancestors()):
+            if any(parent.kind() in boundaries and offset(parent) >= start for parent in jump.ancestors()):
+                continue
+            if jump.kind() == "return_expression":
+                if self.checked_return(jump) or self.fixture_skip(jump):
+                    continue
+            if jump.kind() == "continue_statement" and self.prune_continued_rows(statement, jump):
+                continue
+            return True
+        return False
+
+    def checked_return(self, jump):
+        statement = jump.parent()
+        if statement.kind() == "expression_statement":
+            statement = statement.parent()
+        if statement.kind() != "block":
+            return False
+        for sibling in direct_statements(statement):
+            if offset(sibling) >= offset(jump):
+                break
+            if sibling.kind() == "macro_invocation" and macro_name(sibling)[-1:] in {
+                    (name,) for name in RUST_ASSERTIONS}:
                 return True
+        return False
+
+    def fixture_skip(self, jump):
+        if children(jump):
+            return False
+        block = next((parent for parent in jump.ancestors() if parent.kind() == "block"), None)
+        if block is None or block == self.body:
+            return False
+        if any(parent.kind() in {"loop_expression", "for_expression", "while_expression"}
+               for parent in block.ancestors() if not any(
+                   scope.kind() in SCOPES for scope in parent.ancestors() if offset(scope) > offset(self.body))):
+            return False
+        owner = block.parent()
+        if owner.kind() == "let_declaration" and owner.field("alternative") == block:
+            value = owner.field("value")
+            return value is not None and value.kind() == "call_expression" and (
+                self.syntax.call(value).name in {("std", "env", "var"), ("env", "var"), ("writable_dir",)})
+        if owner.kind() == "if_expression":
+            condition = owner.field("condition")
+            probes = [self.syntax.call(probe) for probe in query(condition, "call_expression")]
+            if any(call.name[-2:] == ("Command", "new") for call in probes) and any(
+                    call.method == "arg" and len(call.arguments) == 1 and
+                    literal(self.syntax, call.arguments[0]) == "--version" for call in probes):
+                return True
+            for call in probes:
+                if call.method.startswith(("should_run_", "require_")) or call.name in {
+                        ("std", "env", "var"), ("env", "var"), ("libc", "geteuid"),
+                        ("libc", "getuid"), ("libc", "mkfifo")}:
+                    return True
+        return any(any(isinstance(message := literal(self.syntax, arg), str) and "skip" in message.casefold()
+                       for arg in self.syntax.macro_arguments(macro))
+                   for macro in query(block, "macro_invocation")
+                   if macro_name(macro)[-1:] in {("eprintln",), ("println",)})
+
+    def prune_continued_rows(self, statement, jump):
+        if statement.kind() == "expression_statement":
+            statement = next(iter(children(statement)), statement)
+        if statement.kind() != "if_statement" or statement.field("alternative") is not None:
+            return False
+        body = statement.field("consequence")
+        if list(direct_statements(body)) != [jump]:
+            return False
+        op, left, right = split_operands(statement.field("condition"))
+        if op not in {"==", "!="}:
+            return False
+        name = parts(left)
+        rows = self.loop_values.get(name)
+        against = literal(self.syntax, right)
+        if not rows or against is UNKNOWN:
+            return False
+        values = [literal(self.syntax, row) for row in rows]
+        if any(value is UNKNOWN for value in values):
+            return False
+        remaining = [row for row, value in zip(rows, values) if not COMPARISONS[op](value, against)]
+        if remaining:
+            self.loop_values = {**self.loop_values, name: remaining}
+            return True
         return False
 
     def visit(self, node):
@@ -496,7 +910,24 @@ class Flow:
             runs = (size is not None and size > 0 and not any(child.kind() == "async" for child in node.children())
                     or condition is not None and tri_truth(self.syntax, condition) is True
                     or kind == "loop_expression")
-            self.loops.append((iterator, node.field("pattern") or node.field("left"), body, runs))
+            runs |= self.while_has_work(condition)
+            if self.syntax.language == "rust" and condition is not None and condition.kind() == "let_condition":
+                value = condition.field("value")
+                if value is not None and value.kind() == "await_expression":
+                    value = children(value)[0]
+                if value is not None and value.kind() == "call_expression":
+                    call = self.syntax.call(value)
+                    if call.method == "join_next" and (name := parts(call.receiver)):
+                        self.writes[name].append(self.syntax.absolute(node))
+            pattern = node.field("pattern") or node.field("left")
+            self.loops.append((iterator, pattern, body, runs))
+            outer_values = self.loop_values
+            outer_ranges = self.loop_ranges
+            if runs:
+                self.loop_values = {**outer_values, **self.project_rows(pattern, self.fixture_rows(iterator))}
+            if (domain := self.loop_range(iterator)) is not None and domain.start < domain.stop and (
+                    len(name := parts(pattern)) == 1):
+                self.loop_ranges = {**outer_ranges, name: domain}
             before = self.collection_growth.copy()
             self.collection_growth = defaultdict(list, {name: sites.copy() for name, sites in before.items()})
             checked = self.visit(body) if runs else self.conditional(body)
@@ -506,6 +937,8 @@ class Flow:
                     sites[old:] = [(site, added * size) for site, added in sites[old:]]
             if not runs:
                 self.collection_growth = defaultdict(list, before)
+            self.loop_values = outer_values
+            self.loop_ranges = outer_ranges
             alternate = self.visit(node.field("alternative"))
             return evaluated or runs and checked or alternate
         if kind == "assert_statement":
@@ -539,7 +972,7 @@ class Flow:
                 if call.method not in {"clone", "len", "as_ref", "is_empty", "as_str", "as_slice",
                                         "to_vec", "to_owned", "iter", "contains", "get"}:
                     self.alias_changes[receiver[0]].append(site)
-                if call.method in {"push", "append", "push_back", "push_front", "extend"}:
+                if call.method in {"push", "append", "push_back", "push_front", "extend", "spawn"}:
                     added = (self.size(call.arguments[0]) or 0) if call.method == "extend" and call.arguments else 1
                     self.collection_growth[receiver].append((site, added))
             if self.syntax.language == "rust" and call.receiver is not None:
@@ -566,10 +999,7 @@ class Flow:
                         finally:
                             self.active_closures.remove(identity)
                 for argument in call.arguments:
-                    if argument.kind() == "reference_expression" and any(
-                            child.kind() == "mutable_specifier" for child in children(argument)):
-                        if borrowed := parts(children(argument)[-1]):
-                            self.alias_changes[borrowed[0]].append(site)
+                    self.record_mutable_borrow(argument, site)
                     if argument.kind() == "closure_expression":
                         callback = body_of(argument)
                         if call.method in {"unwrap_or_else", "expect_err"} and callback is not None and any(
@@ -579,6 +1009,10 @@ class Flow:
                         if callback is not None:
                             checked_callback |= self.visit(callback)
             if recognized:
+                if call.macro and call.method in RUST_ASSERTIONS:
+                    for argument in call.arguments:
+                        for borrow in query(argument, "reference_expression"):
+                            self.record_mutable_borrow(borrow, site)
                 check = check_call(self.syntax, node, call)
                 check.outcome = outcome
                 check.guarded = self.comprehension_guard(check)
@@ -599,7 +1033,16 @@ class Flow:
             if call.macro:
                 return False
         target, value = binding(node)
+        if kind in {"assignment", "augmented_assignment", "assignment_expression", "compound_assignment_expr"}:
+            left = node.field("left")
+            if left is not None and left.kind() in {"subscript", "index_expression"}:
+                indexed = parts(left.field("value") or next(iter(children(left)), None))
+                if indexed:
+                    site = self.syntax.absolute(node)
+                    self.writes[indexed].append(site)
+                    self.alias_changes[indexed[0]].append(site)
         if target:
+            self.mark_vector(node.field("type"), value)
             location = self.syntax.absolute(node)
             if len(target) > 1 or kind in {"augmented_assignment", "compound_assignment_expr"}:
                 self.writes[target[:1]].append(location)
@@ -607,6 +1050,15 @@ class Flow:
                 self.alias_changes[target[0]].append(location)
             self.bindings[target].append((location, value))
         return any([self.visit(child) for child in children(node)])
+
+    def record_mutable_borrow(self, node, site):
+        if node.kind() != "reference_expression":
+            return
+        elements = children(node)
+        if any(child.kind() == "mutable_specifier" for child in elements):
+            if borrowed := parts(elements[-1]):
+                self.alias_changes[borrowed[0]].append(site)
+                self.writes[borrowed].append(site)
 
     def receiver_owner(self, node, before, seen=frozenset()):
         node = unwrap(node)
@@ -671,9 +1123,9 @@ class Flow:
             return True
         at = self.file.line_at(check.location)
         comment = " ".join(comments.get(position, "") for position in (at - 1, at))
-        if any(lint.DISTINCT_INPUTS.search(text) for text in (name, comment)):
+        if any(lint.describes_distinct_inputs(text) for text in (name, comment)):
             return True
-        if any(lint.REPEATABILITY.search(text) for text in (name, comment)):
+        if any(lint.suggests_repeatability(text) for text in (name, comment)):
             return False
         for companion in self.checks:
             if companion is check:
@@ -713,7 +1165,7 @@ class Flow:
                 return False
             if all(self.success_only(check) for check in checks):
                 return False
-        if lint.OUTCOME_CLAIM.search(name) and all(
+        if lint.claims_outcome(name) and all(
                 check.predicate is not None and check.predicate.kind() in CALLS
                 and self.syntax.call(check.predicate).method == "is_ok" for check in checks):
             return False
@@ -756,12 +1208,25 @@ class Flow:
         subject_path = parts(subject)
         if subject_path or subject is not None and subject.kind() in CALLS and self.syntax.language == "python":
             yield subject, positive
+        if check.kind in {"expect", "unwrap"} and check.source.kind() == "call_expression":
+            receiver = self.syntax.call(check.source).receiver
+            if receiver is not None and receiver.kind() == "call_expression":
+                search = self.syntax.call(receiver)
+                if search.method in {"find", "first", "last", "get"}:
+                    yield search.receiver, True
         if subject is not None and subject.kind() in CALLS:
             call = self.syntax.call(subject)
             if call.method == "is_empty" and not call.arguments:
                 yield call.receiver, not positive
-            elif positive and call.method in {"any", "contains", "contains_key"}:
+            elif positive and call.method in {"any", "contains", "contains_key", "is_some"}:
                 receiver = call.receiver
+                if call.method == "is_some":
+                    if receiver is None or receiver.kind() not in CALLS:
+                        return
+                    search = self.syntax.call(receiver)
+                    if search.method not in {"find", "first", "last", "get"}:
+                        return
+                    receiver = search.receiver
                 if receiver is not None and receiver.kind() in CALLS:
                     previous = self.syntax.call(receiver)
                     if previous.method in {"iter", "iter_mut"}:
@@ -779,10 +1244,13 @@ class Flow:
             known = literal(self.syntax, other)
             if isinstance(known, lint.SuffixedNumber):
                 known = known.value
-            length = self.size(other, before=check.location)
-            if operand is None or known is UNKNOWN and length is None:
+            if known is UNKNOWN and (other.kind() in {"list", "tuple", "set", "dictionary",
+                                                      "array_expression", "tuple_expression"}
+                                     or other.kind() == "macro_invocation" and macro_name(other) == ("vec",)):
+                known = self.size(other, before=check.location, exact=True)
+            if operand is None or known is UNKNOWN or known is None:
                 continue
-            value = length if known is UNKNOWN else known
+            value = known
             if operator == "==":
                 yield operand, bool(value)
             elif operator in {"!=", ">"} and not value or operator == ">=" and type(value) is int and value > 0:
@@ -871,7 +1339,7 @@ class Flow:
                     yield self.file.line_at(check.location)
             elif name in writes and name not in negative:
                 methods = {parts(call.receiver) for _, call in self.calls if call.method not in RECORDING}
-                if name not in methods and not self.is_read_in_checks(name):
+                if name not in methods and not self.is_read_in_checks(name) and not self.serialized(name):
                     callback_write = next((site for site, node in writes[name]
                                            if any(parent.kind() in {callback_kind, "function_definition"}
                                                   for parent in node.ancestors()
@@ -880,6 +1348,17 @@ class Flow:
                         yield self.file.line_at(callback_write)
         yield from self.unobserved_callback_writes(recorders)
         self.detector_absences(observations)
+
+    def serialized(self, name):
+        if self.syntax.language != "rust":
+            return False
+        for node, call in self.calls:
+            if call.macro and call.name == ("serde_json", "json") and not any(
+                    parent.kind() == "closure_expression" for parent in node.ancestors()):
+                if any(parts(identifier) == name for identifier in query(node, "identifier")
+                       if identifier.inside(kind="token_tree")):
+                    return True
+        return False
 
     def is_read_in_checks(self, name):
         for check in self.checks:
@@ -925,6 +1404,41 @@ class Flow:
                 return False
         return True
 
+    def positive_sources(self, node, site):
+        while node is not None:
+            node = unwrap(node)
+            if node.kind() == "reference_expression":
+                node = children(node)[-1]
+                continue
+            yield node
+            name = parts(node)
+            if name:
+                binding_site = max((start for start, _ in self.bindings.get(name, ()) if start < site), default=-1)
+                if any(binding_site < changed < site for changed in self.writes[name]):
+                    return
+                value = self.resolve(name, site)
+                if value is None or shape(value) == shape(node):
+                    return
+                node, site = value, binding_site
+                continue
+            if node.kind() in CALLS:
+                call = self.syntax.call(node)
+                if call.method in {"iter", "into_iter", "filter", "filter_map", "map", "collect",
+                                   "enumerate", "copied", "cloned", "as_ref", "as_slice"}:
+                    node = call.receiver
+                    continue
+            return
+
+    def checked_detectors(self):
+        for check in self.checks:
+            if check.guarded:
+                continue
+            for operand, present in self.observations(check):
+                if present and operand is not None:
+                    for source in self.positive_sources(operand, check.location):
+                        if producer := self.detector(source):
+                            yield producer
+
     def detector_absences(self, observations):
         present_values = set()
         candidates = []
@@ -937,57 +1451,73 @@ class Flow:
             value = self.resolve(name, check.location) if name else operand
             if value is None:
                 continue
-            candidates.append((value, present, check.location))
             if present:
-                present_values.add(shape(value))
+                for source in self.positive_sources(value, check.location):
+                    present_values.add(shape(source))
+                    if producer := self.detector(source):
+                        self.file.detectors.append((producer, True, self.file.line_at(check.location)))
+            else:
+                candidates.append((value, check.location))
         reported = set()
-        for value, present, site in candidates:
-            if not present:
-                sources = self.iteration_sources(value)
-                if any(self.runtime_inventory(source) and shape(source) not in present_values
-                       for source in sources):
-                    self.file.detectors.append((("sweep", shape(value)), False, self.file.line_at(site)))
-                    continue
+        for value, site in candidates:
+            if any(self.runtime_inventory(source) and shape(source) not in present_values
+                   for source in self.sweep_sources(value)):
+                self.file.detectors.append((("sweep", shape(value)), False, self.file.line_at(site)))
+                continue
             producer = self.detector(value)
-            if producer is not None and (producer, present) not in reported:
-                self.file.detectors.append((producer, present, self.file.line_at(site)))
-                reported.add((producer, present))
+            if producer is not None and producer not in reported:
+                self.file.detectors.append((producer, False, self.file.line_at(site)))
+                reported.add(producer)
 
-    def iteration_sources(self, node):
-        if node.kind() in {"list_comprehension", "set_comprehension", "dictionary_comprehension",
-                           "generator_expression"}:
-            for clause in query(node, "for_in_clause"):
-                source = clause.field("right")
-                yield self.resolve(parts(source), self.syntax.absolute(source)) or source
-        elif node.kind() in CALLS:
-            call = self.syntax.call(node)
-            if call.method in {"filter", "filter_map", "map", "collect", "flatten", "iter", "into_iter",
-                               "unwrap", "expect", "copied", "cloned"}:
-                source = call.receiver
-                if source is not None:
-                    value = self.resolve(parts(source), self.syntax.absolute(source))
-                    if value is not None:
-                        yield value
-                    yield from self.iteration_sources(source)
-            elif call.method in {"list", "set", "tuple"} and call.arguments:
-                yield from self.iteration_sources(call.arguments[0])
-            elif call.method in {"read_dir", "iterdir", "glob", "rglob", "listdir", "walk"}:
-                yield node
-
-    def runtime_inventory(self, node, seen=frozenset()):
-        if node is None or node.kind() not in CALLS:
-            return False
+    def sweep_sources(self, node):
+        if self.syntax.language == "python":
+            node = self.unwrap_materializer(node)
+            if node.kind() in {"list_comprehension", "set_comprehension", "dictionary_comprehension",
+                               "generator_expression"}:
+                for clause in children(node):
+                    if clause.kind() == "for_in_clause":
+                        source = clause.field("right")
+                        yield self.resolve(parts(source), self.syntax.absolute(source)) or source
+            return
+        if node.kind() != "call_expression":
+            return
         call = self.syntax.call(node)
-        if call.method in {"read_dir", "iterdir", "glob", "rglob", "listdir", "walk"}:
-            return True
-        if call.receiver is not None:
-            return self.runtime_inventory(call.receiver, seen)
-        if call.method in {"list", "tuple", "set", "sorted"} and call.arguments:
-            return self.runtime_inventory(call.arguments[0], seen)
-        if (target := self.file.resolve_function(call.name, self.scope)) is not None and target not in seen:
-            body = body_of(self.file.functions[target])
-            return any(self.runtime_inventory(call, seen | {target}) for call in query(body, *self.call_kinds)
-                       if call.kind() != "macro_invocation")
+        if call.method != "collect":
+            return
+        source = call.receiver
+        filtered = False
+        while source is not None and source.kind() == "call_expression":
+            step = self.syntax.call(source)
+            if step.method not in {"filter", "filter_map", "map", "flatten", "iter", "into_iter",
+                                   "unwrap", "expect", "copied", "cloned", "enumerate"}:
+                break
+            filtered |= step.method in {"filter", "filter_map"}
+            source = step.receiver
+        if filtered and source is not None:
+            yield self.resolve(parts(source), self.syntax.absolute(source)) or source
+
+    def unwrap_materializer(self, node):
+        while node is not None and node.kind() == "call":
+            call = self.syntax.call(node)
+            if call.receiver is not None or call.method not in {"list", "tuple", "set", "sorted"} or (
+                    len(call.arguments) != 1):
+                break
+            node = call.arguments[0]
+        return node
+
+    def runtime_inventory(self, node):
+        if self.syntax.language == "python":
+            node = self.unwrap_materializer(node)
+        while node is not None and node.kind() in CALLS:
+            call = self.syntax.call(node)
+            if self.syntax.language == "python":
+                return call.method in {"listdir", "scandir", "glob", "iglob", "rglob", "iterdir"}
+            if call.method in {"read_dir", "glob", "glob_with"} or call.name[-2:] == ("WalkDir", "new"):
+                return True
+            if call.method not in {"unwrap", "expect", "unwrap_or_default", "flatten", "map", "filter",
+                                   "filter_map", "collect", "into_iter", "iter"}:
+                return False
+            node = call.receiver
         return False
 
     def detector(self, node):
@@ -1020,13 +1550,15 @@ class File:
                 self.lines.append(index + 1)
         self.path = path
         self.scan_root = scan_root
-        self.module_files = {}
+        self.module_files = {path.resolve(): self}
+        self.module_context = None
         self.functions = {}
         self.function_items = []
         self.bases = {}
         self.macros = {}
         self.constants = {}
         self.imports = {}
+        self.glob_imports = defaultdict(list)
         self.detectors = []
         self.recorder_witnesses = set()
         self.recorder_absences = []
@@ -1060,10 +1592,10 @@ class File:
             "assignment", "import_statement", "import_from_statement")
         table = defaultdict(list)
         for node in query(self.syntax.root, *declarations):
-            if any(parent.kind() in FUNCTIONS for parent in node.ancestors()):
-                continue
             owner = namespace(node)
             kind = node.kind()
+            if kind == "assignment" and any(parent.kind() in FUNCTIONS for parent in node.ancestors()):
+                continue
             if kind == "macro_definition":
                 self.macros[(*owner, function_name(node))] = node
             elif kind == "use_declaration":
@@ -1073,10 +1605,14 @@ class File:
                     name = child.field("name") or child
                     alias = child.field("alias")
                     if name is not None:
-                        module = child_text(node.field("module_name")).strip(".")
+                        module = child_text(node.field("module_name"))
+                        relative = len(module) - len(module.lstrip("."))
+                        prefix = tuple(module.lstrip(".").split(".")) if module.lstrip(".") else ()
                         path = tuple(name.text().split("."))
-                        self.imports[(*owner, child_text(alias) or path[0])] = (
-                            *module.split("."), *path) if module else path
+                        key = (*owner, child_text(alias) or path[0])
+                        if not module and alias is None:
+                            path = path[:1]
+                        self.imports[key] = (*("." for _ in range(relative)), *prefix, *path)
             else:
                 name, value = binding(node)
                 if name and value is not None:
@@ -1092,68 +1628,202 @@ class File:
         elif kind == "use_list":
             for child in children(node):
                 self.index_rust_import(child, scope, prefix)
+        elif kind == "use_wildcard":
+            base = next(iter(children(node)), None)
+            self.glob_imports[scope].append((*prefix, *parts(base)))
         elif kind == "use_as_clause":
             path = (*prefix, *parts(node.field("path")))
             alias = child_text(node.field("alias"))
             if path and alias:
                 self.imports[(*scope, alias)] = path
         elif path := parts(node):
-            self.imports[(*scope, path[-1])] = (*prefix, *path)
+            if path == ("self",) and prefix:
+                self.imports[(*scope, prefix[-1])] = prefix
+            else:
+                self.imports[(*scope, path[-1])] = (*prefix, *path)
 
     def constant(self, name, scope):
+        definition = self.fixture_definition(name, scope, "constants")
+        return definition[2] if definition else None
+
+    def fixture_function(self, name, scope):
+        if self.syntax.language == "python":
+            target = self.resolve_function(name, scope)
+            if target is not None:
+                function = self.functions[target]
+                decorator = function.parent()
+                if decorator.kind() != "decorated_definition" or all(
+                        child_text(next(iter(children(part)), None)) in {"staticmethod", "classmethod"}
+                        for part in children(decorator) if part.kind() == "decorator"):
+                    return self, target, function
+        return self.fixture_definition(name, scope, "functions")
+
+    def fixture_definition(self, name, scope, table, seen=frozenset()):
         if not name:
             return None
-        if name[0] == "crate":
-            return self.constants.get(name[1:]) or self.imported_constant(name[1:])
+        identity = self.path, name, scope
+        if identity in seen:
+            return None
+        seen = seen | {identity}
+        definitions = getattr(self, table)
+        rust = self.syntax.language == "rust"
+        if rust and name[0] in {"self", "super", "crate"}:
+            return self.rust_definition(name, scope, table, seen)
         for end in range(len(scope), -1, -1):
             owner = scope[:end]
-            path = (*owner, *name)
-            if path in self.constants:
-                return self.constants[path]
-            imported = self.imports.get((*owner, name[0]))
-            if imported:
-                qualified = (*imported, *name[1:])
-                if qualified[:1] == ("crate",):
-                    qualified = qualified[1:]
-                if qualified in self.constants:
-                    return self.constants[qualified]
-                if result := self.imported_constant(qualified):
-                    return result
-        return self.imported_constant(name)
+            candidate = (*owner, *name)
+            if candidate in definitions:
+                return self, candidate, definitions[candidate]
+            if not rust and name[:1] in {("self",), ("cls",)} and (*owner, *name[1:]) in definitions:
+                candidate = (*owner, *name[1:])
+                return self, candidate, definitions[candidate]
+            if imported := self.imports.get((*owner, name[0])):
+                path = (*imported, *name[1:])
+                if rust:
+                    return self.rust_definition(path, owner, table, seen)
+                return self.python_definition(path, table, seen)
+            if rust and owner in self.glob_imports:
+                matches = [result for glob in self.glob_imports[owner]
+                           if (result := self.rust_definition((*glob, *name), owner, table, seen))]
+                if len(matches) == 1:
+                    return matches[0]
+        if not rust and len(name) == 2 and table == "constants":
+            if (script := self.python_script(name[0])) is not None:
+                return script.fixture_definition(name[1:], (), table, seen)
+        return None
 
-    def imported_constant(self, qualified):
-        if self.scan_root is None or len(qualified) < 2:
-            return None
-        module, name = qualified[:-1], qualified[-1:]
-        if module not in self.module_files:
-            self.module_files[module] = self.read_module(module)
-        return self.module_files[module].get(name)
-
-    def read_module(self, module):
-        current = self.path.resolve()
-        if self.syntax.language == "rust":
-            root = project_root(current, self.scan_root, {"Cargo.toml", ".git"})
-            bases = (root / "src", current.parent)
-            extension, package = ".rs", "mod.rs"
+    def rust_definition(self, name, scope, table, seen):
+        if name[0] == "crate":
+            absolute = name[1:]
+        elif name[0] in {"self", "super"}:
+            module = self.rust_context()[1]
+            parent = (*module, *scope)
+            for part in name:
+                if part == "super":
+                    parent = parent[:-1]
+                elif part != "self":
+                    break
+            while name and name[0] in {"self", "super"}:
+                name = name[1:]
+            absolute = (*parent, *name)
+        elif name[0] == self.rust_context()[2]:
+            absolute = name[1:]
         else:
-            root = project_root(current, self.scan_root, {"pyproject.toml", "setup.py", ".git"})
-            bases = (root, root / "src", current.parent)
-            extension, package = ".py", "__init__.py"
+            return None
+        if not absolute:
+            return None
+        source_root, module, _ = self.rust_context()
+        definitions = getattr(self, table)
+        if absolute[:len(module)] == module and (local := absolute[len(module):]) in definitions:
+            return self, local, definitions[local]
+        if self.scan_root is None:
+            return None
+        for depth in range(len(absolute) - 1, -1, -1):
+            stem = source_root.joinpath(*absolute[:depth])
+            paths = ((stem.with_suffix(".rs"), stem / "mod.rs") if depth else
+                     (stem / "lib.rs", stem / "main.rs"))
+            available = [path for path in paths if path.is_file()]
+            if len(available) == 1:
+                file = self.load_module(available[0])
+                if file is not None:
+                    return file.fixture_definition(absolute[depth:], (), table, seen)
+        return None
+
+    def rust_context(self):
+        if self.module_context is None:
+            path = self.path.resolve()
+            root = project_root(path, self.scan_root, {"Cargo.toml", ".git"})
+            source = next((directory for directory in path.parents if directory.is_relative_to(root / "src")
+                           and ((directory / "lib.rs").is_file() or (directory / "main.rs").is_file())),
+                          root / "src")
+            module = path.relative_to(source).with_suffix("").parts if path.is_relative_to(source) else ()
+            if module and module[-1] in {"mod", "lib", "main"}:
+                module = module[:-1]
+            package = ""
+            try:
+                config = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+                package = config.get("lib", {}).get("name") or config.get("package", {}).get("name", "")
+            except (OSError, ValueError):
+                pass
+            self.module_context = source, module, package.replace("-", "_") if isinstance(package, str) else ""
+        return self.module_context
+
+    def python_definition(self, name, table, seen):
+        if self.scan_root is None or len(name) < 2:
+            return None
+        relative = sum(part == "." for part in name)
+        path = self.path.resolve()
+        root = project_root(path, self.scan_root, {".git", "pyproject.toml", "setup.py"})
+        if relative >= len(path.parents):
+            return None
+        bases = (path.parents[relative - 1],) if relative else tuple(
+            base for parent in path.parents if parent.is_relative_to(root) for base in (parent, parent / "src"))
+        module, target = name[relative:-1], name[-1:]
         for base in bases:
             stem = base.joinpath(*module)
-            for candidate in (stem.with_suffix(extension), stem / package):
-                if not candidate.is_file() or candidate == current or not candidate.resolve().is_relative_to(root):
-                    continue
+            for candidate in (stem.with_suffix(".py"), stem / "__init__.py"):
+                if candidate.is_file() and (file := self.load_module(candidate)) is not None:
+                    return file.fixture_definition(target, (), table, seen)
+        return None
+
+    def python_script(self, alias):
+        if self.scan_root is None:
+            return None
+
+        def args(node, callee):
+            if node is not None and node.kind() == "call":
+                call = self.syntax.call(node)
+                if call.name == tuple(callee.split(".")):
+                    return call.arguments
+            return []
+
+        module = args(self.constants.get((alias,)), "importlib.util.module_from_spec")
+        spec = args(self.constants.get(parts(module[0])), "importlib.util.spec_from_loader") if len(module) == 1 else []
+        if len(spec) != 2:
+            return None
+        loader = parts(spec[1])
+        source = args(self.constants.get(loader), "importlib.machinery.SourceFileLoader")
+        if len(source) != 2:
+            return None
+        path = args(source[1], "str")
+        if len(path) != 1:
+            return None
+        expression = self.constants.get(parts(path[0]))
+        op, parent, filename = split_operands(expression)
+        if op != "/" or parent.kind() != "subscript":
+            return None
+        resolve = parent.field("value")
+        if resolve is None or not resolve.matches(pattern="Path(__file__).resolve().parents"):
+            return None
+        level = integer(self.syntax, parent.field("subscript"))
+        name = literal(self.syntax, filename)
+        if level is not None and 0 <= level < len(self.path.resolve().parents) and isinstance(name, str):
+            if any(self.syntax.call(node).name == (*loader, "exec_module") and
+                   [parts(arg) for arg in self.syntax.call(node).arguments] == [(alias,)]
+                   for node in direct_statements(self.syntax.root) if node.kind() == "call"):
+                return self.load_module(self.path.resolve().parents[level] / name)
+        return None
+
+    def load_module(self, candidate):
+        candidate = candidate.resolve()
+        if candidate == self.path.resolve():
+            return self
+        if candidate not in self.module_files:
+            root = project_root(self.path, self.scan_root, {".git", "Cargo.toml", "pyproject.toml", "setup.py"})
+            file = None
+            if candidate.is_relative_to(root):
                 try:
                     if self.syntax.language == "python":
                         with tokenize.open(candidate) as stream:
                             source = stream.read()
                     else:
                         source = candidate.read_text(encoding="utf-8")
-                    return File(source, self.syntax.language, candidate).constants
+                    file = File(source, self.syntax.language, candidate, self.scan_root)
+                    file.module_files = self.module_files
                 except (OSError, UnicodeError, ValueError, SyntaxError):
-                    return {}
-        return {}
+                    pass
+            self.module_files[candidate] = file
+        return self.module_files[candidate]
 
     def python_method(self, owner, name, seen=frozenset()):
         if not owner or owner in seen:
@@ -1313,6 +1983,7 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
     spans = {(comment.line, comment.column) for comment in comments if comment.standalone}
     observations = []
     pending_recorders = []
+    control_helpers = set()
     for syntax, fn, test, attrs, initial in file.inventory():
         if body_of(fn) is None:
             continue
@@ -1326,7 +1997,14 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
         guaranteed = flow.visit(flow.body)
         should_panic = ("should_panic",) in attrs
         ignored = ("ignore",) in attrs
-        ignored_tool = ignored and all(check.kind == "expect" for check in flow.checks)
+        ignored_diagnostic = ignored and any(
+            attribute_name(attribute) == ("ignore",) and "diagnostic" in attribute.text().casefold()
+            for attribute in attributes(fn)
+        )
+        ignored_tool = ignored and all(
+            check.kind == "expect" or ignored_diagnostic and check.kind in FAILURES | {"unwrap"}
+            for check in flow.checks
+        )
         test.guarded = any(check.reachability for check in flow.checks) and not (
             guaranteed or should_panic or ignored_tool)
         if not (should_panic or ignored or flow.verifies_outcome(test.name)):
@@ -1337,8 +2015,12 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
                 test.issues.append((check_line, "const-truth"))
             if flow.compares_itself(check, test.name, line_comments):
                 test.issues.append((check_line, "self-compare"))
+        if not ignored:
+            control_helpers.update(target for _, call in flow.calls if not call.macro
+                                   and (target := file.resolve_function(call.name, flow.scope)) is not None)
         test.issues.extend((site, "absence-no-control") for site in flow.recorder_evidence())
         observations.extend((key, present, site, test) for key, present, site in file.detectors)
+
         file.detectors.clear()
         pending_recorders.extend((key, site, test) for key, site in file.recorder_absences)
         file.recorder_absences.clear()
@@ -1352,6 +2034,16 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
         if key not in file.recorder_witnesses:
             test.issues.append((site, "absence-no-control"))
     witnessed = {key for key, present, _, _ in observations if present}
+    missing = {key for key, present, _, _ in observations if not present and key not in witnessed}
+    if file.syntax.language == "rust" and missing:
+        names = {key[0] for key in missing if key[0] != "sweep"}
+        for target in control_helpers:
+            function = file.functions[target]
+            body = body_of(function)
+            if names and any(identifier.text() in names for identifier in query(body, "identifier")):
+                helper = Flow(file, file.syntax, body, target)
+                helper.visit(body)
+                witnessed.update(helper.checked_detectors())
     if collection_controls is not None:
         for key in witnessed:
             collection_controls.record(path, scan_root, key)

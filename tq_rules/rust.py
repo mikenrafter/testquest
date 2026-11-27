@@ -6,7 +6,7 @@ import re
 from string import Formatter
 
 from .lint import (UNKNOWN, SuffixedNumber, assertion, different_callees, argument_claims, fixed_boundary, fixed_operand, helper, loose_bounds,
-                   named_arguments, prefix_satisfies, DISTINCT_INPUTS, claims_effect, OUTCOME_CLAIM, REPEATABILITY,
+                   named_arguments, prefix_satisfies, describes_distinct_inputs, claims_effect, claims_outcome, suggests_repeatability,
                    symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN, inverse_codecs, path_directories, pins_path)
 from .source import Comment, Test
 
@@ -2540,9 +2540,9 @@ class Inspect:
         if op != "==" or not contains_call(left):
             return True
         comment = " ".join(line_comments.get(loc, "") for loc in (line - 1, line))
-        if DISTINCT_INPUTS.search(test_name) or DISTINCT_INPUTS.search(comment):
+        if describes_distinct_inputs(test_name) or describes_distinct_inputs(comment):
             return True
-        if REPEATABILITY.search(test_name) or REPEATABILITY.search(comment):
+        if suggests_repeatability(test_name) or suggests_repeatability(comment):
             return False
         for other_line, name, args, _ in self.checks:
             if other_line == line:
@@ -2891,7 +2891,7 @@ def has_outcome_evidence(test, inspector, body, evidence):
     if not evidence.checks(tokens, scope):
         return False
     assertions = [(name, args) for _, name, args, _ in inspector.checks if name in ASSERTIONS]
-    if (OUTCOME_CLAIM.search(test.name) and assertions
+    if (claims_outcome(test.name) and assertions
             and all(name in {"assert", "debug_assert", "prop_assert"} and args
                     and method_call(args[0])[1] == "is_ok" and success_check(name, args)
                     for name, args in assertions)

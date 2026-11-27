@@ -173,7 +173,7 @@ class Syntax:
         prefix = "mod tq {"
         source = tree.text()[1:]
         # The Rust parser recovers proptest's `name in strategy` parameter
-        # syntax inside ERROR nodes. Replace only the parameter AST span.
+        # syntax. Reparse the bindings and strategies as call arguments.
         template = Syntax.parse(prefix + source, "rust")
         strategies_at = {}
         edits = []
@@ -181,20 +181,19 @@ class Syntax:
             parameters = item.field("parameters")
             if parameters is None or item.field("body") is None:
                 continue
-            strategies = {}
-            for recovery in children(parameters):
-                if recovery.kind() != "ERROR":
-                    continue
-                entries = children(recovery)
-                for first, marker, value in zip(entries, entries[1:], entries[2:]):
-                    if first.kind() != "identifier" or marker.text() != "in":
-                        continue
-                    strategy = Syntax.parse("fn tq(){ let _ = " + value.text() + "; }", "rust")
-                    declaration = strategy.root.find(kind="let_declaration")
-                    if declaration is not None and not syntax_errors(strategy.root, missing=True):
-                        strategies[first.text()] = declaration.field("value")
             start = offset(parameters) + 1
             end = parameters.range().end.index - 1
+            span = list((prefix + source)[start:end])
+            for marker in query(parameters, "identifier"):
+                if marker.text() == "in":
+                    span[offset(marker) - start:offset(marker) - start + 2] = ", "
+            call = Syntax.parse("fn tq() { tq(" + "".join(span) + "); }", "rust")
+            args = call.root.find(kind="arguments")
+            entries = children(args) if args is not None else []
+            strategies = {}
+            if len(entries) % 2 == 0 and not syntax_errors(call.root, missing=True):
+                if all(name.kind() == "identifier" for name in entries[::2]):
+                    strategies = {name.text(): value for name, value in zip(entries[::2], entries[1::2])}
             if any(parent.kind() == "function_item" for parent in item.ancestors()):
                 continue
             edits.append((start, end))
@@ -225,7 +224,7 @@ def shape(node):
 
 def split_operands(node):
     node = unwrap(node)
-    if node is not None and node.kind() in {"binary_expression", "comparison_operator", "boolean_operator"}:
+    if node is not None and node.kind() in {"binary_expression", "binary_operator", "comparison_operator", "boolean_operator"}:
         elements = [child for child in node.children() if child.kind() not in COMMENTS]
         if len(elements) == 3:
             return elements[1].text(), elements[0], elements[2]

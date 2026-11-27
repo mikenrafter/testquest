@@ -10,7 +10,7 @@ import sys
 import tokenize
 
 from .lint import (UNKNOWN, assertion, different_callees, fixed_boundary, fixed_operand, argument_claims, helper, loose_bounds, named_arguments,
-                   prefix_satisfies, DISTINCT_INPUTS, claims_effect, OUTCOME_CLAIM, REPEATABILITY, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
+                   prefix_satisfies, describes_distinct_inputs, claims_effect, claims_outcome, suggests_repeatability, symmetric_input, unvaried_arguments, IMPORT_FIELDS, IMPORT_TOKEN,
                    inverse_codecs, path_directories, pins_path)
 from .source import Comment, Test, project_root
 
@@ -928,9 +928,9 @@ class Inspect(ast.NodeVisitor):
         if op is not ast.Eq or not any(isinstance(part, ast.Call) for part in ast.walk(left)):
             return True
         comment = " ".join(line_comments.get(loc, "") for loc in (line - 1, line))
-        if DISTINCT_INPUTS.search(test_name) or DISTINCT_INPUTS.search(comment):
+        if describes_distinct_inputs(test_name) or describes_distinct_inputs(comment):
             return True
-        if REPEATABILITY.search(test_name) or REPEATABILITY.search(comment):
+        if suggests_repeatability(test_name) or suggests_repeatability(comment):
             return False
         for other_line, node, _ in self.checks:
             if other_line == line:
@@ -1886,7 +1886,7 @@ def has_outcome_evidence(node, scope, checks_call):
         return False
     if any(not isinstance(part, ast.Assert) for part in evidence):
         return True
-    if OUTCOME_CLAIM.search(node.name) and all(
+    if claims_outcome(node.name) and all(
             isinstance(part.test, ast.Call) and isinstance(part.test.func, ast.Attribute)
             and part.test.func.attr == "is_ok" and not part.test.args and not part.test.keywords
             for part in evidence):

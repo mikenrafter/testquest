@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from itertools import groupby
 import re
 
 from .source import CollectionControls, finding, scan_paths
@@ -36,26 +37,66 @@ RULES = {
 }
 ADVISORY = {"nondistinguishing-literal", "self-derived-expected"}
 ORDERED_NAME = re.compile(r"reverse|order|swap|endian|rotate|crc|encode", re.I)
-REPEATABILITY = re.compile(r"(?<![a-z])(?:determin(?:ism|istic)|stabl(?:e|ity)|same|repeat\w*|reproducib\w*|idempotent|consistent)(?![a-z])", re.I)
-DISTINCT_INPUTS = re.compile(
-    r"(?<![a-z])(?:(?:both|two)[ _-]+(?:inputs?|lines?|keys?|paths?|requests?|files?|jobs?)"
-    r"|(?:different|distinct)[ _-]+(?:inputs?|lines?|keys?|paths?|calls?|requests?|files?|jobs?))(?![a-z])",
-    re.I,
-)
-OUTCOME_CLAIM = re.compile(
-    r"(?:^|_)(?:returns_none|rejects|fails_when|errors_on|is_empty|truncat(?:es|ed)_before"
-    r"|prints?_\w+?_to_(?:stderr|stdout))(?:_|$)")
-EFFECT_CLAIM = re.compile(
-    r"(?:^|_)(?:(?:prints|writes|sends|truncates|rejects|retries|records|emits|logs|deletes|creates)(?:_|$)"
-    r"|(?:idempotent|request_format)$)"
-)
-EFFECT_CONTEXT = re.compile(r"_(?:after|before|when|while|without)_")
 UNKNOWN = object()
+
+WORD_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZİıſK")
+LOWER_LETTERS = str.maketrans("İıſK", "iisk")
+REPEATABLE = {"determinism", "deterministic", "stable", "stablity", "same", "idempotent", "consistent"}
+INPUTS = {"input", "line", "key", "path", "request", "file", "job"}
+OUTCOME_CLAIMS = {"returns_none", "rejects", "fails_when", "errors_on", "is_empty",
+                  "truncates_before", "truncated_before"}
+EFFECT_VERBS = {"prints", "writes", "sends", "truncates", "rejects", "retries", "records",
+                "emits", "logs", "deletes", "creates"}
+EFFECT_CONTEXTS = ("_after_", "_before_", "_when_", "_while_", "_without_")
+
+
+def letter_runs(text):
+    normalized = text.translate(LOWER_LETTERS).lower()
+    return [(letters, "".join(run)) for letters, run in groupby(normalized, WORD_LETTERS.__contains__)]
+
+
+def suggests_repeatability(text):
+    return any(word in REPEATABLE or word.startswith(("repeat", "reproducib"))
+               for letters, word in letter_runs(text) if letters)
+
+
+def describes_distinct_inputs(text):
+    runs = letter_runs(text)
+    for first, middle, last in zip(runs, runs[1:], runs[2:]):
+        if not first[0] or middle[0] or not last[0] or set(middle[1]) - {" ", "_", "-"}:
+            continue
+        action, subject = first[1], last[1].removesuffix("s")
+        if (action in {"both", "two", "different", "distinct"} and subject in INPUTS
+                or action in {"different", "distinct"} and subject == "call"):
+            return True
+    return False
+
+
+def claims_outcome(name):
+    name = name.removesuffix("\n")
+    wrapped = f"_{name}_"
+    if any(f"_{claim}_" in wrapped for claim in OUTCOME_CLAIMS):
+        return True
+    words = name.split("_")
+    for index, word in enumerate(words):
+        if word not in {"print", "prints"}:
+            continue
+        for end in range(index + 2, len(words) - 1):
+            if words[end] == "to" and words[end + 1] in {"stderr", "stdout"}:
+                description = "_".join(words[index + 1:end])
+                if description and all(char.isalnum() or char == "_" for char in description):
+                    return True
+    return False
 
 
 def claims_effect(name):
-    claim = EFFECT_CONTEXT.split(name, maxsplit=1)[0]
-    return bool(EFFECT_CLAIM.search(claim))
+    name = name.removesuffix("\n")
+    end = min((index for context in EFFECT_CONTEXTS if (index := name.find(context)) >= 0),
+              default=len(name))
+    claim = name[:end]
+    words = claim.split("_")
+    return (any(word in EFFECT_VERBS for word in words) or words[-1] == "idempotent"
+            or words[-2:] == ["request", "format"])
 
 
 @dataclass(frozen=True)
