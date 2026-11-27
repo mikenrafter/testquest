@@ -18,7 +18,7 @@ TESTS = {"test", "it", "specify"}
 MODIFIERS = {"each", "only", "skip", "todo", "concurrent", "serial", "parallel", "failing", "fixme", "skipIf", "runIf", "fails"}
 FACTORIES = {"each", "skipIf", "runIf"}
 FRAMEWORKS = {"vitest", "jest", "@jest/globals", "node:test", "mocha", "@playwright/test", "playwright/test",
-              "bun:test", "ava", "chai", "fast-check", "vite-plus/test"}
+              "bun:test", "ava", "chai", "fast-check", "vite-plus/test", "@alchemy.run/test", "@effect/vitest"}
 ASSERT_MODULES = {"assert", "assert/strict", "node:assert", "node:assert/strict"}
 ASSERT_EQUAL = {"equal", "equals", "eq", "strictEqual", "deepEqual", "deepStrictEqual", "eql", "eqls",
                 "strictEquals", "deepEquals", "is", "toBe", "toEqual", "toStrictEqual"}
@@ -32,6 +32,12 @@ SPY_MATCHERS = {"toHaveBeenCalled", "toBeCalled", "toHaveBeenCalledWith", "toBeC
                 "toHaveBeenCalledOnce", "toHaveBeenCalledExactlyOnceWith", "toHaveBeenLastCalledWith",
                 "toHaveBeenNthCalledWith", "lastCalledWith", "nthCalledWith"}
 SPY_COUNTS = {"toHaveBeenCalledTimes", "toBeCalledTimes"}
+EXPECT_MODULES = {"vitest", "vite-plus/test", "jest", "@jest/globals", "chai", "@playwright/test",
+                  "playwright/test", "bun:test", "@alchemy.run/test", "@effect/vitest"}
+NODE_ASSERT_CHECKS = {"assert", "ok", "equal", "notEqual", "deepEqual", "notDeepEqual", "strictEqual",
+                      "notStrictEqual", "deepStrictEqual", "notDeepStrictEqual", "partialDeepStrictEqual",
+                      "match", "doesNotMatch", "throws", "doesNotThrow", "rejects", "doesNotReject",
+                      "fail", "ifError"}
 EXPECT_RECEIVERS = {("expect",), ("expect", "soft"), ("expect", "poll"), ("expect", "element")}
 ITERATORS = {"map", "forEach", "flatMap", "filter", "some", "every", "find", "findIndex", "reduce", "reduceRight"}
 CHAINS = {"then", "catch", "finally"}
@@ -378,13 +384,68 @@ class File:
             return None
         if node.kind() == "member_expression":
             return self.recorder(node.field("object")), name(node.field("property"))
-        if (binding := self.binding(node)) is not None:
-            if binding.kind() == "variable_declarator" and binding.parent().children()[0].kind() == "const":
-                value = expression(binding.field("value"))
-                if name(value) or value is not None and value.kind() == "member_expression":
-                    return self.recorder(value)
-            return name(node), offset(binding)
-        return shape(node)
+        binding = self.binding(node)
+        if (alias := self.recorder_alias(node)) is not None:
+            source, member_name = alias
+            if source.kind() != "call_expression":
+                identity = self.recorder(source)
+                return (identity, member_name) if member_name else identity
+        declaration, _ = self.destructuring(node)
+        if declaration is not None and (binding is None or offset(declaration) > offset(binding)):
+            return name(node), offset(declaration)
+        return (name(node), offset(binding)) if binding is not None else shape(node)
+
+    def recorder_alias(self, node):
+        binding = self.binding(node)
+        declaration, key = self.destructuring(node)
+        if declaration is None or binding is not None and offset(binding) > offset(declaration):
+            declaration, key = binding, ""
+        if declaration is None or declaration.kind() != "variable_declarator":
+            return None
+        source = expression(declaration.field("value"))
+        if source is None or offset(source) >= offset(node) or not (name(source) or source.kind() == "member_expression"
+                                  or key and source.kind() == "call_expression"):
+            return None
+        if not self.recorder_alias_stable(node, declaration, source, key):
+            return None
+        return source, key
+
+    def recorder_alias_stable(self, use, declaration, source, key):
+        if self.fixture_references is None:
+            self.fixture_references = defaultdict(list)
+            for entry in query(self.syntax.root, "identifier"):
+                self.fixture_references[name(entry)].append(entry)
+        source_root, path = chain(source)
+        watched = [(name(use), declaration, ())]
+        if name(source_root):
+            watched.append((name(source_root), self.binding(source_root), (*path, key) if key else path))
+        start, end = offset(declaration), offset(use)
+        for identifier, binding, members in watched:
+            for reference in self.fixture_references[identifier]:
+                if not start < offset(reference) < end:
+                    continue
+                visible = self.binding(reference)
+                destructured, _ = self.destructuring(reference)
+                if destructured is not None and (visible is None or offset(destructured) > offset(visible)):
+                    visible = destructured
+                if (offset(visible) if visible is not None else None) != (
+                        offset(binding) if binding is not None else None):
+                    continue
+                current, parent = reference, reference.parent()
+                while parent.kind() in {"member_expression", *TRANSPARENT}:
+                    current, parent = parent, parent.parent()
+                _, observed = chain(current)
+                if observed != members[:len(observed)]:
+                    continue
+                if parent.kind() in {"assignment_expression", "augmented_assignment_expression", "update_expression"}:
+                    target = parent.field("left") or parent.field("argument")
+                    if target is not None and offset(target) == offset(current):
+                        return False
+                if parent.kind() == "arguments":
+                    callee = parent.parent().field("function")
+                    if not self.expect_origin(callee) and self.assertion_call(callee, ()) is None:
+                        return False
+        return True
 
     def helper(self, node):
         binding = self.binding(node)
@@ -473,17 +534,19 @@ class File:
         if not name(node):
             return None
         binding = self.binding(node)
-        declaration, key = self.destructuring(node)
-        if declaration is not None and (binding is None or offset(declaration) > offset(binding)):
-            root = self.sibling_control(declaration.field("value"), seen)
-            return ("member", root, key) if root is not None else None
+        if (alias := self.recorder_alias(node)) is not None:
+            source, key = alias
+            root = self.sibling_control(source, seen)
+            return ("member", root, key) if key and root is not None else root
         if binding is None or offset(binding) in seen:
             return None
         site = offset(binding)
         if binding.kind() == "variable_declarator" and const_declaration(binding):
-            root = self.sibling_control(binding.field("value"), seen | {site})
-            if root is not None:
-                return root
+            value = expression(binding.field("value"))
+            if value is not None and value.kind() not in {"identifier", "member_expression"}:
+                root = self.sibling_control(value, seen | {site})
+                if root is not None:
+                    return root
         if not any(parent.kind() in FUNCTIONS for parent in binding.ancestors()):
             return "binding", site
         return None
@@ -507,7 +570,7 @@ class File:
                     binding = self.binding(root)
                     if binding is None or not any(parent.kind() in FUNCTIONS for parent in binding.ancestors()):
                         return None
-                return self.recorder(receiver)
+                return self.recorder(node if calls else receiver)
         return None
 
     def indexed_collection(self, node):
@@ -763,18 +826,58 @@ class File:
             ignored = registration.ignored or any(parent.ignored for parent in parents)
             yield test, callback, ignored
 
+    def assertion_target(self, callee):
+        root, _ = chain(callee)
+        source, names = self.callee(callee)
+        binding = self.binding(root)
+        if self.parameter_scope(root) is not None or name(root) in self.source_imports:
+            return "", ()
+        if binding is not None and (binding.kind() != "variable_declarator"
+                                    or self.require(binding.field("value"))[0] != source or not source):
+            return "", ()
+        return source, names
+
+    def expect_origin(self, callee):
+        source, names = self.assertion_target(callee)
+        if names in EXPECT_RECEIVERS and (not source or source in EXPECT_MODULES):
+            if names != ("expect", "soft") or source in {"", "vitest", "vite-plus/test",
+                                                         "@playwright/test", "playwright/test", "@effect/vitest"}:
+                return names
+        return ()
+
+    def assertion_call(self, callee, context):
+        source, names = self.assertion_target(callee)
+        if source in ASSERT_MODULES:
+            if names[:2] == ("assert", "strict"):
+                names = ("assert", *names[2:])
+            elif names[:1] == ("strict",):
+                names = ("assert", *names[1:])
+            method = names[-1] if names else ""
+            if len(names) <= 2 and method in NODE_ASSERT_CHECKS:
+                return method
+        if names and source in {"chai", "vitest", "vite-plus/test", "@alchemy.run/test", "@effect/vitest"} and names[0] in {"assert", "should"}:
+            return names[-1] if names != ("should",) else None
+        if names in {("expect", "assertions"), ("expect", "hasAssertions"), ("expect", "fail")}:
+            return names[-1]
+        if names and source == "fast-check" and names[-1] == "assert":
+            return "assert"
+        if names and not source and names[0] in {"assert", "should"}:
+            return names[-1]
+        root, members = chain(callee)
+        if name(root) in context and (members[:1] == ("assert",) or
+                                      len(members) == 1 and members[-1] in CONTEXT_CHECKS):
+            return members[-1]
+        return None
+
     def check(self, node, context):
         callee = node.field("function")
-        source, names = self.callee(callee)
         args = arguments(node)
         base, members = chain(callee)
         if base is None:
             return None
         if members and base.kind() == "call_expression":
-            _, origin = self.callee(base.field("function"))
-            if (origin in EXPECT_RECEIVERS
-                    and (origin != ("expect", "element") or self.binding(chain(base.field("function"))[0]) is None)
-                    and (subject := arguments(base))):
+            origin = self.expect_origin(base.field("function"))
+            if origin and (subject := arguments(base)):
                 check = matcher(node, subject[0], members, args)
                 check.modifiers = (*origin[1:], *check.modifiers)
                 return check
@@ -784,20 +887,8 @@ class File:
             for _ in members[index:]:
                 subject = expression(subject.field("object"))
             return matcher(node, subject, members[index + 1:], args)
-        if not names:
-            return None
-        if names in {("expect", "assertions"), ("expect", "hasAssertions"), ("expect", "fail")}:
-            return Check(node, names[-1])
-        receiver, *methods = names
-        local = self.binding(base) if name(base) and not source else None
-        if (receiver == "assert" and local is None or source in ASSERT_MODULES
-                or source == "fast-check" and names[-1] == "assert"
-                or receiver == "should" and (source == "chai" or local is None)
-                or receiver in context and (methods[:1] == ["assert"] or
-                                            len(methods) == 1 and methods[-1] in CONTEXT_CHECKS)):
-            method = methods[-1] if methods else receiver
-            return assert_check(node, method, args)
-        return None
+        method = self.assertion_call(callee, context)
+        return assert_check(node, method, args) if method is not None else None
 
     def property_check(self, node):
         parent = node.parent()
@@ -810,7 +901,7 @@ class File:
                 "ok", "true", "false", "null", "undefined", "exist", "exists", "empty", "called", "calledOnce"}:
             return None
         if "should" in members or base is not None and base.kind() == "call_expression" and (
-                self.callee(base.field("function"))[1] == ("expect",) and arguments(base)):
+                self.expect_origin(base.field("function")) and arguments(base)):
             subject = (arguments(base)[0] if base is not None and base.kind() == "call_expression"
                        and arguments(base) and "should" not in members else base)
             return matcher(node, subject, members, [])
@@ -944,12 +1035,9 @@ def micro_snapshot(file, test, checks):
     whole = []
 
     def key(node, subject):
-        root, _ = chain(subject)
-        binding = file.binding(root)
-        position = micro.offset(binding) if binding is not None else -1
-        target = subject.text() if subject is not None else ""
-        return reads.key(node, shape(subject), reads.assignment(node, target, position),
-                         reread=micro.has_call(subject))
+        identity = file.recorder(subject)
+        position = reads.assignment(node, subject.text() if subject is not None else "")
+        return reads.key(node, identity, position, reread=micro.has_call(subject))
 
     for check in checks:
         actual = expression(check.actual)

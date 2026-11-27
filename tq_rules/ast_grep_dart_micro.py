@@ -51,10 +51,9 @@ def micro_snapshot(file, test, checks):
 
     def key(check, subject):
         source = check.file or file
-        binding = source.binding(subject)
-        position = offset(binding.node) if binding is not None else -1
-        position = reads.assignment(check.node, subject_text(subject), position)
-        return reads.key(check.node, signature(subject), (source.path, position),
+        identity = source.recorder_identity(subject) or signature(subject)
+        position = reads.assignment(check.node, subject_text(subject))
+        return reads.key(check.node, identity, (source.path, position),
                          reread=next(calls(unwrap(subject)), None) is not None)
 
     for check in checks:

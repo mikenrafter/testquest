@@ -244,6 +244,19 @@ class File:
                 self.functions[name].append((scope, body))
         for node in query(syntax.root, "initialized_variable_definition", "initialized_identifier", "static_final_declaration"):
             self.index_variable(node)
+        for declaration in query(syntax.root, "pattern_variable_declaration"):
+            pattern = next((child for child in contents(declaration) if child.kind() == "record_pattern"), None)
+            value = next((child for child in contents(declaration) if child.kind() == "record_literal"), None)
+            targets, values = contents(pattern), contents(value)
+            if not targets or len(targets) != len(values) or any(entry.kind() != "record_field" for entry in values):
+                continue
+            for entry, initial in zip(targets, values):
+                parts = contents(entry)
+                if len(parts) == 1 and identifier(parts[0]) and not any(
+                        token.kind() == ":" for token in tokens(initial)):
+                    self.bindings[parts[0].text()].append(
+                        Binding(parts[0], self.scope(declaration), contents(initial),
+                                any(token.kind() == "final" for token in tokens(declaration))))
         for parameter in query(syntax.root, "formal_parameter"):
             target = parameter_name(parameter)
             definition = next((owner for owner in parameter.ancestors()
@@ -272,7 +285,8 @@ class File:
 
     def index_variable(self, node):
         elements = tokens(node)
-        initial = named(between(elements, "=", ","))
+        initial = tuple(child for child in between(elements, "=", ",")
+                        if child.is_named() or child.kind() == "this")
         before = elements[:next((i for i, child in enumerate(elements) if child.kind() in {"=", ","}),
                                 len(elements))]
         target = next((child for child in reversed(before) if child.kind() == "identifier"), None)
@@ -658,23 +672,53 @@ class File:
                 return (*self.identity(binding.initializer), *path[1:])
         return offset(binding.node), *path[1:]
 
-    def recorder(self, nodes, seen=frozenset()):
-        path = names(nodes)
-        if not path:
-            return None
-        binding = self.binding(nodes)
+    def recorder_binding(self, nodes):
+        nodes = unwrap(nodes)
+        if nodes and nodes[0].kind() == "this" and len(nodes) >= 2 and member(nodes[1]):
+            field = next((entry for entry in contents(contents(nodes[1])[0]) if identifier(entry)), None)
+            if field is not None:
+                owner = next((entry for entry in field.ancestors() if entry.kind() == "class_body"), None)
+                if owner is not None:
+                    binding = next((entry for entry in self.bindings[field.text()] if entry.scope == owner), None)
+                    suffix = tuple(member(entry) for entry in nodes[2:])
+                    return (binding, (field.text(), *suffix)) if all(suffix) else (None, ())
+        return self.binding(nodes), names(nodes)
+
+    def recorder_alias(self, nodes, binding):
+        source, initial = self.recorder_binding(binding.initializer)
+        if not initial or source == binding or binding.scope.kind() not in {"block", "function_expression"}:
+            return False
+        start, end = offset(binding.node), offset(unwrap(nodes)[0])
+        for watched in (binding, source):
+            if watched is None:
+                continue
+            for use in query(binding.scope, "identifier"):
+                if not start < offset(use) < end or use.text() != watched.node.text() or self.binding((use,)) != watched:
+                    continue
+                if self.writes_binding(use):
+                    return False
+                parent = use.parent()
+                if parent.kind() in {"argument", "named_argument"} and len(names(contents(parent))) == 1:
+                    arguments = parent.parent()
+                    selector = next((entry for entry in arguments.ancestors() if entry.kind() == "selector"), None)
+                    call = final_call(contents(selector.parent())) if selector is not None else None
+                    if call is None or self.framework_name(call.name) not in {"expect", "expectLater", "expectAsync"}:
+                        return False
+        return True
+
+    def recorder_identity(self, nodes, *, collections=False):
+        binding, path = self.recorder_binding(nodes)
         if binding is None:
-            return None
-        site = offset(binding.node)
-        if site in seen:
-            return None
-        if binding.final and names(binding.initializer):
-            alias = self.recorder(binding.initializer, seen | {site})
-            if alias:
+            return (path or None) if not collections else None
+        if self.recorder_alias(nodes, binding):
+            if (alias := self.recorder_identity(binding.initializer, collections=collections)) is not None:
                 return (*alias, *path[1:])
-        if collection_size(binding.initializer, exact=True) == 0:
-            return site, *path[1:]
+        if not collections or collection_size(binding.initializer, exact=True) == 0:
+            return offset(binding.node), *path[1:]
         return None
+
+    def recorder(self, nodes):
+        return self.recorder_identity(nodes, collections=True)
 
     def observation(self, check):
         actual, matcher = check.actual, check.matcher

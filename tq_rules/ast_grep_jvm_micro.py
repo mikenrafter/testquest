@@ -21,7 +21,10 @@ def micro_snapshot(file, test, checks):
         target = root(subject)
         _, binding = file.visible_binding(target, name(target))
         position = offset(binding) if binding is not None else -1
-        return reads.key(check.node, shape(subject), reads.assignment(check.node, text(subject), position),
+        recorder = file.recorder(subject)
+        identity = recorder.identity if recorder is not None else shape(subject)
+        assigned = reads.assignment(check.node, text(subject))
+        return reads.key(check.node, identity, assigned if recorder is not None else max(assigned, position),
                          reread=micro.has_call(subject))
 
     for (_, origin), check in checks.items():

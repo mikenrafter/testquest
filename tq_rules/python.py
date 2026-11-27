@@ -135,17 +135,23 @@ def constant_truth(node):
     return False
 
 
-def predicate(call, method):
-    args = call.args
+def predicate(call, method, *, unbound=False):
+    args = call.args[int(unbound):]
     operators = {"assertEqual": ast.Eq, "assertNotEqual": ast.NotEq,
                  "assertIs": ast.Is, "assertIsNot": ast.IsNot,
                  "assertListEqual": ast.Eq, "assertTupleEqual": ast.Eq,
                  "assertGreater": ast.Gt, "assertGreaterEqual": ast.GtE,
                  "assertLess": ast.Lt, "assertLessEqual": ast.LtE}
-    if method in operators and len(args) >= 2:
-        return ast.Compare(left=args[0], ops=[operators[method]()], comparators=[args[1]])
-    if method in {"assertTrue", "assertFalse"} and args:
-        return args[0] if method == "assertTrue" else ast.UnaryOp(op=ast.Not(), operand=args[0])
+    named = {entry.arg: entry.value for entry in call.keywords}
+    if method in operators:
+        first = args[0] if args else named.get("first")
+        second = args[1] if len(args) >= 2 else named.get("second")
+        if first is not None and second is not None:
+            return ast.Compare(left=first, ops=[operators[method]()], comparators=[second])
+    if method in {"assertTrue", "assertFalse"}:
+        subject = args[0] if args else named.get("expr")
+        if subject is not None:
+            return subject if method == "assertTrue" else ast.UnaryOp(op=ast.Not(), operand=subject)
     return None
 
 
@@ -298,10 +304,16 @@ class Inspect(ast.NodeVisitor):
     def visit_Call(self, node):
         name = name_of(node.func)
         method = name.rsplit(".", 1)[-1]
-        if helper(method) or name in self.checking_helpers:
-            self.record_check(node.lineno, predicate(node, method))
+        qualified = self.imported_name(node.func)
+        if qualified == "pytest.raises":
+            parent = self.iterables.parents.get(node, (None, ""))[0]
+            if len(node.args) >= 2 or isinstance(parent, ast.withitem):
+                self.record_check(node.lineno, None)
+        elif (helper(method) or name in self.checking_helpers) and not (method == "raises" and qualified):
+            self.record_check(node.lineno, predicate(node, method, unbound=qualified.startswith("unittest.TestCase.")))
         if method == "assertEqual":
-            self.expected_arguments.extend(node.args[1:2])
+            expected = 2 if qualified.startswith("unittest.TestCase.") else 1
+            self.expected_arguments.extend(node.args[expected:expected + 1])
             self.expected_arguments.extend(keyword.value for keyword in node.keywords if keyword.arg == "second")
         if assertion(method):
             self.check_arguments.extend(node.args)

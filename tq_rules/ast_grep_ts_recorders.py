@@ -46,11 +46,17 @@ def fixture_origin(file, node, path=(), seen=frozenset(), *, in_factory=False):
     if name(node) and file.parameter_scope(node) is None:
         binding = file.binding(node)
         destructured, key = file.destructuring(node)
+        if (alias := file.recorder_alias(node)) is not None:
+            source, key = alias
+            return fixture_origin(file, source, (key, *path) if key else path, seen, in_factory=in_factory)
         if destructured is not None and (binding is None or offset(destructured) > offset(binding)):
-            return fixture_origin(file, destructured.field("value"), (key, *path), seen, in_factory=in_factory)
+            return None
         if binding is None or binding.kind() != "variable_declarator":
             return None
         value = binding.field("value")
+        source = expression(value)
+        if name(source) or source is not None and source.kind() == "member_expression":
+            return None
         if value is not None and not const_declaration(binding):
             return None
         if value is None:

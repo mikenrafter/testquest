@@ -236,6 +236,8 @@ class Flow:
         self.checks = []
         self.loops = []
         self.alias_changes = defaultdict(list)
+        self.recorder_changes = defaultdict(list)
+        self.recorder_escapes = None
         self.collection_growth = defaultdict(list)
         self.strategies = dict(initial)
         self.loop_values = {}
@@ -1005,7 +1007,23 @@ class Flow:
                 owner = self.receiver_owner(call.receiver, site)
                 if owner:
                     call = Call((*owner, call.method), call.arguments, call.receiver)
-            recognized, outcome = self.file.check_call(call, self.scope)
+            if self.syntax.language == "python":
+                qualified = self.file.python_import(call.name, self.scope)
+                if qualified == ("pytest", "raises"):
+                    manager = node
+                    while manager.parent().kind() in {"as_pattern", "parenthesized_expression"}:
+                        manager = manager.parent()
+                    recognized = outcome = len(call.arguments) >= 2 or manager.parent().kind() == "with_item"
+                elif qualified[:2] == ("unittest", "TestCase") and len(qualified) == 3:
+                    recognized = outcome = lint.assertion(call.method) and bool(call.arguments)
+                    if recognized:
+                        call = Call(call.name, call.arguments[1:], call.receiver)
+                elif qualified and (call.method in PYTHON_PREDICATES or call.method in {"raises", "assertTrue", "assertFalse"}):
+                    recognized = outcome = False
+                else:
+                    recognized, outcome = self.file.check_call(call, self.scope)
+            else:
+                recognized, outcome = self.file.check_call(call, self.scope)
             if self.syntax.language == "rust" and call.method in {"unwrap", "expect"} and call.receiver is not None:
                 inner = unwrap(call.receiver)
                 if inner.kind() in CALLS and self.syntax.call(inner).method.startswith(("validate", "verify", "check")):
@@ -1074,7 +1092,21 @@ class Flow:
                 self.writes[target[:1]].append(location)
             if self.bindings.get(target) or len(target) > 1:
                 self.alias_changes[target[0]].append(location)
+                self.recorder_changes[target].append(location)
             self.bindings[target].append((location, value))
+        elif kind in {"assignment", "let_declaration"}:
+            pattern = node.field("left") or node.field("pattern")
+            value = node.field("right") or node.field("value")
+            if pattern is not None and value is not None and pattern.kind() in {
+                    "pattern_list", "tuple_pattern", "list_pattern"} and value.kind() in {
+                    "expression_list", "tuple", "list", "tuple_expression"}:
+                targets, values = children(pattern), children(value)
+                if len(targets) == len(values):
+                    location = self.syntax.absolute(node)
+                    for entry, initial in zip(targets, values):
+                        if target := parts(entry):
+                            self.bindings[target].append((location, initial))
+                            self.recorder_changes[target].append(location)
         return any([self.visit(child) for child in children(node)])
 
     def record_mutable_borrow(self, node, site):
@@ -1135,6 +1167,41 @@ class Flow:
                              for changed in self.alias_changes[key]):
             return (*alias, *name[1:])
         return name
+
+    def recorder_path(self, node, before):
+        node = unwrap(node)
+        if node is not None and node.kind() == "reference_expression":
+            node = children(node)[-1]
+        path = parts(node)
+        if not path:
+            return ()
+        root = path[:1]
+        versions = [(site, value) for site, value in self.bindings.get(root, ()) if site < before]
+        if len(versions) != 1 or versions[0][1] is None:
+            return path
+        start, value = versions[0]
+        original = self.recorder_path(value, start)
+        if not original:
+            return path
+        relevant = (root, original[:1], original)
+        if any(start < site < before for key in relevant for site in self.recorder_changes[key]):
+            return path
+        if self.recorder_escapes is None:
+            self.recorder_escapes = defaultdict(list)
+            checked_sites = {check.location for check in self.checks}
+            for call_node, call in self.calls:
+                site = self.syntax.absolute(call_node)
+                if call.macro or site in checked_sites or call.method in {"len", "bool", "str", "repr", "tuple", "list"}:
+                    continue
+                for argument in call.arguments:
+                    value = argument.field("value") if argument.kind() == "keyword_argument" else argument
+                    if value is not None and value.kind() == "reference_expression":
+                        value = children(value)[-1]
+                    if supplied := parts(value):
+                        self.recorder_escapes[supplied].append(site)
+        if any(start < site < before for key in relevant for site in self.recorder_escapes[key]):
+            return path
+        return (*original, *path[1:])
 
     def compares_itself(self, check, name, comments):
         operator, left, right = check.operator, check.left, check.right
@@ -1311,8 +1378,8 @@ class Flow:
                     continue
                 calls.extend((call, self.syntax.call(call)) for call in query(node, "call"))
         for node, call in calls:
-            receiver = parts(call.receiver)
             site = self.syntax.absolute(node)
+            receiver = self.recorder_path(call.receiver, site)
             if receiver in recorders and call.method in RECORDING:
                 writes[receiver].append((site, node))
             for index, arg in enumerate(call.arguments):
@@ -1322,12 +1389,15 @@ class Flow:
                 else:
                     slot = index
                 if arg is not None and arg.kind() == "reference_expression":
-                    name = parts(children(arg)[-1])
+                    name = self.recorder_path(children(arg)[-1], site)
                     is_recorder = any(child.kind() == "mutable_specifier" for child in children(arg))
                 else:
-                    path = parts(arg)
-                    name = path[:-1]
-                    is_recorder = path[-1:] and path[-1] in RECORDING
+                    path = self.recorder_path(arg, site)
+                    name = path if self.syntax.language == "rust" else path[:-1]
+                    value = self.resolve(parts(arg), site) if self.syntax.language == "rust" else None
+                    is_recorder = (value is not None and value.kind() == "reference_expression" and
+                                   any(part.kind() == "mutable_specifier" for part in children(value))
+                                   if self.syntax.language == "rust" else path[-1:] and path[-1] in RECORDING)
                 if is_recorder and name in recorders:
                     owner = self.receiver_owner(call.receiver, site) if self.syntax.language == "rust" else ()
                     callee = (*owner, call.method) if owner else call.name
@@ -1341,7 +1411,7 @@ class Flow:
             for operand, present in self.observations(check):
                 if operand is not None:
                     observations.append((operand, present, check))
-                if name := parts(operand):
+                if name := self.recorder_path(operand, check.location):
                     (positive if present else negative)[name].append(check)
         controlled = {producer for name, checks in positive.items() for producer, site in inputs[name]
                       if not writes[name] and len({key for key, _ in inputs[name]}) == 1
@@ -1851,6 +1921,13 @@ class File:
             self.module_files[candidate] = file
         return self.module_files[candidate]
 
+    def python_import(self, name, scope):
+        if name:
+            for depth in range(len(scope), -1, -1):
+                if qualified := self.imports.get((*scope[:depth], name[0])):
+                    return (*qualified, *name[1:])
+        return ()
+
     def python_method(self, owner, name, seen=frozenset()):
         if not owner or owner in seen:
             return None
@@ -2076,15 +2153,16 @@ def micro_snapshot(file, flow, test):
     syntax = flow.syntax
 
     def binding_at(node, before):
-        name = parts(node)
+        name = flow.recorder_path(node, before)
         positions = [site for length in range(1, len(name) + 1) for site, _ in flow.bindings.get(name[:length], ())
                      if site < before]
         positions.extend(site for site in flow.writes.get(name[:1], ()) if site < before)
         return max(positions, default=-1)
 
     def key(source, subject):
-        return reads.key(source, shape(subject), binding_at(subject, syntax.absolute(source)),
-                         reread=micro.has_call(subject))
+        before = syntax.absolute(source)
+        identity = flow.recorder_path(subject, before) or shape(subject)
+        return reads.key(source, identity, binding_at(subject, before), reread=micro.has_call(subject))
 
     def line_count(source, joined):
         call = syntax.call(joined) if joined is not None and joined.kind() == "call" else None
