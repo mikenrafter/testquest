@@ -41,7 +41,8 @@ SYNCHRONOUS = {"assertAll", "assertSoftly", "assertTimeout", "assertTimeoutPreem
                "runBlocking", "run", "apply", "also", "let", "with", "use", "synchronized",
                "assumingThat", "assertDoesNotThrow", "assertNotNull", "assertIs", "assertIsNot",
                "eventually", "continually", "assertEach", "runOnIdle", "runOnUiThread", "runOnMainSync",
-               "onActivity", "runComposeUiTest", "runAndroidComposeUiTest", "dynamicTest"}
+               "onActivity", "runComposeUiTest", "runAndroidComposeUiTest", "dynamicTest",
+               "coroutineScope", "supervisorScope", "withContext", "withTimeout"}
 ITERATING = {"forEach", "forEachIndexed", "map", "mapIndexed", "onEach", "all", "any", "none",
              "filter", "filterNot", "repeat"}
 
@@ -134,6 +135,8 @@ def iterable_size(syntax, node):
     node = unwrap(node)
     if node is None:
         return None
+    if node.kind() == "array_initializer":
+        return len(children(node))
     if node.kind() == "array_creation_expression":
         if (initializer := child(node, "array_initializer")) is not None:
             return len(children(initializer))
@@ -254,7 +257,7 @@ def fluent_origin(file, node):
 
 def junit_args(file, call, method):
     args = [arg for arg in call.args if not any(arg is named for named in call.named.values())]
-    if method in BOOLEANS:
+    if method in BOOLEANS | {"assertNotNull"}:
         if "actual" in call.named:
             return [call.named["actual"]]
         slots = 1
@@ -329,6 +332,9 @@ def check_call(file, node, call):
         operands = junit_args(file, call, method)
         if len(operands) >= 2:
             return collect_observations(file, equality(node, method, *operands[:2]))
+    if method == "assertNotNull":
+        operands = junit_args(file, call, method)
+        return collect_observations(file, Check(node), method, operands[0] if operands else None)
     if lint.assertion(method) or method == "fail" or file.imports.get(call.method) and lint.helper(method):
         return Check(node)
     return None
@@ -410,9 +416,18 @@ def collect_observations(file, check, method="", subject=None, expected=None):
         check.fragment_subject = unwrap(subject)
 
     def observe(receiver, present):
-        if (target := file.recorder(receiver)) is not None:
+        if (target := file.collection_recorder(receiver)) is not None:
             check.observations = ((("size", target), present),)
         return check
+
+    def observed_item(node):
+        node = unwrap(node)
+        node = file.immutable_value(node) or node
+        while (receiver := member(node)[0]) is not None:
+            node = receiver
+        if (call := call_of(node)) is not None and call.method in {"poll", "single", "first", "getFirst", "remove"}:
+            return call.receiver
+        return None
 
     tested = unwrap(check.predicate)
     if tested is not None:
@@ -427,6 +442,8 @@ def collect_observations(file, check, method="", subject=None, expected=None):
                 return observe(call.receiver, True)
     if method in {"isEmpty", "isNotEmpty", "empty", "emptyIterable", "shouldBeEmpty", "shouldNotBeEmpty"}:
         return observe(subject, method in {"isNotEmpty", "shouldNotBeEmpty"})
+    if method in {"assertNotNull", "isNotNull"} and (receiver := observed_item(subject)) is not None:
+        return observe(receiver, True)
     if method in {"contains", "containsAnyOf", "containsExactly", "containsExactlyElementsIn",
                   "containsAtLeast", "shouldContain", "hasSizeGreaterThan", "hasSizeLessThan", "hasSize",
                   "shouldHaveSize"}:
@@ -447,6 +464,14 @@ def collect_observations(file, check, method="", subject=None, expected=None):
         reverse = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
         for operand, expected, relation in ((check.left, check.right, check.operator),
                                              (check.right, check.left, reverse.get(check.operator, check.operator))):
+            if relation == "==" and (receiver := observed_item(operand)) is not None:
+                value = literal(file.syntax, expected)
+                if value is not UNKNOWN and value is not None:
+                    return observe(receiver, True)
+            if relation == "==" and call_of(expected) is not None and (size := iterable_size(
+                    file.syntax, expected)) is not None and size > 0:
+                if file.collection_recorder(operand) is not None:
+                    return observe(operand, True)
             receiver, property_name = member(operand)
             measurement = call_of(operand)
             if measurement is not None and not measurement.args:
