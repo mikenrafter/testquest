@@ -1972,6 +1972,7 @@ class File:
 
 
 def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
+    from . import ast_grep_literals as literals
     from .ast_grep_languages import ECMASCRIPT_LANGUAGES, JVM_LANGUAGES
 
     if path.suffix in ECMASCRIPT_LANGUAGES:
@@ -2034,6 +2035,8 @@ def parse(source, path, *, scan_root=None, collection_controls=None, inventory=F
             control_helpers.update(target for _, call in flow.calls if not call.macro
                                    and (target := file.resolve_function(call.name, flow.scope)) is not None)
         test.issues.extend((site, "absence-no-control") for site in flow.recorder_evidence())
+        test.issues.extend((site, "nondistinguishing-literal")
+                           for site in literals.issues(file, syntax, flow, flow.body, test.name))
         observations.extend((key, present, site, test) for key, present, site in file.detectors)
 
         file.detectors.clear()

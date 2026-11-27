@@ -84,6 +84,14 @@ def syntax_errors(root, *, missing=False):
 
 
 
+class Expansion(list):
+    """Macro arguments together with the syntax tree that owns their nodes."""
+
+    def __init__(self, nodes=(), syntax=None):
+        super().__init__(nodes)
+        self.syntax = syntax
+
+
 @dataclass
 class Call:
     name: tuple
@@ -155,13 +163,13 @@ class Syntax:
                 if all(operand is not None and operand.kind() in NAMES | {
                         "integer_literal", "float_literal", "string_literal", "raw_string_literal",
                         "boolean_literal", "char_literal"} for operand in operands):
-                    return operands
+                    return Expansion(operands, self)
         prefix = "fn tq() { tq("
         parsed = Syntax.parse(prefix + tree.text()[1:-1] + "); }", "rust",
                               origin=self.absolute(tree) + 1, prefix=len(prefix))
         arguments = parsed.root.find(kind="arguments")
         if arguments is not None and not syntax_errors(parsed.root, missing=True):
-            return children(arguments)
+            return Expansion(children(arguments), parsed)
         if name and name[-1] in RUST_ASSERTIONS:
             self.macro_errors.append(self.absolute(node))
         return []
