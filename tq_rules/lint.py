@@ -318,7 +318,8 @@ def find(paths, *, select=None, owners=None, parser=None):
         elif file_rows:
             selected = select(path, tests)
             for row in file_rows:
-                owner = next((test for test in selected if test.start <= row["line"] <= test.end), None)
+                owner = next((test for test in selected
+                              if test.line == row["line"] or test.start <= row["line"] <= test.end), None)
                 if owner is not None:
                     rows.append(row)
                     if owners is not None:

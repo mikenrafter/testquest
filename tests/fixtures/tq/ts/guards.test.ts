@@ -1,0 +1,18 @@
+test("if", () => { if (ready()) expect(out()).toBe(1); });
+test("covered if", () => { if (ready()) expect(out()).toBe(1); else expect(out()).toBe(2); });
+test("switch", () => { switch (kind()) { case 1: expect(out()).toBe(1); break; } });
+test("covered switch", () => { switch (kind()) { case 1: default: expect(out()).toBe(1); } });
+test("ternary", () => ready() ? expect(out()).toBe(1) : other());
+test("short circuit", () => ready() && expect(out()).toBe(1));
+test("caught", () => { try { out(); } catch (e) { expect(e).toBe(error); } });
+test("swallowed assertion", () => { try { expect(out()).toBe(1); } catch {} });
+test("counted loop", () => { for (let i = 0; i < limit(); ++i) expect(out(i)).toBe(1); });
+test("known counted loop", () => { for (let i = 0; i < 2; ++i) expect(out(i)).toBe(1); });
+test("for of", () => { for (const x of items()) expect(x).toBe(1); });
+test("nonempty", () => { for (const x of [1]) expect(out(x)).toBe(1); });
+test("empty", () => [].forEach(x => expect(x).toBe(1)));
+test("unknown map", () => items().map(x => expect(x).toBe(1)));
+test("nonempty map", () => [1].map(x => expect(out(x)).toBe(1)));
+test("early exit", () => { for (const x of [1]) { if (skip(x)) break; expect(out(x)).toBe(1); } });
+test("unused callback", () => { const check = () => expect(out()).toBe(1); work(); });
+test("known fixture", () => { const values = [1]; values.forEach(x => expect(out(x)).toBe(1)); });

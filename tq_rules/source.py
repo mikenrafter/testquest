@@ -2,7 +2,10 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import subprocess
 import tokenize
+
+from .ast_grep_languages import ECMASCRIPT_LANGUAGES, ECMASCRIPT_OUTPUT
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,17 @@ class Test:
             return self.owns(comment)
         first, last = self.span_columns
         return (self.start, first) <= (comment.line, comment.column) < (self.end, last)
+
+
+def note_owners(path, tests, comment, *, inventory=False):
+    ecmascript = path.suffix in ECMASCRIPT_LANGUAGES
+    if inventory or ecmascript:
+        owners = [test for test in tests if test.owns_inventory_comment(comment)]
+    else:
+        owners = [test for test in tests if test.owns(comment)]
+    if ecmascript and owners:
+        return [max(owners, key=lambda test: (test.start, test.column, -test.end))]
+    return owners
 
 
 class CollectionControls:
@@ -78,19 +92,26 @@ def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None,
 
     paths = {}
     cwd = Path.cwd()
+    legacy_suffixes = {".py", ".rs"}
+    suffixes = legacy_suffixes | ECMASCRIPT_LANGUAGES.keys() if parser else legacy_suffixes
     for item in inputs:
         path = Path(item)
         if not path.exists():
             raise FileNotFoundError(path)
         if path.is_dir():
             directory_root = path.resolve() if refine_guards else None
+            scripts = []
             for directory, children, files in os.walk(path):
                 children[:] = [child for child in children if child not in IGNORED]
                 for name in files:
                     candidate = Path(directory, name)
-                    if candidate.suffix in {".py", ".rs"} and not candidate.is_symlink():
+                    if candidate.suffix in legacy_suffixes and not candidate.is_symlink():
                         paths[candidate] = directory_root
-        elif path.suffix in {".py", ".rs"} and not path.is_symlink():
+                    elif (candidate.suffix in suffixes and not candidate.is_symlink()
+                          and not ECMASCRIPT_OUTPUT.intersection(candidate.relative_to(path).parts[:-1])):
+                        scripts.append(candidate)
+            paths.update(dict.fromkeys(unignored_scripts(path, scripts), directory_root))
+        elif path.suffix in suffixes and not path.is_symlink():
             paths.setdefault(path, cwd if refine_guards else None)
     try:
         for path in sorted(paths, key=str):
@@ -121,6 +142,20 @@ def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None,
     finally:
         if parser is None:
             python.parse_imported_module.cache_clear()
+
+
+def unignored_scripts(root, paths):
+    """Apply the repository's Git ignore rules to discovered JavaScript sources."""
+    if not paths:
+        return []
+    relatives = {os.fsencode(path.relative_to(root)): path for path in paths}
+    try:
+        result = subprocess.run(["git", "-C", str(root), "check-ignore", "-z", "--stdin"],
+                                input=b"\0".join(relatives) + b"\0", capture_output=True)
+    except FileNotFoundError:
+        return paths
+    ignored = set(result.stdout.split(b"\0")) if result.returncode == 0 else set()
+    return [path for relative, path in relatives.items() if relative not in ignored]
 
 
 def finding(path, line, rule, message, level="error"):

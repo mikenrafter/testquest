@@ -9,6 +9,7 @@ import tempfile
 import tokenize
 
 from . import repo
+from .ast_grep_languages import ECMASCRIPT_LANGUAGES
 from .source import scan_paths
 
 
@@ -74,7 +75,7 @@ def scan_blobs(repository, files, *, require_parse=True, parser=None):
 
 
 def overlaps(test, start, count):
-    return count > 0 and test.start < start + count and start <= test.end
+    return count > 0 and min(test.line, test.start) < start + count and start <= test.end
 
 
 class ChangedTests:
@@ -87,7 +88,7 @@ class ChangedTests:
         self.untracked = repo.untracked(repository)
         self.changed = {
             new: (old, blob) for old, new, blob, _ in
-            repo.differences(repository, self.ref, renames=True) if source_path(new)
+            repo.differences(repository, self.ref, renames=True) if source_path(new) or (parser is not None and new.suffix in ECMASCRIPT_LANGUAGES)
         }
 
     def __call__(self, path, tests):
