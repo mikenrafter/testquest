@@ -3,6 +3,8 @@
 from . import lint
 from .ast_grep import line, offset, query
 from .ast_grep_dart import CHANGING_COLLECTION, Check, collection_size, constant, expression_operator
+from .ast_grep_dart_inputs import enum_filter, minimum_size
+from .ast_grep_dart_setup import direct_binding
 from .ast_grep_dart_syntax import (
     CALLBACKS, COLLECTIONS, between, call_arguments, collection_entries, contents, final_call, identifier, kind,
     member, named, names, signature, split, tokens, unwrap,
@@ -72,6 +74,35 @@ def generic_future_callback(node):
     return None
 
 
+def if_condition(node):
+    if node is None or node.kind() not in {"if_statement", "if_element"}:
+        return ()
+    return as_tuple(node.field("condition")) or named(between(
+        tokens(node), "(", "case" if any(child.kind() == "case" for child in tokens(node)) else ")"))
+
+
+def branch_statements(branch):
+    return contents(branch) if branch is not None and branch.kind() == "block" else as_tuple(branch)
+
+
+def is_diagnostic(file, statement):
+    if statement.kind() == "if_statement" and statement.field("alternative") is None:
+        condition = if_condition(statement)
+        if len(names(condition)) == 1:
+            branch = branch_statements(statement.field("consequence"))
+            return len(branch) == 1 and is_diagnostic(file, branch[0])
+    if statement.kind() != "expression_statement":
+        return False
+    call = final_call(contents(statement))
+    if (call is None or call.name != ("print",) or len(call.args) != 1
+            or file.resolve_name((call.node,), {}) is not None):
+        return False
+    message = unwrap(call.args[0])
+    return (kind(message) == "string_literal"
+            and all(kind(contents(part)) == "identifier_dollar_escaped"
+                    for part in query(message[0], "template_substitution")))
+
+
 def fixed_duration(nodes):
     nodes = unwrap(nodes)
     if kind(nodes) == "const_object_expression":
@@ -88,7 +119,7 @@ def fixed_duration(nodes):
 
 
 class Flow:
-    def __init__(self, file, callback):
+    def __init__(self, file, callback, setup_callbacks=()):
         self.file = file
         self.callback = callback
         self.checks = []
@@ -100,8 +131,15 @@ class Flow:
         self.reply_joined = True
         self.sink = None
         self.event = None
+        self.setup_callbacks = set(setup_callbacks)
+        self.empty_at_exit = None
+        self.loop_constants = {}
 
     def run(self):
+        original = self.file
+        self.file = self.callback.file
+        self.empty_at_exit = self.exit_emptiness(self.callback)
+        self.file = original
         return self.body(self.callback, False, True)
 
     def body(self, callback, conditional, completed):
@@ -148,15 +186,17 @@ class Flow:
         if node_kind == "block":
             return self.sequence(contents(node), conditional)
         if node_kind in {"if_statement", "if_element"}:
-            condition = as_tuple(node.field("condition")) or named(between(tokens(node), "(", "case"))
-            if not any(child.kind() == "case" for child in tokens(node)):
-                condition = as_tuple(node.field("condition")) or named(between(tokens(node), "(", ")"))
+            condition = if_condition(node)
             value = constant(condition)
             leading = self.expression(condition, conditional)
             first = self.visit(node.field("consequence"), conditional or value is not True,
                                completed=completed)
             second = self.visit(node.field("alternative"), conditional or value is not False,
                                 completed=completed)
+            if node.field("alternative") is None and self.checks_empty_branch(condition, node.field("consequence")):
+                second = 0
+            if first == RETURN and self.checked_early_return(condition, node.field("consequence")):
+                first = 0
             return followed_by(leading, first if value is True else second if value is False else first | second)
         if node_kind in {"for_statement", "while_statement", "do_statement"}:
             return self.loop(node, conditional)
@@ -193,6 +233,8 @@ class Flow:
             assignment = next((child.kind() for child in tokens(node) if child.kind() in {"=", "??="}), None)
             if assignment:
                 target = next(iter(contents(node)), None)
+                if self.setup_callbacks:
+                    self.setup_callbacks.discard(direct_binding(self.file, contents(target)))
                 if (key := self.completer(contents(target))) is not None:
                     self.escaped_completers.add(key)
                 return self.expression(named(between(tokens(node), assignment)), conditional or assignment == "??=")
@@ -231,6 +273,48 @@ class Flow:
         if node_kind in {"local_variable_declaration", "unary_expression", "finally_clause", "assert_statement"}:
             return self.sequence(contents(node), conditional, completed)
         return self.expression(contents(node), conditional)
+
+    def checks_empty_branch(self, condition, branch):
+        condition = unwrap(condition)
+        if names(condition)[-1:] != ("isNotEmpty",) or branch is None:
+            return False
+        statements = branch_statements(branch)
+        if kind(statements) != "expression_statement":
+            return False
+        call = final_call(contents(statements[0]))
+        check = self.file.check(call) if call is not None else None
+        if check is None or check.matcher != "isEmpty" or self.file.resolve_name((call.node,), {}, path=call.name):
+            return False
+        subject = unwrap(check.actual)
+        to_list = final_call(subject)
+        if to_list is not None and to_list.method == "toList" and not to_list.optional:
+            transform = final_call(to_list.receiver)
+            if transform is not None and transform.method == "map" and not transform.optional:
+                subject = transform.receiver
+        return signature(condition[:-1]) == signature(subject)
+
+    def exit_emptiness(self, callback):
+        body = contents(callback.body)
+        if kind(body) != "block" or not (statements := contents(body[0])):
+            return None
+        last = statements[-1]
+        condition = if_condition(last)
+        if condition and last.field("alternative") is None and self.checks_empty_branch(
+                condition, last.field("consequence")):
+            return direct_binding(self.file, unwrap(condition)[:-1])
+        return None
+
+    def checked_early_return(self, condition, branch):
+        if self.empty_at_exit is None or self.active != {self.callback.key}:
+            return False
+        condition = unwrap(condition)
+        if (names(condition)[-1:] != ("isEmpty",)
+                or direct_binding(self.file, condition[:-1]) != self.empty_at_exit):
+            return False
+        statements = branch_statements(branch)
+        return (bool(statements) and statements[-1].kind() == "return_statement"
+                and not contents(statements[-1])
+                and all(is_diagnostic(self.file, statement) for statement in statements[:-1]))
 
     def expression(self, nodes, conditional, completed=False):
         nodes = unwrap(nodes)
@@ -277,6 +361,9 @@ class Flow:
             self.complete(key, call.node, on_event=self.event is not None and call.method == "complete")
         if (check := self.file.check(call)) is not None:
             return followed_by(out, self.record(check, guarded, optional))
+        if self.setup_callbacks and any(direct_binding(self.file, argument) in self.setup_callbacks
+                                        for _, argument in arguments):
+            out = followed_by(out, self.record(Check(call.node), guarded, optional))
         if any(self.is_unreachable(arg) for _, arg in arguments):
             out = followed_by(out, self.record(Check(call.node), guarded, optional))
 
@@ -288,8 +375,12 @@ class Flow:
                          self.file.library_name(receiver.name, "package:fake_async/") == "FakeAsync"
                          or receiver.name == ("FakeAsync",) and not self.file.binding((receiver.node,))
                          and not self.file.functions.get("FakeAsync")))
-        zone_method = (call.method if len(call.name) == 1 else
-                       self.file.library_name(call.name, "dart:async"))
+        zone_method = self.file.library_name(call.name, "dart:async")
+        if (call.name in {("runZoned",), ("runZonedGuarded",)}
+                and not self.file.binding((call.node,)) and not self.file.functions.get(call.method)):
+            zone_method = call.method
+        elif len(call.name) == 1 and (self.file.binding((call.node,)) or self.file.functions.get(call.method)):
+            zone_method = ""
         zone = (zone_method in {"runZoned", "runZonedGuarded"}
                 or call.method == "runZoned"
                 and self.file.library_name(call.name[:-1], "dart:io") == "IOOverrides")
@@ -406,37 +497,25 @@ class Flow:
             self.writes.append((self.file, key, site, self.sink if sink is None else sink))
 
     def nonempty(self, nodes):
-        nodes = unwrap(nodes)
-        if collection_size(nodes):
-            return True
-        path = names(nodes)
-        if path[-1:] == ("values",) and self.file.is_enum(path[:-1], nodes[0]):
-            return True
-        if nodes and member(nodes[-1]) in {"entries", "values", "keys"}:
-            nodes = unwrap(nodes[:-1])
-            path = names(nodes)
-            if kind(nodes) == "set_or_map_literal":
-                return bool(collection_size(nodes))
-        binding = self.file.binding(nodes)
-        if binding and binding.final and len(path) == 1 and collection_size(binding.initializer):
-            return binding.const or self.file.unchanged(binding)
-        call = final_call(nodes)
-        if call and call.name in {("Iterable", "generate"), ("List", "filled"), ("List", "generate")} and call.args:
-            count = self.file.fixed_number(call.args[0])
-            return type(count) is int and count > 0
-        return False
+        return bool(minimum_size(self.file, nodes))
 
     def loop(self, node, conditional):
         body = node.field("body")
         condition = node.field("condition")
         once = node.kind() == "do_statement"
         leading = NEXT
+        filtered = None
+        counter = None
         if node.kind() == "for_statement":
             parts = next((child for child in contents(node) if child.kind() == "for_loop_parts"), node)
             items = between(tokens(parts), "(", ")")
             iterable = named(between(items, "in"))
             if iterable:
                 once = self.nonempty(iterable)
+                target = next((child.text() for child in reversed(items[:next(
+                    i for i, child in enumerate(items) if child.kind() == "in")])
+                               if child.kind() == "identifier"), "")
+                filtered = enum_filter(self.file, body, target, iterable)
                 leading = self.expression(iterable, conditional)
             else:
                 initial = next((child for child in items if child.kind() == "local_variable_declaration"), None)
@@ -444,12 +523,18 @@ class Flow:
                     after = items[items.index(initial) + 1:]
                     condition = named(after[:next((i for i, child in enumerate(after) if child.kind() == ";"),
                                                  len(after))])
-                    once = self.counting_loop(initial, condition)
+                    once, counter = self.counting_loop(initial, condition, body)
                     leading = followed_by(self.visit(initial, conditional), self.expression(condition, conditional))
         elif not once:
             once = constant(as_tuple(condition)) is True
             leading = self.visit(condition, conditional)
-        result = self.visit(body, conditional or not once)
+        if counter is not None:
+            key, first = counter
+            self.loop_constants[key] = first
+        result = (self.visit(body, conditional or not once) if filtered is None
+                  else self.sequence(filtered, conditional))
+        if counter is not None:
+            del self.loop_constants[key]
         if node.kind() == "do_statement":
             result = followed_by(result, self.visit(condition, conditional or bool(result & ~NEXT)))
         exits = result & (RETURN | THROW)
@@ -457,16 +542,25 @@ class Flow:
             exits |= NEXT
         return followed_by(leading, exits)
 
-    def counting_loop(self, initial, condition):
+    def counting_loop(self, initial, condition, body):
         definition = variable_definition(initial)
         if definition is None:
-            return False
-        first = self.file.fixed_number(named(between(tokens(definition), "=", ",")))
+            return False, None
+        first = self.file.fixed_number(named(between(tokens(definition), "=", ",")), self.loop_constants)
         operator, left, right = expression_operator(condition)
-        bound = self.file.fixed_number(right)
-        if names(left) != (declared_name(definition),) or type(first) not in {int, float} or type(bound) not in {int, float}:
-            return False
-        return {"<": first < bound, "<=": first <= bound, ">": first > bound, ">=": first >= bound}.get(operator, False)
+        if names(left) != (declared_name(definition),) or type(first) not in {int, float}:
+            return False, None
+        bound = self.file.fixed_number(right, self.loop_constants)
+        if type(bound) not in {int, float} and operator in {"<", "<="} and names(right)[-1:] == ("length",):
+            bound = minimum_size(self.file, unwrap(right)[:-1])
+        if type(bound) not in {int, float}:
+            return False, None
+        enters = {"<": first < bound, "<=": first <= bound, ">": first > bound, ">=": first >= bound}.get(operator, False)
+        if enters and body is not None and (binding := self.file.binding(left)) is not None:
+            if not any(self.file.writes_binding(use) and self.file.binding((use,)) == binding
+                       for use in query(body, "identifier") if use.text() == binding.node.text()):
+                return True, ((self.file, offset(binding.node)), first)
+        return enters, None
 
     def switch(self, node, conditional):
         leading = self.visit(node.field("condition"), conditional)

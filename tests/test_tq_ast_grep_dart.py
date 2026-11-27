@@ -61,6 +61,25 @@ class AstGrepDart(TqCase):
         path = self.copy(FIXTURES / "dart" / "round_one_loops_test.dart")
         self.assertEqual(self.locations(path.name), [(25, "guarded-assert"), (30, "guarded-assert")])
 
+    def test_registration_context_and_forwarding(self):
+        # catches: ignoring supplied checks, joining detached runners, or counting unused setup callbacks
+        for fixture in ("round_two_platform.dart", "round_two_support.dart"):
+            self.copy(FIXTURES / "dart" / fixture)
+        path = self.copy(FIXTURES / "dart" / "round_two_callbacks_test.dart")
+        self.assertEqual(self.locations(path.name), [
+            (25, "no-assert"), (44, "guarded-assert"), (48, "guarded-assert"),
+            (69, "no-assert"), (74, "no-assert"), (76, "no-assert"), (77, "no-assert"),
+        ])
+
+    def test_fixed_loop_inputs_and_equivalent_guard(self):
+        # catches: accepting empty product results, mutable input, or a guard that changes the checked value
+        path = self.copy(FIXTURES / "dart" / "round_two_loops_test.dart")
+        self.assertEqual(self.locations(path.name), [
+            (51, "guarded-assert"), (54, "guarded-assert"), (57, "guarded-assert"),
+            (61, "guarded-assert"), (65, "guarded-assert"), (70, "guarded-assert"),
+            (93, "guarded-assert"), (109, "guarded-assert"),
+        ])
+
     def test_absence_controls_and_unproven_detectors(self):
         # catches: accepting a witness for the wrong detector or a swallowed error
         path = self.copy(FIXTURES / "dart" / "round_one_absence_test.dart")
