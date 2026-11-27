@@ -230,12 +230,27 @@ class Check:
         else:
             return None, None, None
         value = literal(expected)
-        if subject is None or type(value) not in {int, float}:
+        if subject is None:
             return None, None, None
         counter, subject = observation_subject(counter, subject)
+        if type(value) not in {int, float}:
+            if counter == "length" and self.operator in {"===", "=="} and not negated and _positive_sum(expected):
+                return counter, subject, True
+            return None, None, None
         if value == 0:
             return counter, subject, negated
         return counter, subject, True if value > 0 and not negated else None
+
+
+def _positive_sum(node):
+    operator, left, right = split_operands(expression(node))
+    if operator != "+":
+        return False
+    lhs, rhs = literal(left), literal(right)
+    return (
+        isinstance(rhs, (int, float)) and rhs > 0 and (lhs is lint.UNKNOWN or isinstance(lhs, (int, float)) and lhs >= 0)
+        or isinstance(lhs, (int, float)) and lhs > 0 and (rhs is lint.UNKNOWN or isinstance(rhs, (int, float)) and rhs >= 0)
+    )
 
 
 def nonempty_array(node):
@@ -251,6 +266,12 @@ def observation_subject(counter, subject):
         mock = expression(subject.field("object"))
         if member(mock, "mock"):
             return "calls", expression(mock.field("object"))
+    if counter == "length" and subject is not None and subject.kind() == "call_expression":
+        fn = expression(subject.field("function"))
+        args = arguments(subject)
+        if (len(args) == 1 and fn is not None and fn.kind() == "member_expression"
+                and name(fn.field("object")) == "Object" and name(fn.field("property")) in {"keys", "values", "entries"}):
+            return counter, expression(args[0])
     return counter, subject
 
 
@@ -507,6 +528,8 @@ class File:
         return {}
 
     def destructuring(self, node):
+        if node is None:
+            return None, ""
         use = offset(node)
         visible = [(declaration, key) for scope, declaration, key in self.destructured.get(name(node), ())
                    if offset(scope) <= use < scope.range().end.index and offset(declaration) < use]
@@ -634,7 +657,7 @@ class File:
                 return supplied[key]
             return node, supplied
         if (binding := self.binding(node)) is not None and binding.kind() == "variable_declarator":
-            if const_declaration(binding) and self.fixture_unchanged(node, binding):
+            if (const_declaration(binding) or self.never_reassigned(binding)) and self.fixture_unchanged(node, binding):
                 return self.fixed(binding.field("value"), supplied, seen)
         if node.kind() in {"member_expression", "subscript_expression"}:
             receiver, bindings = self.fixed(node.field("object"), supplied, seen)
@@ -643,6 +666,13 @@ class File:
                 item = self.object_field(receiver, key, bindings, seen)
                 if item is not None:
                     return item
+            if receiver is not None and receiver.kind() == "new_expression":
+                new_args = arguments(receiver)
+                if len(new_args) == 1 and (obj := expression(new_args[0])) is not None and obj.kind() == "object":
+                    key = name(node.field("property")) or text_literal(node.field("index"))
+                    item = self.object_field(obj, key, bindings, seen)
+                    if item is not None:
+                        return item
             if receiver is not None and receiver.kind() == "array":
                 index = literal(node.field("index"))
                 values = children(receiver)
@@ -650,16 +680,64 @@ class File:
                     return self.fixed(values[index], bindings, seen)
         if node.kind() == "call_expression":
             callee = node.field("function")
-            if not any(child.kind() == "?." for child in node.children()) and (target := self.helper(callee)) is not None:
-                body = expression(target.field("body"))
-                if body is not None and body.kind() == "statement_block":
-                    statements = children(body)
-                    body = next(iter(children(statements[0])), None) if (
-                        len(statements) == 1 and statements[0].kind() == "return_statement") else None
-                if body is not None:
-                    arguments_by_name = {**supplied, **self.fixture_arguments(target, arguments(node), supplied, seen)}
-                    return self.fixed(body, arguments_by_name, seen)
+            if not any(child.kind() == "?." for child in node.children()):
+                if (target := self.helper(callee)) is not None:
+                    body = self._single_return(target)
+                    if body is not None:
+                        arguments_by_name = {**supplied, **self.fixture_arguments(target, arguments(node), supplied, seen)}
+                        return self.fixed(body, arguments_by_name, seen)
+                else:
+                    from .ast_grep_ts_imports import imported_helper
+                    if (imported := imported_helper(self, callee)) is not None:
+                        module, target = imported
+                        if module is not None and target is not None and (body := self._single_return(target)) is not None:
+                            arguments_by_name = self.fixture_arguments(target, arguments(node), supplied, seen)
+                            return module.fixed(body, arguments_by_name)
         return node, supplied
+
+    def _single_return(self, target):
+        body = expression(target.field("body"))
+        if body is not None and body.kind() == "statement_block":
+            statements = children(body)
+            if not statements or statements[-1].kind() != "return_statement":
+                return None
+            ret = expression(next(iter(children(statements[-1])), None))
+            if len(statements) == 1:
+                return ret
+            if ret is not None and (key := name(ret)):
+                for stmt in reversed(statements[:-1]):
+                    if stmt.kind() in {"lexical_declaration", "variable_declaration"}:
+                        for decl in children(stmt):
+                            if decl.kind() == "variable_declarator" and name(decl.field("name")) == key:
+                                return expression(decl.field("value"))
+            return None
+        return body
+
+    def never_reassigned(self, binding):
+        key = name(binding.field("name"))
+        if not key:
+            return False
+        scope = next((parent for parent in binding.ancestors() if parent.kind() in SCOPES), self.syntax.root)
+        if self.fixture_references is None:
+            self.fixture_references = defaultdict(list)
+            for reference in query(self.syntax.root, "identifier"):
+                self.fixture_references[name(reference)].append(reference)
+        for reference in self.fixture_references[key]:
+            if not offset(scope) <= offset(reference) < scope.range().end.index:
+                continue
+            if (owner := self.binding(reference)) is None or offset(owner) != offset(binding):
+                continue
+            parent = reference.parent()
+            if parent is None:
+                continue
+            if parent.kind() in {"assignment_expression", "augmented_assignment_expression"} and offset(parent.field("left")) == offset(reference):
+                return False
+            if parent.kind() == "update_expression":
+                return False
+            if parent.kind() == "member_expression" and parent.parent() is not None and parent.parent().kind() == "call_expression":
+                if name(parent.field("property")) in {"push", "pop", "splice", "shift", "unshift", "sort", "reverse"}:
+                    return False
+        return True
 
     def parameter_scope(self, node):
         key = name(node)
@@ -684,6 +762,8 @@ class File:
         for field in reversed(children(node)):
             if field.kind() == "pair" and (name(field.field("key")) or text_literal(field.field("key"))) == key:
                 return self.fixed(field.field("value"), supplied, seen)
+            if field.kind() == "shorthand_property_identifier" and name(field) == key:
+                return self.fixed(field, supplied, seen)
             if field.kind() == "spread_element":
                 spread, bindings = self.fixed(children(field)[0], supplied, seen)
                 return self.object_field(spread, key, bindings, seen) if spread is not None else None
@@ -712,8 +792,9 @@ class File:
                         and self.binding(receiver) is None and self.parameter_scope(receiver) is None):
                     continue
             if parent.kind() in {"assignment_expression", "augmented_assignment_expression", "update_expression",
-                                 "arguments", "unary_expression", "return_statement", "variable_declarator",
-                                 "pair", "array", "spread_element"}:
+                                 "unary_expression", "return_statement", "variable_declarator",
+                                 "pair", "array", "spread_element"} or (
+                                     parent.kind() == "arguments" and current.kind() != "member_expression"):
                 return False
             if parent.kind() == "call_expression" and offset(parent.field("function")) == offset(current):
                 if name(current.field("property")) not in {"map", "filter", "forEach", "every", "some", "find",
@@ -870,15 +951,82 @@ class File:
         binding = self.binding(root)
         if self.parameter_scope(root) is not None:
             return "", ()
-        if name(root) in self.source_imports:
+        if name(root) in self.source_imports and binding is None:
+            from .ast_grep_ts_imports import imported_expect_origin
+
             source, imported = self.source_imports[name(root)]
-            if source == "@effect/vitest/utils" and binding is None:
+            if source == "@effect/vitest/utils":
                 return source, (*imported, *chain(callee)[1])
+            origin = imported_expect_origin(self, callee)
+            if origin is not None:
+                return origin
             return "", ()
+        if binding is not None and binding.kind() == "variable_declarator":
+            rhs = expression(binding.field("value"))
+            base_rhs = rhs
+            while base_rhs is not None and base_rhs.kind() == "call_expression":
+                fn = expression(base_rhs.field("function"))
+                if fn is not None and fn.kind() == "member_expression" and name(fn.field("property")) in {"extend", "configure"}:
+                    base_rhs = expression(fn.field("object"))
+                    continue
+                break
+            if base_rhs is not rhs and base_rhs is not None:
+                src, base_names = self.assertion_target(base_rhs)
+                if src or base_names:
+                    return src, (*base_names, *chain(callee)[1])
         if binding is not None and (binding.kind() != "variable_declarator"
                                     or self.require(binding.field("value"))[0] != source or not source):
             return "", ()
         return source, names
+
+    def is_throwing_test_fixture(self, callee):
+        fixture_name = name(callee)
+        if not fixture_name or self.binding(callee) is not None:
+            return False
+        call = None
+        for ancestor in callee.ancestors():
+            if ancestor.kind() in FUNCTIONS:
+                params = ancestor.field("parameters") or next((c for c in children(ancestor) if c.kind() == "formal_parameters"), None)
+                if params is not None and any(
+                        p.text() == fixture_name for p in query(params, "shorthand_property_identifier_pattern", "identifier")):
+                    parent = ancestor.parent()
+                    if parent is not None and parent.kind() == "arguments":
+                        call = parent.parent()
+                        break
+        if call is None or call.kind() != "call_expression":
+            return False
+        test_fn = expression(call.field("function"))
+        extend_call = None
+        if test_fn is not None:
+            root, _ = chain(test_fn)
+            if name(root) in self.source_imports and self.binding(root) is None:
+                from .ast_grep_ts_imports import imported_helper
+                imported = imported_helper(self, test_fn)
+                if imported is not None:
+                    extend_call = expression(imported[1])
+            elif (binding := self.binding(root)) is not None and binding.kind() == "variable_declarator":
+                extend_call = expression(binding.field("value"))
+        if extend_call is None or extend_call.kind() != "call_expression":
+            return False
+        ext_fn = expression(extend_call.field("function"))
+        if ext_fn is None or ext_fn.kind() != "member_expression" or name(ext_fn.field("property")) != "extend":
+            return False
+        args = arguments(extend_call)
+        if not args or expression(args[0]).kind() != "object":
+            return False
+        for entry in children(expression(args[0])):
+            if entry.kind() == "pair" and name(entry.field("key")) == fixture_name:
+                impl = expression(entry.field("value"))
+                if impl is None:
+                    return False
+                for use_call in query(impl, "call_expression"):
+                    if name(use_call.field("function")) == "use":
+                        for use_arg in arguments(use_call):
+                            if any(not any(p.kind() == "catch_clause" and offset(p) >= offset(impl)
+                                           for p in th.ancestors())
+                                   for th in query(use_arg, "throw_statement")):
+                                return True
+        return False
 
     def expect_origin(self, callee):
         source, names = self.assertion_target(callee)
@@ -923,11 +1071,27 @@ class File:
         if base is None:
             return None
         if members and base.kind() == "call_expression":
+            tsrc, tnames = self.assertion_target(base.field("function"))
+            if tnames == ("expectTypeOf",) and (not tsrc or tsrc in {"vitest", "vite-plus/test", "expect-type"}):
+                return Check(node, "type check")
             origin = self.expect_origin(base.field("function"))
             if origin and (subject := arguments(base)):
                 check = matcher(node, subject[0], members, args)
                 check.modifiers = (*origin[1:], *check.modifiers)
                 return check
+        if node.field("type_arguments") is not None:
+            tsrc, tnames = self.assertion_target(callee)
+            if tnames == ("assertType",) and (not tsrc or tsrc in {"vitest", "vite-plus/test", "expect-type"}):
+                return Check(node, "type check")
+            target = self.helper(callee)
+            if target is None:
+                from .ast_grep_ts_imports import imported_helper
+                imported = imported_helper(self, callee)
+                target = imported[1] if imported is not None else None
+            if target is not None and target.kind() in FUNCTIONS:
+                tbody = target.field("body")
+                if tbody is not None and tbody.kind() == "statement_block" and not children(tbody):
+                    return Check(node, "type check")
         if "should" in members and members[-1] != "should":
             index = members.index("should")
             subject = expression(callee)
@@ -1147,7 +1311,7 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
     from .ast_grep_catches import swallowed_assertions
     from .ast_grep_ts_flow import Flow
     from .ast_grep_ts_controls import (
-        control_keys, positive_reads, returned_mock_control, supplied_prompt_part,
+        collection_member_witness, control_keys, positive_reads, returned_mock_control, supplied_prompt_part,
     )
     from .ast_grep_ts_navigation import navigation_issues
     from .ast_grep_ts_recorders import fixture_origin
@@ -1176,7 +1340,8 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
         test.issues.extend((line(node), rule) for node, rule in ui_issues(file, test, flow.checks))
         test.issues.extend((line(node), rule) for node, rule in navigation_issues(file, flow.checks))
         test.checks = len(flow.checks)
-        lint.record_completion(test, not flow.checks, no_crash_test(flow, test, notes))
+        has_ts_expect_error = any("@ts-expect-error" in note.text for note in notes if test.start <= note.line <= test.end)
+        lint.record_completion(test, not flow.checks and not has_ts_expect_error, no_crash_test(flow, test, notes))
         test.guarded = bool(flow.checks) and bool(incomplete)
         if inventory:
             test.body_hash = hashlib.sha256(repr(shape(body)).encode()).hexdigest()
@@ -1228,7 +1393,8 @@ def parse(source, path, language, *, scan_root=None, inventory=False, observe=No
             if (local not in witnesses and not siblings.intersection(extra_witnesses)
                     and (group is None or (local[0], group) not in groups)
                     and not (local[0] == "calls" and returned_mock_control(file, subject, check, flow.checks))
-                    and not (local[0] == "length" and supplied_prompt_part(file, subject, flow.checks, body))):
+                    and not (local[0] == "length" and supplied_prompt_part(file, subject, flow.checks, body))
+                    and not (local[0] == "length" and collection_member_witness(file, subject, check, flow.checks, body))):
                 test_absences.append((test, siblings, site))
     for test, siblings, site in test_absences:
         if not siblings.intersection(sibling_witnesses):

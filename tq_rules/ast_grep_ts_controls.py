@@ -3,7 +3,7 @@
 from . import lint
 from .ast_grep import children, offset, query, shape, split_operands
 from .ast_grep_ts import (
-    FUNCTIONS, arguments, chain, const_declaration, expression, formal_parameters, literal, name, span,
+    FUNCTIONS, arguments, chain, const_declaration, expression, formal_parameters, literal, name, span, text,
 )
 from .ast_grep_ts_effects import language_model_reference, returned_value
 from .ast_grep_ts_recorders import fixture_origin, object_member
@@ -377,18 +377,21 @@ def mock_declaration(call):
 def positive_reads(file, check):
     """A checked index, find result, or derived request witnesses a nonempty input."""
     expected = literal(check.expected)
+    exp_node = expression(check.expected)
     if check.negated or not (
         check.method in {"toBeDefined", "toBeTruthy", "toBeGreaterThan"} or
         check.operator in {"===", "=="} and (
             expected is not lint.UNKNOWN and expected is not None
-            or check.expected is not None and check.expected.kind() in {"object", "array"}
+            or exp_node is not None and exp_node.kind() in {"object", "array"} | FUNCTIONS
+            or exp_node is not None and exp_node.kind() == "identifier" and text(exp_node) not in {"undefined", "null"}
         )
     ):
         return
-    yield from required_reads(file, check.actual)
+    allow_member = check.method not in {"toBeNull", "toBeUndefined", "toBeFalsy"} and expected is not None
+    yield from required_reads(file, check.actual, allow_member=allow_member)
 
 
-def required_reads(file, node, supplied=None, seen=frozenset()):
+def required_reads(file, node, supplied=None, seen=frozenset(), *, allow_member=False):
     node, bindings = file.fixed(node, supplied)
     if node is None or span(node) in seen:
         return
@@ -402,17 +405,19 @@ def required_reads(file, node, supplied=None, seen=frozenset()):
                 yield "calls", receiver.field("object").field("object"), bindings
             else:
                 yield "length", receiver, bindings
-        yield from required_reads(file, receiver, bindings, seen)
+        elif allow_member and kind == "member_expression" and name(node.field("property")) != "length":
+            yield "length", receiver, bindings
+        yield from required_reads(file, receiver, bindings, seen, allow_member=allow_member)
     elif kind == "call_expression":
         fn = expression(node.field("function"))
         if name(fn.field("property")) in {"find", "at"}:
             yield "length", fn.field("object"), bindings
         else:
-            yield from required_reads(file, fn.field("object"), bindings, seen)
+            yield from required_reads(file, fn.field("object"), bindings, seen, allow_member=allow_member)
     elif kind == "new_expression" and name(node.field("constructor")) == "Request" and file.binding(
             node.field("constructor")) is None:
         for arg in arguments(node)[:1]:
-            yield from required_reads(file, arg, bindings, seen)
+            yield from required_reads(file, arg, bindings, seen, allow_member=allow_member)
 
 
 def supplied_prompt_part(file, subject, checks, body):
@@ -477,5 +482,117 @@ def supplied_prompt_part(file, subject, checks, body):
         args = arguments(entry)
         if reference == ("Prompt", method) or (
                 reference == ("Prompt", "makePart") and args and literal(args[0]) == part):
+            return True
+    return False
+
+
+def _filter_field_chain(subject):
+    node = expression(subject)
+    if node is None or node.kind() != "call_expression":
+        return None
+    callee = expression(node.field("function"))
+    if callee is None or callee.kind() != "member_expression" or name(callee.field("property")) != "filter":
+        return None
+    base, fields = chain(callee.field("object"))
+    if not name(base) or not fields:
+        return None
+    return base, fields
+
+
+def _role_guard(subject, item_name, body):
+    for parent in subject.ancestors():
+        if offset(parent) < offset(body):
+            break
+        if parent.kind() != "if_statement":
+            continue
+        op, left, right = split_operands(expression(parent.field("condition")))
+        if op not in {"===", "=="}:
+            continue
+        for lside, rside in ((left, right), (right, left)):
+            base, fields = chain(lside)
+            val = literal(rside)
+            if name(base) == item_name and fields == ("role",) and isinstance(val, str):
+                return val
+    return None
+
+
+def _proven_item_with_role(file, var_node, col_rec, role, checks, body):
+    binding = file.binding(var_node)
+    if binding is None or binding.kind() != "variable_declarator":
+        return False
+    init = expression(binding.field("value"))
+    if init is None:
+        return False
+    var_rec = file.recorder(var_node)
+    from_find = False
+    if init.kind() == "call_expression":
+        fn = expression(init.field("function"))
+        if fn is None or fn.kind() != "member_expression" or name(fn.field("property")) != "find":
+            return False
+        if file.recorder(fn.field("object")) != col_rec:
+            return False
+        from_find = True
+    elif init.kind() == "subscript_expression":
+        if file.recorder(init.field("object")) != col_rec:
+            return False
+    else:
+        return False
+    role_matched = role is None
+    defined_ok = not from_find
+    if from_find:
+        for call in query(body, "call_expression"):
+            if any(offset(p) >= offset(body) and p.kind() in {"if_statement", "for_in_statement", "for_statement"}
+                   for p in call.ancestors()):
+                continue
+            args = arguments(call)
+            if name(call.field("function")) == "assertDefined" and len(args) == 1 and file.recorder(args[0]) == var_rec:
+                defined_ok = True
+                break
+    for check in checks:
+        if check.guarded or check.negated:
+            continue
+        if check.method in {"toBeDefined", "toBeTruthy"} and file.recorder(check.actual) == var_rec:
+            defined_ok = True
+        if role is not None and check.operator in {"===", "=="}:
+            for side, exp in ((check.actual, check.expected), (check.expected, check.actual)):
+                base, fields = chain(side)
+                if fields == ("role",) and file.recorder(base) == var_rec and literal(exp) == role:
+                    role_matched = True
+                    defined_ok = True
+    if from_find and role is not None and not role_matched:
+        args = arguments(init)
+        if args and args[0].kind() in FUNCTIONS:
+            op, l, r = split_operands(expression(returned_value(args[0])))
+            if op == "===":
+                for s, v in ((l, r), (r, l)):
+                    if chain(s)[1] == ("role",) and literal(v) == role:
+                        role_matched = True
+    return defined_ok and role_matched
+
+
+def collection_member_witness(file, subject, absence, checks, body):
+    """An unguarded positive filter check on a proven element of the same collection witnesses an absence check."""
+    parsed = _filter_field_chain(subject)
+    if parsed is None:
+        return False
+    item_node, fields = parsed
+    loop = next((p for p in subject.ancestors()
+                 if offset(p) >= offset(body) and p.kind() == "for_in_statement"
+                 and any(c.kind() == "of" for c in p.children())
+                 and name(p.field("left")) == name(item_node)), None)
+    if loop is None:
+        return False
+    col_rec = file.recorder(loop.field("right"))
+    role = _role_guard(subject, name(item_node), body)
+    for check in checks:
+        if check is absence or check.guarded:
+            continue
+        counter, pos_sub, presence = check.observation()
+        if counter != "length" or presence is not True:
+            continue
+        pos_parsed = _filter_field_chain(pos_sub)
+        if pos_parsed is None or pos_parsed[1] != fields:
+            continue
+        if _proven_item_with_role(file, pos_parsed[0], col_rec, role, checks, body):
             return True
     return False
