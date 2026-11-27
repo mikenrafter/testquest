@@ -1,6 +1,7 @@
 """JVM assertion operands, literal proofs and recorder observations."""
 
 from dataclasses import dataclass, field
+import re
 
 from . import lint
 from .ast_grep import children, line, query, shape, unwrap
@@ -184,6 +185,7 @@ class Check:
     fragment_needle: object = None
     fragment_negative: bool = False
     no_throw: bool = False
+    message: str = ""
     controls: dict = field(default_factory=dict)
     disabled: frozenset = frozenset()
     sizes: tuple = ()
@@ -221,9 +223,13 @@ def compares_itself(syntax, check, title, notes, checks):
         return True
     site = line(check.node)
     comment = " ".join(notes.get(at, "") for at in (site - 1, site))
-    if any(lint.describes_distinct_inputs(text) for text in (title, comment)):
+    if any(lint.describes_distinct_inputs(text) for text in (title, comment, check.message)):
         return True
-    if any(lint.suggests_repeatability(text) for text in (title, comment)):
+    if any(lint.suggests_repeatability(text) for text in (title, comment, check.message)):
+        return False
+    if check.operator == "is" and re.search(
+            r"\b(?:second|subsequent|repeated)\b.*\b(?:cache|cached|from memory)\b",
+            check.message, flags=re.I):
         return False
     for other in checks:
         if other is check:
@@ -323,7 +329,7 @@ def check_call(file, node, call):
         check = Check(node)
         for arg in call.args:
             record_observation(check, (key for key in verified_call(file, arg, "")
-                                       if key[0] in {"calls", "mock-type"}), False)
+                                       if key[0] in {"calls", "mock-type", "installed-mock"}), False)
         return check
     if call.receiver is not None:
         if (verified := call_of(call.receiver)) is not None and file.resolve_name(verified.method) == "verify":
@@ -350,7 +356,13 @@ def check_call(file, node, call):
     if method in EQUAL | UNEQUAL | IDENTITY:
         operands = junit_args(file, call, method)
         if len(operands) >= 2:
-            return collect_observations(file, equality(node, method, *operands[:2]))
+            check = equality(node, method, *operands[:2])
+            if method == "assertSame" and len(call.args) == 3:
+                message = next((arg for arg in call.args if all(arg is not operand for operand in operands[:2])), None)
+                value = literal(file.syntax, message)
+                if isinstance(value, str):
+                    check.message = value
+            return collect_observations(file, check)
     if method == "assertNotNull":
         operands = junit_args(file, call, method)
         return collect_observations(file, Check(node), method, operands[0] if operands else None)
@@ -462,10 +474,16 @@ def collect_observations(file, check, method="", subject=None, expected=None):
         check.fragment_needle = expected
         check.fragment_negative |= check.negated or method in {"doesNotContain", "shouldNotContain"}
 
-    from .ast_grep_jvm_controls import captured_slot, collection_controls_for, sized_source
+    from .ast_grep_jvm_controls import (
+        captured_slot, checked_callback_collectors, collection_controls_for, collection_projection, latch_recorder,
+        reflected_mock, sized_source,
+    )
 
     def observe(receiver, present):
         record_observation(check, collection_controls_for(file, receiver, present), present)
+        if present and file.syntax.language == "kotlin":
+            if (source := collection_projection(file, receiver)) is not None:
+                record_observation(check, collection_controls_for(file, source, True), True)
         return check
 
     def observed_item(node):
@@ -476,6 +494,11 @@ def collect_observations(file, check, method="", subject=None, expected=None):
         if (call := call_of(node)) is not None and call.method in {"poll", "single", "first", "getFirst", "remove"}:
             return call.receiver
         return None
+
+    if check.operator == "is" and file.syntax.language == "java":
+        for readback, observed in ((check.left, check.right), (check.right, check.left)):
+            if (recorder := reflected_mock(file, readback, observed)) is not None:
+                record_observation(check, (("installed-mock", recorder),), True)
 
     for operand in (subject, check.left, check.right, check.predicate):
         if (slot := captured_slot(file, operand)) is not None:
@@ -496,10 +519,22 @@ def collect_observations(file, check, method="", subject=None, expected=None):
                 check.fragment_needle = call.args[0]
                 check.fragment_negative = check.negated != (opposite is not None)
             positive = (not check.negated) != (opposite is not None)
+            if file.syntax.language == "kotlin" and call_of(call.receiver) is not None:
+                from .ast_grep_jvm_profiles import observed_mock_reads
+
+                channel = "read-returned-true" if positive else "read-returned-false"
+                record_observation(check, ((channel, recorder) for recorder in observed_mock_reads(
+                    file, opposite or tested, call)), True)
+            if (positive and call.method == "await" and len(call.args) == 2
+                    and file.syntax.language == "java" and (latch := latch_recorder(file, call.receiver)) is not None):
+                record_observation(check, (("awaited-latch", latch),), True)
             if call.method in {"isEmpty", "isNotEmpty"} and not call.args:
                 return observe(call.receiver, positive == (call.method == "isNotEmpty"))
             if positive and call.method in {"contains", "containsKey", "containsValue", "any"}:
                 return observe(call.receiver, True)
+    if method == "isZero" and subject is not None and file.syntax.language == "java":
+        record_observation(check, (("checked-callback-count", recorder)
+                                   for recorder in checked_callback_collectors(file, subject)), True)
     if method in {"isEmpty", "isNotEmpty", "empty", "emptyIterable", "shouldBeEmpty", "shouldNotBeEmpty"}:
         return observe(subject, method in {"isNotEmpty", "shouldNotBeEmpty"})
     if method in {"assertNotNull", "isNotNull"} and (receiver := observed_item(subject)) is not None:
@@ -538,8 +573,13 @@ def collect_observations(file, check, method="", subject=None, expected=None):
                     return observe(receiver, True)
             if relation == "==" and call_of(expected) is not None and (size := iterable_size(
                     file.syntax, expected)) is not None and size > 0:
-                if file.collection_recorder(operand) is not None:
+                if file.collection_recorder(operand) is not None or (
+                        file.syntax.language == "kotlin" and collection_projection(file, operand) is not None):
                     return observe(operand, True)
+            if relation == "==" and type(count := literal(file.syntax, expected)) is int and count == 0:
+                if file.syntax.language == "java" and operand is not None:
+                    record_observation(check, (("checked-callback-count", recorder)
+                                               for recorder in checked_callback_collectors(file, operand)), True)
             operand = file.immutable_value(unwrap(operand)) or unwrap(operand)
             receiver, property_name = member(operand)
             measurement = call_of(operand)

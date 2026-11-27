@@ -656,12 +656,57 @@ def comments(syntax):
                               text, standalone or index > 0)
 
 
-def no_crash_test(language, test, body, checks, notes, missing, checked):
+def completion_control(file, test, body, notes):
+    if file.syntax.language != "kotlin" or not any(
+            comment.standalone and comment.line == test.start - 1
+            and comment.text.lower().removeprefix("why:").lstrip().startswith("positive control.")
+            for comment in notes):
+        return False
+
+    from .ast_grep_jvm_flow import expects_failure
+
+    block = child(body, "statements")
+    steps = children(block) if block is not None else []
+    cleanup = call_of(steps[-1]) if steps else None
+    if cleanup is None or cleanup.method != "close" or cleanup.args or has_safe_navigation(cleanup.callee):
+        return False
+    attempt = call_of(cleanup.receiver)
+    helper = file.helper(cleanup.receiver, attempt) if attempt is not None else None
+    if helper is None:
+        return False
+    _, declaration = helper
+    for sibling, sibling_body, ignored, _ in file.inventory():
+        if ignored or sibling.qualified.rpartition("::")[0] != test.qualified.rpartition("::")[0] or sibling.line <= test.line:
+            continue
+        for entry in query(sibling_body, "call_expression"):
+            call = call_of(entry)
+            if call is None or not call.callbacks():
+                continue
+            callback = call.callbacks()[-1]
+            block = body_of(callback)
+            entries = children(block) if block is not None else []
+            if len(entries) != 1 or shape(entries[0]) != shape(cleanup.receiver):
+                continue
+            target = file.helper(entries[0], call_of(entries[0]))
+            if target is None or target[0] is not helper[0] or node_key(target[1]) != node_key(declaration):
+                continue
+            method = file.resolve_name(call.method)
+            if method in {"assertThrows", "assertFailsWith", "shouldThrow", "shouldThrowExactly"}:
+                return True
+            wrapper = file.helper(entry, call)
+            if wrapper is not None and expects_failure(wrapper[1]):
+                return True
+    return False
+
+
+def no_crash_test(file, test, body, checks, notes, missing, checked):
     if checks:
         return checked and all(check.no_throw for check in checks)
-    if not missing or not lint.claims_completion(test, notes):
+    if not missing or query(body, "catch_block" if file.syntax.language == "kotlin" else "catch_clause"):
         return False
-    if query(body, "catch_block" if language == "kotlin" else "catch_clause"):
+    if completion_control(file, test, body, notes):
+        return True
+    if not lint.claims_completion(test, notes):
         return False
     statements = children(body_of(body) if body.kind() in LAMBDAS else body)
     while len(statements) == 1 and statements[0].kind() in {"block", "statements", "function_body"}:
@@ -676,8 +721,11 @@ def no_crash_test(language, test, body, checks, notes, missing, checked):
 
 def parse(source, path, language, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
     from .ast_grep_jvm_checks import compares_itself
-    from .ast_grep_jvm_controls import analyze, capture_controls, shared_keys, sibling_controls
+    from .ast_grep_jvm_controls import (
+        analyze, answer_controls, capture_controls, shared_keys, sibling_controls, split_collection_controls,
+    )
     from .ast_grep_jvm_micro import micro_snapshot
+    from .ast_grep_jvm_profiles import disabled_output, observed_mock_controls
 
     syntax = parse_syntax(source, language)
     resolved = path.resolve()
@@ -703,14 +751,17 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
     for index, (test, body, expected_exception, flow, evidence) in enumerate(analyses):
         if sizes and flow.loop_checks and not evidence.checked:
             flow, evidence = analyze(file, body, sizes)
-        witnesses = evidence.witnesses | capture_controls(file, body, evidence.witnesses)
+        witnesses = (evidence.witnesses | capture_controls(file, body, evidence.witnesses)
+                     | answer_controls(file, body, evidence.witnesses)
+                     | split_collection_controls(file, body, evidence.witnesses))
         controls_by_test.append(shared_keys(witnesses))
+        checked_reads = observed_mock_controls(evidence.witnesses)
         checks = list(flow.checks.values())
         micro_snapshot(file, test, flow.checks)
         test.checks = len(checks) + int(expected_exception)
         missing = not test.checks and not flow.opaque_check
         if not expected_exception:
-            lint.record_completion(test, missing, no_crash_test(language, test, body, checks, notes, missing, evidence.checked))
+            lint.record_completion(test, missing, no_crash_test(file, test, body, checks, notes, missing, evidence.checked))
         test.guarded = bool(checks) and not (evidence.checked or expected_exception)
         if test.guarded and flow.loop_checks.keys() == flow.checks.keys():
             source = next(iter(flow.loop_checks.values()))
@@ -741,7 +792,17 @@ def parse(source, path, language, *, scan_root=None, collection_controls=None, i
                 if present or key[1] in check.disabled:
                     continue
                 related = check.controls.get(key, frozenset({key}))
-                if not related & witnesses:
+                captured = next((recorder for channel, recorder in related if channel == "captured-call"), None)
+                if captured is not None and (setting := disabled_output(
+                        file, body, check.node, key[1], captured.shared[-1])) is not None:
+                    issue = site, "absence-no-control"
+                    test.issues.append(issue)
+                    if test.issue_messages is None:
+                        test.issue_messages = {}
+                    test.issue_messages[issue] = (
+                        f"The output path is disabled by `{setting} = false`. Enable it to exercise the path checked here.")
+                    continue
+                if not related & (witnesses | checked_reads):
                     absences.append((index, test, site, shared_keys(related)))
 
     pending = []
