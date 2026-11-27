@@ -1972,6 +1972,13 @@ class File:
 
 
 def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False, observe=None):
+    from .ast_grep_languages import ECMASCRIPT_LANGUAGES
+
+    if path.suffix in ECMASCRIPT_LANGUAGES:
+        from .ast_grep_ts import parse as parse_ecmascript
+
+        return parse_ecmascript(source, path, ECMASCRIPT_LANGUAGES[path.suffix],
+                                inventory=inventory, observe=observe)
     file = File(source, "rust" if path.suffix == ".rs" else "python", path, scan_root)
     if file.syntax.language == "python" and (errors := syntax_errors(file.syntax.root)):
         if observe is not None:

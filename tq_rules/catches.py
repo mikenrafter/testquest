@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 from . import repo
-from .source import scan_paths
+from .source import note_owners, scan_paths
 
 
 NOTE = re.compile(r"catches:\s*(.+?)(?:\s+\[patch:\s*([^\]]+)\])?$")
@@ -98,7 +98,7 @@ def replay(base, patch, command, temp, environment):
         return "error", f"Test command exited {result.returncode}. {(result.stderr or result.stdout).strip()}"
 
 
-def run(repository, worktree, command, *, inventory=False, revision="HEAD"):
+def run(repository, worktree, command, *, inventory=False, revision="HEAD", parser=None):
     repository = repo.root(repository)
     template = shlex.split(command)
     if not template:
@@ -113,9 +113,9 @@ def run(repository, worktree, command, *, inventory=False, revision="HEAD"):
         with chdir(base):
             notes = [
                 (path, comment.line, test.identifier, *match.groups(), test.qualified, test.body_hash)
-                for path, tests, comments in scan_paths([Path(".")], [], inventory=inventory)
+                for path, tests, comments in scan_paths([Path(".")], [], inventory=inventory, parser=parser)
                 for comment in comments if (match := NOTE.fullmatch(comment.text))
-                for test in tests if (test.owns_inventory_comment(comment) if inventory else test.owns(comment))
+                for test in note_owners(path, tests, comment, inventory=inventory)
             ]
         for path, line, test, description, patch, qualified, body_hash in sorted(notes, key=lambda note: note[:4]):
             if patch:

@@ -45,7 +45,7 @@ def main():
         scan.add_argument("paths", nargs="*" if name == "lint" else "+")
         if name == "lint":
             scan.add_argument("--since")
-            scan.add_argument("--engine", choices=("legacy", "ast-grep"), default="legacy")
+        scan.add_argument("--engine", choices=("legacy", "ast-grep"), default="legacy")
         scan.add_argument("--json", action="store_true")
     ledger.add_commands(commands.add_parser("log", help="Record and report test evidence."))
     commands.add_parser("rules", help="Show finding rules and exceptions.")
@@ -54,6 +54,7 @@ def main():
     replay.add_argument("--worktree", action="store_true")
     replay.add_argument("--cmd", default="python3 -m unittest {test}",
                         help="Test command with optional {test} placeholder.")
+    replay.add_argument("--engine", choices=("legacy", "ast-grep"), default="legacy")
     replay.add_argument("--json", action="store_true")
     map_risk = commands.add_parser("risk", help="Rank source files by change history and usage.")
     map_risk.add_argument("--repo", default=".")
@@ -71,24 +72,17 @@ def main():
     if options.command == "lint" and not (options.paths or options.since):
         parser.error("lint requires paths or --since")
     try:
+        parse = select_parser(getattr(options, "engine", "legacy"))
         if options.command == "lint":
-            parse = None
-            if options.engine == "ast-grep":
-                try:
-                    from .ast_grep_lint import parse
-                except ModuleNotFoundError as error:
-                    if error.name != "ast_grep_py":
-                        raise
-                    raise ValueError("--engine ast-grep requires the ast-grep-py package") from error
             select = (history.ChangedTests(repo.root("."), options.since, parser=parse)
                       if options.since else None)
             return print_findings(lint.find(options.paths or ["."], select=select, parser=parse), options.json)
         if options.command == "log":
             return run_log(options)
         if options.command == "witness":
-            return print_findings(witness.find(options.paths), options.json)
+            return print_findings(witness.find(options.paths, parser=parse), options.json)
         if options.command == "catches":
-            rows = catches.run(options.repo, options.worktree, options.cmd)
+            rows = catches.run(options.repo, options.worktree, options.cmd, parser=parse)
             return print_replays(rows, options.json)
         if options.command == "risk":
             from . import risk
@@ -121,6 +115,18 @@ def main():
         print(f"tq: {error}", file=sys.stderr)
         return 2
     return 0
+
+
+def select_parser(engine):
+    if engine == "legacy":
+        return None
+    try:
+        from .ast_grep_lint import parse
+    except ModuleNotFoundError as error:
+        if error.name != "ast_grep_py":
+            raise
+        raise ValueError("--engine ast-grep requires the ast-grep-py package") from error
+    return parse
 
 
 def print_replays(rows, as_json):
