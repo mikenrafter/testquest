@@ -1,6 +1,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
 import re
 from string import Formatter
 
@@ -35,6 +36,7 @@ class Token:
     kind: str = ""
     children: tuple = ()
     end: int = 0
+    end_column: int = 0
 
 
 def tokenize(source):
@@ -93,7 +95,7 @@ def group(tokens):
         elif len(stack) > 1 and token.text == CLOSE[stack[-1][0].text]:
             opening, children = stack.pop()
             stack[-1][1].append(Token(opening.text, opening.line, opening.column,
-                                      "group", tuple(children), token.line))
+                                      "group", tuple(children), token.line, token.column + 1))
         else:
             stack[-1][1].append(token)
     if len(stack) != 1:
@@ -244,7 +246,7 @@ def test_functions(tokens, namespace=(), imports=None, *, module_scope=True):
                         header = next((part.children for part in tokens[index + 2:body_index]
                                        if part.text == "("), ())
                         yield (token, name, "::".join((*namespace, name)), attributes[0][0].line,
-                               body, panic, ignored, aliases, scope, header)
+                               body, panic, ignored, aliases, scope, header, attributes[0][0].column)
                         index = body_index
                         break
             attributes.clear()
@@ -2928,7 +2930,7 @@ def witnessed_by_helpers(inspected, evidence, file_iterables, parameters, missin
             yield from (producer for producer, present, _ in helper.collection_checks() if present)
 
 
-def parse(source, path, *, scan_root=None, collection_controls=None):
+def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False):
     tokens, comments = tokenize(source)
     line_comments = {comment.line: comment.text for comment in comments}
     tests = []
@@ -2943,12 +2945,13 @@ def parse(source, path, *, scan_root=None, collection_controls=None):
     file_iterables = FileIterables(grouped, path, parameters)
     evidence = CheckEvidence(file_iterables, found)
     macro_tests = set(macro_template_tests(grouped))
-    for token, name, identifier, start, body, panic, ignored, aliases, scope, header in found:
+    for token, name, identifier, start, body, panic, ignored, aliases, scope, header, column in found:
         if scope is not None and id(scope) not in helpers:
             helpers[id(scope)] = checking_helpers(scope, test_bodies)
         previous = {c.line for c in comments if c.standalone and c.column == token.column}
         while start - 1 in previous:
             start -= 1
+            column = token.column
         test = Test(name, identifier, token.line, start, body.end, token.column)
         namespace = tuple(identifier.split("::")[:-1])
         inspector = Inspect(aliases, helpers.get(id(scope), frozenset()), file_iterables,
@@ -2960,6 +2963,11 @@ def parse(source, path, *, scan_root=None, collection_controls=None):
                                 if len(argument) >= 3 and argument[0].kind == "word" and argument[1].text == "in"}
         inspector.parity_mutations = growth_receivers(body.children)
         inspector.visit(body.children)
+        if inventory:
+            test.qualified = identifier
+            test.span_columns = column, body.end_column
+            test.body_hash = hashlib.sha256(repr(shape(body.children)).encode()).hexdigest()
+            test.checks = len(inspector.checks)
         inspected.append((test, inspector, panic, ignored, body))
     pins = {pin for _, inspector, _, _, _ in inspected for pin in inspector.literal_pins()}
     observations = [list(inspector.collection_observations()) if not ignored else []

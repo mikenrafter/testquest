@@ -266,12 +266,16 @@ def helper(name):
     return name.lower().startswith(("assert", "check", "expect")) or name in {"raises", "fail"}
 
 
-def find(paths):
+def find(paths, *, select=None, owners=None):
     rows = []
     controls = CollectionControls()
-    files = list(scan_paths(paths, rows, refine_guards=True, collection_controls=controls))
+    files = list(scan_paths(paths, rows, refine_guards=True, collection_controls=controls,
+                            inventory=select is not None))
+    if select is not None:
+        rows.clear()
     controls.finish()
     for path, tests, comments in files:
+        file_rows = []
         allows = {}
         for comment in comments:
             match = re.fullmatch(r"tq:\s*allow\s+([\w-]+)(?:\s+(.*))?", comment.text)
@@ -279,10 +283,10 @@ def find(paths):
                 continue
             rule, reason = match.groups()
             if not reason:
-                rows.append(finding(path, comment.line, "invalid-suppression",
+                file_rows.append(finding(path, comment.line, "invalid-suppression",
                                     f"Suppression for {rule} needs a reason."))
             elif rule not in RULES:
-                rows.append(finding(path, comment.line, "invalid-suppression",
+                file_rows.append(finding(path, comment.line, "invalid-suppression",
                                     f"Unknown rule {rule}."))
             else:
                 allows[comment.line, rule] = comment.standalone
@@ -300,8 +304,18 @@ def find(paths):
                     break
             else:
                 advisory = rule in ADVISORY
-                rows.append(finding(path, line, rule, ("advisory: " if advisory else "") + RULES[rule][0],
+                file_rows.append(finding(path, line, rule, ("advisory: " if advisory else "") + RULES[rule][0],
                                     "advisory" if advisory else "error"))
+        if select is None:
+            rows.extend(file_rows)
+        elif file_rows:
+            selected = select(path, tests)
+            for row in file_rows:
+                owner = next((test for test in selected if test.start <= row["line"] <= test.end), None)
+                if owner is not None:
+                    rows.append(row)
+                    if owners is not None:
+                        owners[row["path"], row["line"]] = owner
     return sorted(rows, key=lambda row: (row["path"], row["line"], row["rule"]))
 
 

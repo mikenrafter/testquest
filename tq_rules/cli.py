@@ -3,7 +3,7 @@ import json
 import subprocess
 import sys
 
-from . import catches, lint, props, risk, witness
+from . import catches, history, ledger, ledger_report, lint, props, repo, risk, witness
 
 
 DIAGNOSTIC_RULES = {
@@ -27,7 +27,8 @@ def print_findings(rows, as_json):
         print(json.dumps(rows, indent=2))
     else:
         for row in rows:
-            print("{path}:{line} {rule} {message}".format(**row))
+            detail = f" [row {row['row']}]" if "row" in row else ""
+            print("{path}:{line} {rule} {message}".format(**row) + detail)
     return int(any(row.get("level") != "advisory" for row in rows))
 
 
@@ -37,8 +38,11 @@ def main():
     for name, help_text in (("lint", "Find weak assertions and fixtures."),
                             ("witness", "Find conditional checks without reachability evidence.")):
         scan = commands.add_parser(name, help=help_text)
-        scan.add_argument("paths", nargs="+")
+        scan.add_argument("paths", nargs="*" if name == "lint" else "+")
+        if name == "lint":
+            scan.add_argument("--since")
         scan.add_argument("--json", action="store_true")
+    ledger.add_commands(commands.add_parser("log", help="Record and report test evidence."))
     commands.add_parser("rules", help="Show finding rules and exceptions.")
     replay = commands.add_parser("catches", help="Replay named faults in a temporary copy.")
     replay.add_argument("--repo", default=".")
@@ -59,24 +63,19 @@ def main():
     options = parser.parse_args()
     if options.command == "risk" and options.budget < 0:
         parser.error("--budget must be nonnegative")
+    if options.command == "lint" and not (options.paths or options.since):
+        parser.error("lint requires paths or --since")
     try:
         if options.command == "lint":
-            return print_findings(lint.find(options.paths), options.json)
+            select = history.ChangedTests(repo.root("."), options.since) if options.since else None
+            return print_findings(lint.find(options.paths or ["."], select=select), options.json)
+        if options.command == "log":
+            return run_log(options)
         if options.command == "witness":
             return print_findings(witness.find(options.paths), options.json)
         if options.command == "catches":
             rows = catches.run(options.repo, options.worktree, options.cmd)
-            if options.json:
-                print(json.dumps(rows, indent=2))
-            else:
-                for row in rows:
-                    print("{path}:{line} {status} {test} {description}".format(**row))
-                    if row["detail"]:
-                        print(row["detail"])
-            statuses = {row["status"] for row in rows}
-            if "green" in statuses:
-                return 1
-            return 2 if statuses & {"error", "patch-failed"} else 0
+            return print_replays(rows, options.json)
         if options.command == "risk":
             snapshot = risk.map_risk(options.repo, options.budget)
             if options.html:
@@ -105,4 +104,57 @@ def main():
     except (OSError, ValueError, SyntaxError, subprocess.SubprocessError) as error:
         print(f"tq: {error}", file=sys.stderr)
         return 2
+    return 0
+
+
+def print_replays(rows, as_json):
+    if as_json:
+        print(json.dumps(rows, indent=2))
+    else:
+        for row in rows:
+            print("{path}:{line} {status} {test} {description}".format(**row))
+            if row["detail"]:
+                print(row["detail"])
+    statuses = {row["status"] for row in rows}
+    if "green" in statuses:
+        return 1
+    return 2 if statuses & {"error", "patch-failed"} else 0
+
+
+def run_log(options):
+    command = options.log_command
+    path = options.ledger
+    if path is None or command in {"record", "lint", "kill"}:
+        repository = repo.root(getattr(options, "repo", "."))
+        if path is None:
+            path = repository.with_name(repository.name + ".research") / "tq" / "ledger.jsonl"
+    log = ledger.Ledger(path)
+    if command == "record":
+        with log.edit() as (existing, append):
+            append(ledger.record(repository, options.since, existing))
+    elif command == "lint":
+        owners = {}
+        select = history.ChangedTests(repository, options.since)
+        rows = lint.find(options.paths, select=select, owners=owners)
+        entries = list(ledger.lint_events(repository, rows, owners))
+        log.write(entries)
+        return print_findings([
+            row | {"row": entry["row"], "rule_version": entry["rule_version"]}
+            for row, entry in zip(rows, entries)
+        ], options.json)
+    elif command == "verdict":
+        with log.edit() as (existing, append):
+            append([ledger.judgment(existing, options)])
+    elif command == "import-verdicts":
+        log.write(ledger.import_verdicts(options.file))
+    elif command == "kill":
+        rows, events = ledger.kill(repository, options.worktree, options.cmd)
+        log.write(events)
+        return print_replays(rows, False)
+    elif command == "report":
+        report = ledger_report.summarize(log.read())
+        if options.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            ledger_report.print_report(report)
     return 0

@@ -1,4 +1,5 @@
 from contextlib import chdir
+import hashlib
 import io
 import os
 import re
@@ -18,9 +19,9 @@ NOTE = re.compile(r"catches:\s*(.+?)(?:\s+\[patch:\s*([^\]]+)\])?$")
 TIMEOUT = 60
 
 
-def snapshot(repository, destination, worktree):
+def snapshot(repository, destination, worktree, revision):
     if not worktree:
-        archive = repo.git(repository, "archive", "HEAD")
+        archive = repo.git(repository, "archive", revision)
         with tarfile.open(fileobj=io.BytesIO(archive)) as files:
             files.extractall(destination, filter="data")
         return
@@ -97,7 +98,7 @@ def replay(base, patch, command, temp, environment):
         return "error", f"Test command exited {result.returncode}. {(result.stderr or result.stdout).strip()}"
 
 
-def run(repository, worktree, command):
+def run(repository, worktree, command, *, inventory=False, revision="HEAD"):
     repository = repo.root(repository)
     template = shlex.split(command)
     if not template:
@@ -108,20 +109,26 @@ def run(repository, worktree, command):
         base = Path(temp).resolve() / "source"
         environment["GIT_CEILING_DIRECTORIES"] = str(base.parent)
         base.mkdir()
-        snapshot(repository, base, worktree)
+        snapshot(repository, base, worktree, revision)
         with chdir(base):
             notes = [
-                (path, comment.line, test.identifier, *match.groups())
-                for path, tests, comments in scan_paths([Path(".")], [])
+                (path, comment.line, test.identifier, *match.groups(), test.qualified, test.body_hash)
+                for path, tests, comments in scan_paths([Path(".")], [], inventory=inventory)
                 for comment in comments if (match := NOTE.fullmatch(comment.text))
-                for test in tests if test.owns(comment)
+                for test in tests if (test.owns_inventory_comment(comment) if inventory else test.owns(comment))
             ]
-        for path, line, test, description, patch in sorted(notes, key=lambda note: note[:4]):
+        for path, line, test, description, patch, qualified, body_hash in sorted(notes, key=lambda note: note[:4]):
             if patch:
                 argv = [part.replace("{test}", test) for part in template]
                 status, detail = replay(base, patch.strip(), argv, temp, environment)
             else:
                 status, detail = "unreplayable", ""
-            rows.append(dict(path=str(path), line=line, test=test, description=description,
-                             status=status, detail=detail))
+            row = dict(path=str(path), line=line, test=test, description=description,
+                       status=status, detail=detail)
+            if inventory and status in {"red", "green"}:
+                content = relative_patch(base, patch.strip()).read_bytes()
+                row["mutant"] = hashlib.sha256(content).hexdigest()
+                row["test"] = f"{path}::{qualified}"
+                row["body_hash"] = body_hash
+            rows.append(row)
     return rows

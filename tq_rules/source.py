@@ -25,9 +25,19 @@ class Test:
     guarded: bool = False
     conditional: bool = False
     measured: bool = False
+    qualified: str = ""
+    body_hash: str = ""
+    checks: int = 0
+    span_columns: tuple[int, int] | None = None
 
     def owns(self, comment):
         return self.start <= comment.line <= self.end and comment.column >= self.column
+
+    def owns_inventory_comment(self, comment):
+        if self.span_columns is None:
+            return self.owns(comment)
+        first, last = self.span_columns
+        return (self.start, first) <= (comment.line, comment.column) < (self.end, last)
 
 
 class CollectionControls:
@@ -56,7 +66,7 @@ class CollectionControls:
 IGNORED = {".git", "__pycache__", ".venv", "node_modules", "target"}
 
 
-def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None):
+def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None, inventory=False):
     """Yield parsed files; append a parse-error finding to `errors` for each unreadable one."""
     from . import python, rust
 
@@ -83,10 +93,10 @@ def scan_paths(inputs, errors, *, refine_guards=False, collection_controls=None)
             if path.suffix == ".py":
                 with tokenize.open(path) as stream:
                     parsed = python.parse(stream.read(), path, scan_root=paths[path],
-                                          collection_controls=collection_controls)
+                                          collection_controls=collection_controls, inventory=inventory)
             else:
                 parsed = rust.parse(path.read_text(encoding="utf-8"), path, scan_root=paths[path],
-                                    collection_controls=collection_controls)
+                                    collection_controls=collection_controls, inventory=inventory)
         except (SyntaxError, ValueError, UnicodeDecodeError) as error:
             errors.append(finding(path, getattr(error, "lineno", None) or 1, "parse-error",
                                   f"Cannot parse: {error}"))

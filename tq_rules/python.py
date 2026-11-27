@@ -2,6 +2,7 @@ import ast
 import builtins
 from bisect import bisect_left
 from collections import ChainMap, Counter, defaultdict
+import hashlib
 import io
 from pathlib import Path
 import sys
@@ -1860,7 +1861,7 @@ def body_fingerprint(node, tokens, lines):
     )
 
 
-def parse(source, path, *, scan_root=None, collection_controls=None):
+def parse(source, path, *, scan_root=None, collection_controls=None, inventory=False):
     tree = ast.parse(source, filename=str(path))
     tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
     comments = [
@@ -1913,6 +1914,11 @@ def parse(source, path, *, scan_root=None, collection_controls=None):
             end += 1
         identifier = ".".join((*path.with_suffix("").parts, *parents, node.name))
         test = Test(node.name, identifier, node.lineno, start, end, node.col_offset)
+        if inventory:
+            test.qualified = "::".join((*parents, node.name))
+            body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+            test.body_hash = hashlib.sha256(body.encode()).hexdigest()
+            test.checks = len(inspector.checks)
         inspected.append((test, inspector, node))
         test.guarded = bool(inspector.checks) and all(guards for _, _, guards in inspector.checks)
         if test.guarded and scan_root is not None:
